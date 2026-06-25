@@ -165,7 +165,34 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("all_queue", None)
     await _send_next_due(update.effective_chat.id, update.effective_user.id, context)
+
+
+async def review_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    all_words = db.get_all_words_for_review(update.effective_user.id)
+    if not all_words:
+        await update.message.reply_text("В базе нет слов для повторения.")
+        return
+    context.user_data["all_queue"] = [dict(r) for r in all_words]
+    context.user_data["all_index"] = 0
+    await _send_all_next(update.effective_chat.id, update.effective_user.id, context)
+
+
+async def _send_all_next(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    queue = context.user_data.get("all_queue", [])
+    idx = context.user_data.get("all_index", 0)
+    if idx >= len(queue):
+        await context.bot.send_message(chat_id, "Все слова пройдены! 🎉")
+        return
+    row = queue[idx]
+    examples = json.loads(row.get("examples") or "[]")
+    distractors = db.get_distractors(user_id, exclude_id=row["id"], count=2)
+    if examples and len(distractors) >= 2:
+        sent = await _try_send_fill_blank(chat_id, row, examples, distractors, context)
+        if sent:
+            return
+    await _send_recognition(chat_id, row, context)
 
 
 async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
@@ -338,7 +365,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = db.get_word_by_id(word_id)
         mark = "✅" if remembered else "↩️ повторим позже"
         await query.edit_message_text(f'*{row["phrase"]}* — {mark}', parse_mode="Markdown")
-        await _send_next_due(query.message.chat_id, query.from_user.id, context)
+        if "all_queue" in context.user_data:
+            context.user_data["all_index"] = context.user_data.get("all_index", 0) + 1
+            await _send_all_next(query.message.chat_id, query.from_user.id, context)
+        else:
+            await _send_next_due(query.message.chat_id, query.from_user.id, context)
 
     # --- fill-in-the-blank ---
     elif action == "fill":
@@ -357,7 +388,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f'Неверно ❌\n\nПравильный ответ: *{row["phrase"]}* — {row["meaning"]}',
                 parse_mode="Markdown",
             )
-        await _send_next_due(query.message.chat_id, query.from_user.id, context)
+        if "all_queue" in context.user_data:
+            context.user_data["all_index"] = context.user_data.get("all_index", 0) + 1
+            await _send_all_next(query.message.chat_id, query.from_user.id, context)
+        else:
+            await _send_next_due(query.message.chat_id, query.from_user.id, context)
 
     # --- gender quiz ---
     elif action == "gender":
@@ -452,6 +487,7 @@ async def post_init(app: Application):
     await app.bot.set_my_commands([
         ("words", "Добавить 10 частотных слов"),
         ("review", "Повторить слова по расписанию"),
+        ("all", "Повторить все слова из базы"),
         ("gender", "Угадать род существительных"),
         ("delete", "Удалить слово из базы"),
         ("stats", "Статистика словаря"),
@@ -466,6 +502,7 @@ def main():
     app.add_handler(CommandHandler("words", words))
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("review", review))
+    app.add_handler(CommandHandler("all", review_all))
     app.add_handler(CommandHandler("gender", gender_quiz))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(on_button))

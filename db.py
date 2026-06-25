@@ -101,6 +101,18 @@ def add_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
     return new_id
 
 
+def get_all_words_for_review(user_id):
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT * FROM words
+           WHERE user_id = ? AND status NOT IN ('mastered', 'skipped')
+           ORDER BY RANDOM()""",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def delete_word(user_id: int, phrase: str) -> bool:
     conn = get_connection()
     cur = conn.execute(
