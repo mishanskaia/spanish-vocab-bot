@@ -14,17 +14,28 @@ The council fixes this. It runs your question through 5 independent advisors, ea
 This is adapted from Andrej Karpathy's LLM Council. He dispatches queries to multiple models, has them peer-review each other anonymously, then a chairman produces the final answer. We do the same thing inside Claude using sub-agents (or, if sub-agents aren't available in this environment, by reasoning through each advisor role sequentially in a single response) with different thinking lenses instead of different models.
 
 ---
-
 ## language
 
-Always respond in the same language the user used when triggering the council. If they wrote in Russian, everything must be in Russian — the framed question, all 5 advisor responses, the peer reviews, and the final verdict, including translated section headers (e.g. "Council Verdict" → "Вердикт совета", "Where the Council Agrees" → "В чём совет согласен", "Where the Council Clashes" → "В чём совет расходится", "Blind Spots the Council Caught" → "Слепые зоны, которые заметил совет", "The Recommendation" → "Рекомендация", "The One Thing to Do First" → "Первый шаг").
+CRITICAL: respond in the same language the user used in their trigger message. If they wrote in Russian, the entire output must be in Russian: the framed question, all 5 advisor responses, all peer reviews, and the final verdict — including translated section headers and advisor names (see below).
 
-Use these Russian names for the five advisors, consistently across sessions:
+This instruction must be repeated explicitly inside every individual prompt you construct for an advisor, reviewer, or chairman sub-agent — sub-agents start with a fresh context and do not automatically see this skill file, so each delegated prompt needs its own line like: "Respond entirely in Russian." If you are reasoning through the advisor roles sequentially yourself (no sub-agents available), this is automatic since you keep the full context — but stay vigilant, don't slip into English partway through.
+
+Russian section headers:
+- "Council Verdict" → "Вердикт совета"
+- "Where the Council Agrees" → "В чём совет согласен"
+- "Where the Council Clashes" → "В чём совет расходится"
+- "Blind Spots the Council Caught" → "Слепые зоны, которые заметил совет"
+- "The Recommendation" → "Рекомендация"
+- "The One Thing to Do First" → "Первый шаг"
+
+Russian advisor names:
 - The Contrarian → Скептик
 - The First Principles Thinker → Мыслитель первых принципов
 - The Expansionist → Визионер
 - The Outsider → Посторонний
 - The Executor → Исполнитель
+
+---
 
 ---
 
