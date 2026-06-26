@@ -15,6 +15,19 @@ This is adapted from Andrej Karpathy's LLM Council. He dispatches queries to mul
 
 ---
 
+## language
+
+Always respond in the same language the user used when triggering the council. If they wrote in Russian, everything must be in Russian — the framed question, all 5 advisor responses, the peer reviews, and the final verdict, including translated section headers (e.g. "Council Verdict" → "Вердикт совета", "Where the Council Agrees" → "В чём совет согласен", "Where the Council Clashes" → "В чём совет расходится", "Blind Spots the Council Caught" → "Слепые зоны, которые заметил совет", "The Recommendation" → "Рекомендация", "The One Thing to Do First" → "Первый шаг").
+
+Use these Russian names for the five advisors, consistently across sessions:
+- The Contrarian → Скептик
+- The First Principles Thinker → Мыслитель первых принципов
+- The Expansionist → Визионер
+- The Outsider → Посторонний
+- The Executor → Исполнитель
+
+---
+
 ## when to run the council
 
 The council is for questions where being wrong is expensive.
