@@ -5,7 +5,7 @@ from datetime import date, timedelta
 
 DB_PATH = os.environ.get("DB_PATH", "spanish_vocab_bot.db")
 
-INTERVALS = [1, 3, 7, 14, 30, 60, 120]
+INTERVALS = [0, 1, 2, 6, 14, 30, 60]
 
 
 def _stage_to_status(stage: int) -> str:
@@ -85,7 +85,7 @@ def add_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
              conjugation=None) -> int:
     conn = get_connection()
     today = date.today().isoformat()
-    first_review = (date.today() + timedelta(days=INTERVALS[0])).isoformat()
+    first_review = date.today().isoformat()
     cur = conn.execute(
         """INSERT INTO words
            (user_id, phrase, meaning, part_of_speech, cefr_level, examples,
@@ -197,7 +197,7 @@ def mark_review_result(word_id, remembered: bool):
         stage += 1
         streak += 1
     else:
-        stage = max(0, stage - 1)
+        stage = 0
         streak = 0
 
     if stage >= len(INTERVALS):
