@@ -26,7 +26,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-REMINDER_HOUR_UTC = int(os.environ.get("REMINDER_HOUR_UTC", "8"))
+REMINDER_MORNING_HOUR_UTC = int(os.environ.get("REMINDER_MORNING_HOUR_UTC", "6"))
+REMINDER_MORNING_MIN_UTC = int(os.environ.get("REMINDER_MORNING_MIN_UTC", "30"))
+REMINDER_EVENING_HOUR_UTC = int(os.environ.get("REMINDER_EVENING_HOUR_UTC", "15"))
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +221,7 @@ async def _send_recognition(chat_id: int, row, context: ContextTypes.DEFAULT_TYP
     )
     await context.bot.send_message(
         chat_id,
-        f'Что значит:\n\n*{row["phrase"]}*',
+        f'Как будет по-испански:\n\n*{row["meaning"]}*',
         reply_markup=keyboard,
         parse_mode="Markdown",
     )
@@ -349,7 +351,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'*{row["phrase"]}* — {row["meaning"]}\n'
             f'_{row["part_of_speech"]} · {row["cefr_level"]}_\n\n'
             f'Примеры:\n{examples_text}'
-            f'{conj_block}',
+            f'{conj_block}\n\nТы вспомнил(а)?',
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Знаю ✅", callback_data=f"good:{word_id}"),
                 InlineKeyboardButton("Не знаю ❌", callback_data=f"bad:{word_id}"),
@@ -473,9 +475,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Daily reminder
 # ---------------------------------------------------------------------------
 
-async def daily_reminder(context: ContextTypes.DEFAULT_TYPE):
+async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
     for user_id in db.get_all_due_users():
-        await context.bot.send_message(user_id, "Время повторить испанские слова! 🇪🇸")
+        await context.bot.send_message(user_id, "Доброе утро! Время повторить испанские слова 🇪🇸")
+        await _send_next_due(user_id, user_id, context)
+
+
+async def evening_reminder(context: ContextTypes.DEFAULT_TYPE):
+    for user_id in db.get_all_due_users():
+        await context.bot.send_message(user_id, "Ещё не повторяли сегодня? Самое время! 🌆")
         await _send_next_due(user_id, user_id, context)
 
 
@@ -508,7 +516,8 @@ def main():
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    app.job_queue.run_daily(daily_reminder, time=dtime(hour=REMINDER_HOUR_UTC, minute=0))
+    app.job_queue.run_daily(morning_reminder, time=dtime(hour=REMINDER_MORNING_HOUR_UTC, minute=REMINDER_MORNING_MIN_UTC))
+    app.job_queue.run_daily(evening_reminder, time=dtime(hour=REMINDER_EVENING_HOUR_UTC, minute=0))
 
     print("Bot started. Stop with Ctrl+C.")
     app.run_polling()
