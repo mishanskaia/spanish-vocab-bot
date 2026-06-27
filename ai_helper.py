@@ -55,7 +55,7 @@ def explain_word(word: str) -> dict:
 
 def find_frequent_words(existing_words: list, count: int = 10) -> list:
     existing_str = ", ".join(existing_words) if existing_words else "нет"
-    prompt = f"""Подбери {count} испанских слов, которых ещё нет у пользователя.
+    prompt = f"""Подбери ровно {count} испанских слова, которых ещё нет у пользователя. Отвечай кратко и быстро.
 
 Уже добавленные слова (не повторяй): {existing_str}
 

@@ -90,10 +90,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def words(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("all_queue", None)
-    await update.message.reply_text("Подбираю 10 частотных слов...")
+    await update.message.reply_text("Подбираю слова, подожди немного...")
 
     existing = db.get_user_words(update.effective_user.id)
-    new_words = ai_helper.find_frequent_words(existing, count=10)
+    new_words = ai_helper.find_frequent_words(existing, count=5)
 
     if not new_words:
         await update.message.reply_text("Не удалось подобрать слова. Попробуй ещё раз.")
