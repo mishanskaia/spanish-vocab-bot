@@ -41,7 +41,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Просто напиши любое испанское слово — я объясню и сохраню его.\n\n"
         "/words — добавить 10 частотных слов автоматически\n"
         "/review — повторить слова по расписанию\n"
-        "/gender — угадать род существительных\n"
+        "/all — повторить все слова из базы\n"
         "/delete — удалить слово из базы\n"
         "/stats — статистика словаря"
     )
@@ -79,7 +79,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f'_{info.get("part_of_speech", "")} · {info.get("cefr_level", "")}_\n\n'
         f'Примеры:\n{examples_text}'
         f'{conj_block}\n\n'
-        f'Первое повторение — завтра.',
+        f'Первое повторение — сегодня.',
         parse_mode="Markdown",
     )
 
@@ -89,6 +89,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def words(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("all_queue", None)
     await update.message.reply_text("Подбираю 10 частотных слов...")
 
     existing = db.get_user_words(update.effective_user.id)
@@ -108,7 +109,14 @@ async def _send_words_item(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     idx = context.user_data.get("words_index", 0)
 
     if idx >= len(queue):
-        await context.bot.send_message(chat_id, "Все слова добавлены!")
+        saved = context.user_data.get("words_saved", 0)
+        skipped = context.user_data.get("words_skipped", 0)
+        context.user_data.pop("words_saved", None)
+        context.user_data.pop("words_skipped", None)
+        await context.bot.send_message(
+            chat_id,
+            f"Готово! Сохранено: {saved}, пропущено: {skipped}."
+        )
         return
 
     item = queue[idx]
@@ -446,6 +454,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 examples=item.get("examples", []),
                 conjugation=item.get("conjugation"),
             )
+            context.user_data["words_saved"] = context.user_data.get("words_saved", 0) + 1
             await query.edit_message_text(
                 f'Сохранено: *{item["phrase"]}* ✅',
                 parse_mode="Markdown",
@@ -453,6 +462,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             if idx < len(queue):
                 item = queue[idx]
+                context.user_data["words_skipped"] = context.user_data.get("words_skipped", 0) + 1
                 db.add_skipped_word(
                     user_id=query.from_user.id,
                     phrase=item["phrase"],
@@ -496,7 +506,6 @@ async def post_init(app: Application):
         ("words", "Добавить 10 частотных слов"),
         ("review", "Повторить слова по расписанию"),
         ("all", "Повторить все слова из базы"),
-        ("gender", "Угадать род существительных"),
         ("delete", "Удалить слово из базы"),
         ("stats", "Статистика словаря"),
     ])
@@ -511,7 +520,7 @@ def main():
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("review", review))
     app.add_handler(CommandHandler("all", review_all))
-    app.add_handler(CommandHandler("gender", gender_quiz))
+
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
