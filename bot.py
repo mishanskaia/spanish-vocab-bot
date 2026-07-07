@@ -26,9 +26,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-REMINDER_MORNING_HOUR_UTC = int(os.environ.get("REMINDER_MORNING_HOUR_UTC", "6"))
-REMINDER_MORNING_MIN_UTC = int(os.environ.get("REMINDER_MORNING_MIN_UTC", "30"))
-REMINDER_EVENING_HOUR_UTC = int(os.environ.get("REMINDER_EVENING_HOUR_UTC", "15"))
+# 10:00 Moscow = 07:00 UTC; 18:00 Moscow = 15:00 UTC
+REMINDER_MORNING_UTC = (7, 0)
+REMINDER_EVENING_UTC = (15, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я помогу тебе учить испанские слова 🇪🇸\n\n"
         "Просто напиши любое испанское слово — я объясню и сохраню его.\n\n"
-        "/words — добавить 10 частотных слов автоматически\n"
+        "/words — добавить новые слова автоматически\n"
         "/review — повторить слова по расписанию\n"
         "/all — повторить все слова из базы\n"
         "/delete — удалить слово из базы\n"
@@ -73,23 +73,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conj = info.get("conjugation")
     conj_block = f"\n\n📝 Спряжение: {conj}" if conj else ""
 
+    window = db.get_current_window()
+    if window == 'morning':
+        review_hint = "Первое повторение — сегодня вечером."
+    else:
+        review_hint = "Первое повторение — завтра утром."
+
     await update.message.reply_text(
         f'✅ *{info.get("phrase", word)}*\n'
         f'{info.get("meaning", "")}\n'
         f'_{info.get("part_of_speech", "")} · {info.get("cefr_level", "")}_\n\n'
         f'Примеры:\n{examples_text}'
         f'{conj_block}\n\n'
-        f'Первое повторение — сегодня.',
+        f'{review_hint}',
         parse_mode="Markdown",
     )
 
 
 # ---------------------------------------------------------------------------
-# /words — 10 частотных слов
+# /words — новые слова
 # ---------------------------------------------------------------------------
 
 async def words(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("all_queue", None)
+    context.user_data.pop("words_saved", None)
+    context.user_data.pop("words_skipped", None)
     await update.message.reply_text("Подбираю слова, подожди немного...")
 
     existing = db.get_user_words(update.effective_user.id)
@@ -159,7 +167,6 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not words_list:
             await update.message.reply_text("Твой словарь пуст.")
             return
-        # Show first 20 words as buttons
         buttons = []
         for w in words_list[:20]:
             buttons.append([InlineKeyboardButton(w, callback_data=f"del_word:{w}")])
@@ -176,8 +183,92 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("all_queue", None)
+    context.user_data["review_shown"] = set()
+    db.detect_and_mark_overdue(update.effective_user.id)
     await _send_next_due(update.effective_chat.id, update.effective_user.id, context)
 
+
+async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    shown = context.user_data.get("review_shown", set())
+    overdue, scheduled = db.get_due_words_split(user_id)
+
+    # Filter out already shown in this session
+    overdue = [r for r in overdue if r["id"] not in shown]
+    scheduled = [r for r in scheduled if r["id"] not in shown]
+
+    if not overdue and not scheduled:
+        await context.bot.send_message(chat_id, "Нет слов для повторения сегодня 🎉")
+        return
+
+    is_overdue = bool(overdue)
+    row = overdue[0] if overdue else scheduled[0]
+
+    shown.add(row["id"])
+    context.user_data["review_shown"] = shown
+
+    examples = json.loads(row["examples"] or "[]")
+    distractors = db.get_distractors(user_id, exclude_id=row["id"], count=2)
+
+    if examples and len(distractors) >= 2:
+        sent = await _try_send_fill_blank(chat_id, row, examples, distractors, context, is_overdue)
+        if sent:
+            return
+
+    await _send_recognition(chat_id, row, context, is_overdue)
+
+
+async def _send_recognition(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE, is_overdue: bool = False):
+    prefix = "⚠️ *Пропущено ранее*\n\n" if is_overdue else ""
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Показать ответ", callback_data=f"show:{row['id']}")]]
+    )
+    await context.bot.send_message(
+        chat_id,
+        f'{prefix}Как будет по-испански:\n\n*{row["meaning"]}*',
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+
+
+async def _try_send_fill_blank(chat_id, row, examples, distractors, context, is_overdue=False) -> bool:
+    phrase = row["phrase"]
+    example = examples[0]
+
+    word_for_search = phrase
+    if " " in phrase and phrase.split()[0].lower() in ("el", "la", "los", "las"):
+        word_for_search = phrase.split(" ", 1)[1]
+
+    blank_sentence = re.sub(re.escape(word_for_search), "_____", example, count=1, flags=re.IGNORECASE)
+    if "_____" not in blank_sentence:
+        blank_sentence = re.sub(re.escape(phrase), "_____", example, count=1, flags=re.IGNORECASE)
+    if "_____" not in blank_sentence:
+        return False
+
+    options = [phrase] + [d["phrase"] for d in distractors]
+    random.shuffle(options)
+
+    buttons = [
+        InlineKeyboardButton(
+            opt,
+            callback_data=f"fill:{row['id']}:{'correct' if opt == phrase else 'wrong'}",
+        )
+        for opt in options
+    ]
+    keyboard = InlineKeyboardMarkup([buttons])
+    prefix = "⚠️ *Пропущено ранее*\n\n" if is_overdue else ""
+
+    await context.bot.send_message(
+        chat_id,
+        f'{prefix}Вставь пропущенное слово:\n\n*{blank_sentence}*',
+        reply_markup=keyboard,
+        parse_mode="Markdown",
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
+# /all — повторить все слова
+# ---------------------------------------------------------------------------
 
 async def review_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_words = db.get_all_words_for_review(update.effective_user.id)
@@ -203,109 +294,6 @@ async def _send_all_next(chat_id: int, user_id: int, context: ContextTypes.DEFAU
         if sent:
             return
     await _send_recognition(chat_id, row, context)
-
-
-async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    due = db.get_due_words(user_id)
-    if not due:
-        await context.bot.send_message(chat_id, "Нет слов для повторения сегодня 🎉")
-        return
-
-    row = due[0]
-    examples = json.loads(row["examples"] or "[]")
-    distractors = db.get_distractors(user_id, exclude_id=row["id"], count=2)
-
-    if examples and len(distractors) >= 2:
-        sent = await _try_send_fill_blank(chat_id, row, examples, distractors, context)
-        if sent:
-            return
-
-    await _send_recognition(chat_id, row, context)
-
-
-async def _send_recognition(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("Показать ответ", callback_data=f"show:{row['id']}")]]
-    )
-    await context.bot.send_message(
-        chat_id,
-        f'Как будет по-испански:\n\n*{row["meaning"]}*',
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
-
-
-async def _try_send_fill_blank(chat_id, row, examples, distractors, context) -> bool:
-    phrase = row["phrase"]
-    # Try to match the base word without article for fill-in-the-blank
-    example = examples[0]
-
-    # Extract the word part (after article for nouns)
-    word_for_search = phrase
-    if " " in phrase and phrase.split()[0].lower() in ("el", "la", "los", "las"):
-        word_for_search = phrase.split(" ", 1)[1]
-
-    blank_sentence = re.sub(re.escape(word_for_search), "_____", example, count=1, flags=re.IGNORECASE)
-    if "_____" not in blank_sentence:
-        blank_sentence = re.sub(re.escape(phrase), "_____", example, count=1, flags=re.IGNORECASE)
-    if "_____" not in blank_sentence:
-        return False
-
-    options = [phrase] + [d["phrase"] for d in distractors]
-    random.shuffle(options)
-
-    buttons = [
-        InlineKeyboardButton(
-            opt,
-            callback_data=f"fill:{row['id']}:{'correct' if opt == phrase else 'wrong'}",
-        )
-        for opt in options
-    ]
-    keyboard = InlineKeyboardMarkup([buttons])
-
-    await context.bot.send_message(
-        chat_id,
-        f'Вставь пропущенное слово:\n\n*{blank_sentence}*',
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
-    return True
-
-
-# ---------------------------------------------------------------------------
-# /gender — угадай род существительного
-# ---------------------------------------------------------------------------
-
-async def gender_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _send_gender_question(update.effective_chat.id, update.effective_user.id, context)
-
-
-async def _send_gender_question(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    nouns = db.get_nouns_for_gender_quiz(user_id)
-    if not nouns:
-        await context.bot.send_message(
-            chat_id,
-            "Нет существительных для повторения сегодня. Добавь больше слов! 📚"
-        )
-        return
-
-    row = nouns[0]
-    phrase = row["phrase"]
-    # Strip article to show bare noun
-    word_without_article = phrase
-    if " " in phrase and phrase.split()[0].lower() in ("el", "la", "los", "las"):
-        word_without_article = phrase.split(" ", 1)[1]
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("el", callback_data=f"gender:{row['id']}:el"),
-        InlineKeyboardButton("la", callback_data=f"gender:{row['id']}:la"),
-    ]])
-    await context.bot.send_message(
-        chat_id,
-        f'Какой артикль?\n\n*{word_without_article}*',
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -361,20 +349,24 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'Примеры:\n{examples_text}'
             f'{conj_block}\n\nТы вспомнил(а)?',
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("Знаю ✅", callback_data=f"good:{word_id}"),
-                InlineKeyboardButton("Не знаю ❌", callback_data=f"bad:{word_id}"),
+                InlineKeyboardButton("Легко 🟢", callback_data=f"grade:{word_id}:easy"),
+                InlineKeyboardButton("Помню 🟡", callback_data=f"grade:{word_id}:remember"),
+                InlineKeyboardButton("Сложно 🔴", callback_data=f"grade:{word_id}:hard"),
             ]]),
             parse_mode="Markdown",
         )
 
-    # --- recognition: grade ---
-    elif action in ("good", "bad"):
+    # --- self-assessment grade ---
+    elif action == "grade":
         word_id = int(parts[1])
-        remembered = (action == "good")
-        db.mark_review_result(word_id, remembered)
+        grade = parts[2]
+        db.mark_review_result(word_id, grade)
         row = db.get_word_by_id(word_id)
-        mark = "✅" if remembered else "↩️ повторим позже"
-        await query.edit_message_text(f'*{row["phrase"]}* — {mark}', parse_mode="Markdown")
+        marks = {"easy": "Легко 🟢", "remember": "Помню 🟡", "hard": "Сложно 🔴"}
+        await query.edit_message_text(
+            f'*{row["phrase"]}* — {marks.get(grade, "")}',
+            parse_mode="Markdown",
+        )
         if "all_queue" in context.user_data:
             context.user_data["all_index"] = context.user_data.get("all_index", 0) + 1
             await _send_all_next(query.message.chat_id, query.from_user.id, context)
@@ -385,10 +377,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "fill":
         word_id = int(parts[1])
         result = parts[2]
-        remembered = (result == "correct")
-        db.mark_review_result(word_id, remembered)
+        grade = "remember" if result == "correct" else "hard"
+        db.mark_review_result(word_id, grade)
         row = db.get_word_by_id(word_id)
-        if remembered:
+        if result == "correct":
             await query.edit_message_text(
                 f'Правильно! ✅\n\n*{row["phrase"]}* — {row["meaning"]}',
                 parse_mode="Markdown",
@@ -403,30 +395,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_all_next(query.message.chat_id, query.from_user.id, context)
         else:
             await _send_next_due(query.message.chat_id, query.from_user.id, context)
-
-    # --- gender quiz ---
-    elif action == "gender":
-        word_id = int(parts[1])
-        chosen = parts[2]
-        row = db.get_word_by_id(word_id)
-        if row is None:
-            return
-        phrase = row["phrase"]
-        correct_article = phrase.split()[0].lower() if " " in phrase else None
-
-        if correct_article == chosen:
-            db.mark_review_result(word_id, True)
-            await query.edit_message_text(
-                f'Правильно! ✅\n\n*{phrase}* — {row["meaning"]}',
-                parse_mode="Markdown",
-            )
-        else:
-            db.mark_review_result(word_id, False)
-            await query.edit_message_text(
-                f'Неверно ❌\n\nПравильно: *{phrase}* — {row["meaning"]}',
-                parse_mode="Markdown",
-            )
-        await _send_gender_question(query.message.chat_id, query.from_user.id, context)
 
     # --- delete word by button ---
     elif action == "del_word":
@@ -482,19 +450,30 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Daily reminder
+# Daily reminders
 # ---------------------------------------------------------------------------
 
 async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
     for user_id in db.get_all_due_users():
-        await context.bot.send_message(user_id, "Доброе утро! Время повторить испанские слова 🇪🇸")
-        await _send_next_due(user_id, user_id, context)
+        count = db.count_due_not_reviewed_today(user_id)
+        if count > 0:
+            await context.bot.send_message(
+                user_id,
+                f"☀️ Доброе утро! Слов на повторение: {count}"
+            )
+            db.detect_and_mark_overdue(user_id)
+            await _send_next_due(user_id, user_id, context)
 
 
 async def evening_reminder(context: ContextTypes.DEFAULT_TYPE):
     for user_id in db.get_all_due_users():
-        await context.bot.send_message(user_id, "Ещё не повторяли сегодня? Самое время! 🌆")
-        await _send_next_due(user_id, user_id, context)
+        count = db.count_due_not_reviewed_today(user_id)
+        if count > 0:
+            await context.bot.send_message(
+                user_id,
+                f"🌙 Добрый вечер! Слов на повторение: {count}"
+            )
+            await _send_next_due(user_id, user_id, context)
 
 
 # ---------------------------------------------------------------------------
@@ -503,7 +482,7 @@ async def evening_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(app: Application):
     await app.bot.set_my_commands([
-        ("words", "Добавить 10 частотных слов"),
+        ("words", "Добавить новые слова"),
         ("review", "Повторить слова по расписанию"),
         ("all", "Повторить все слова из базы"),
         ("delete", "Удалить слово из базы"),
@@ -520,13 +499,12 @@ def main():
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("review", review))
     app.add_handler(CommandHandler("all", review_all))
-
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    app.job_queue.run_daily(morning_reminder, time=dtime(hour=REMINDER_MORNING_HOUR_UTC, minute=REMINDER_MORNING_MIN_UTC))
-    app.job_queue.run_daily(evening_reminder, time=dtime(hour=REMINDER_EVENING_HOUR_UTC, minute=0))
+    app.job_queue.run_daily(morning_reminder, time=dtime(hour=REMINDER_MORNING_UTC[0], minute=REMINDER_MORNING_UTC[1]))
+    app.job_queue.run_daily(evening_reminder, time=dtime(hour=REMINDER_EVENING_UTC[0], minute=REMINDER_EVENING_UTC[1]))
 
     print("Bot started. Stop with Ctrl+C.")
     app.run_polling()
