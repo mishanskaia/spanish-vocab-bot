@@ -165,6 +165,29 @@ def get_user_words(user_id: int):
     return [r["phrase"] for r in rows]
 
 
+def reset_collected_review_dates(user_id: int, batch_size: int = 15):
+    """Spreads this user's collected words across next_review_date in
+    batches of batch_size (oldest first). Returns [(date_iso, count), ...]."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT id FROM words WHERE user_id = ? AND status = 'collected' AND pool = 'scheduled'
+           ORDER BY added_date, id""",
+        (user_id,),
+    ).fetchall()
+    today = date.today()
+    batches = []
+    for i, r in enumerate(rows):
+        batch_index = i // batch_size
+        next_review = (today + timedelta(days=batch_index)).isoformat()
+        conn.execute("UPDATE words SET next_review_date = ? WHERE id = ?", (next_review, r["id"]))
+        if batch_index == len(batches):
+            batches.append([next_review, 0])
+        batches[batch_index][1] += 1
+    conn.commit()
+    conn.close()
+    return [(d, c) for d, c in batches]
+
+
 def detect_and_mark_overdue(user_id: int):
     """Words due before today get marked overdue and staged back one step."""
     conn = get_connection()
