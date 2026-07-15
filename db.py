@@ -173,7 +173,7 @@ def detect_and_mark_overdue(user_id: int):
         """SELECT id, interval_stage FROM words
            WHERE user_id = ? AND pool = 'scheduled'
            AND next_review_date < ?
-           AND status NOT IN ('mastered', 'skipped', 'collected')""",
+           AND status NOT IN ('mastered', 'skipped')""",
         (user_id, today),
     ).fetchall()
     for r in rows:
@@ -198,7 +198,7 @@ def get_due_words_split(user_id: int):
     ).fetchall()
     scheduled = conn.execute(
         """SELECT * FROM words WHERE user_id = ? AND pool = 'scheduled'
-           AND status NOT IN ('mastered', 'skipped', 'collected')
+           AND status NOT IN ('mastered', 'skipped')
            AND next_review_date <= ?
            ORDER BY next_review_date ASC""",
         (user_id, today),
@@ -217,7 +217,7 @@ def get_all_due_users():
     today = date.today().isoformat()
     rows = conn.execute(
         """SELECT DISTINCT user_id FROM words
-           WHERE status NOT IN ('mastered', 'skipped', 'collected')
+           WHERE status NOT IN ('mastered', 'skipped')
            AND (pool = 'overdue' OR (pool = 'scheduled' AND next_review_date <= ?))""",
         (today,),
     ).fetchall()
@@ -230,7 +230,7 @@ def count_due_not_reviewed_today(user_id: int) -> int:
     today = date.today().isoformat()
     row = conn.execute(
         """SELECT COUNT(*) AS c FROM words
-           WHERE user_id = ? AND status NOT IN ('mastered', 'skipped', 'collected')
+           WHERE user_id = ? AND status NOT IN ('mastered', 'skipped')
            AND (pool = 'overdue' OR (pool = 'scheduled' AND next_review_date <= ?))
            AND (last_reviewed IS NULL OR last_reviewed != ?)""",
         (user_id, today, today),
