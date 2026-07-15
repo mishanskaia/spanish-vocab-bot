@@ -29,6 +29,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 # 10:00 Moscow = 07:00 UTC; 18:00 Moscow = 15:00 UTC
 REMINDER_MORNING_UTC = (7, 0)
 REMINDER_EVENING_UTC = (15, 0)
+REVIEW_SESSION_LIMIT = 15
 
 
 # ---------------------------------------------------------------------------
@@ -188,8 +189,10 @@ async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _send_next_due(update.effective_chat.id, update.effective_user.id, context)
 
 
-async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    shown = context.user_data.get("review_shown", set())
+async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, user_data=None):
+    if user_data is None:
+        user_data = context.user_data
+    shown = user_data.get("review_shown", set())
     overdue, scheduled = db.get_due_words_split(user_id)
 
     # Filter out already shown in this session
@@ -200,11 +203,20 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
         await context.bot.send_message(chat_id, "Нет слов для повторения сегодня 🎉")
         return
 
+    if len(shown) >= REVIEW_SESSION_LIMIT:
+        remaining = len(overdue) + len(scheduled)
+        await context.bot.send_message(
+            chat_id,
+            f"На сегодня достаточно — повторили {REVIEW_SESSION_LIMIT} слов 👍\n"
+            f"Осталось ещё {remaining}, увидимся в следующий раз.",
+        )
+        return
+
     is_overdue = bool(overdue)
     row = overdue[0] if overdue else scheduled[0]
 
     shown.add(row["id"])
-    context.user_data["review_shown"] = shown
+    user_data["review_shown"] = shown
 
     examples = json.loads(row["examples"] or "[]")
     distractors = db.get_distractors(user_id, exclude_id=row["id"], count=2)
@@ -461,8 +473,10 @@ async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
                 user_id,
                 f"☀️ Доброе утро! Слов на повторение: {count}"
             )
+            user_data = context.application.user_data[user_id]
+            user_data["review_shown"] = set()
             db.detect_and_mark_overdue(user_id)
-            await _send_next_due(user_id, user_id, context)
+            await _send_next_due(user_id, user_id, context, user_data)
 
 
 async def evening_reminder(context: ContextTypes.DEFAULT_TYPE):
@@ -473,7 +487,8 @@ async def evening_reminder(context: ContextTypes.DEFAULT_TYPE):
                 user_id,
                 f"🌙 Добрый вечер! Слов на повторение: {count}"
             )
-            await _send_next_due(user_id, user_id, context)
+            user_data = context.application.user_data[user_id]
+            await _send_next_due(user_id, user_id, context, user_data)
 
 
 # ---------------------------------------------------------------------------
