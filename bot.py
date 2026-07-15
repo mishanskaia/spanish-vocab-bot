@@ -333,6 +333,22 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# /reset_collected — one-off: spread stuck "collected" words across days
+# ---------------------------------------------------------------------------
+
+async def reset_collected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    batches = db.reset_collected_review_dates(update.effective_user.id)
+    if not batches:
+        await update.message.reply_text("Нет слов в статусе «собрано» — распределять нечего.")
+        return
+    total = sum(c for _, c in batches)
+    lines = "\n".join(f"{d}: {c} слов" for d, c in batches)
+    await update.message.reply_text(
+        f"Распределила {total} слов по датам:\n{lines}\n\nТеперь заходи в /review как обычно."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Button callback handler
 # ---------------------------------------------------------------------------
 
@@ -515,6 +531,7 @@ def main():
     app.add_handler(CommandHandler("review", review))
     app.add_handler(CommandHandler("all", review_all))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("reset_collected", reset_collected))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
