@@ -29,7 +29,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 # 10:00 Moscow = 07:00 UTC; 18:00 Moscow = 15:00 UTC
 REMINDER_MORNING_UTC = (7, 0)
 REMINDER_EVENING_UTC = (15, 0)
-REVIEW_SESSION_LIMIT = 15
+NEW_WORDS_DAILY_LIMIT = 15
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +185,7 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("all_queue", None)
     context.user_data["review_shown"] = set()
+    context.user_data["review_new_shown"] = 0
     db.detect_and_mark_overdue(update.effective_user.id)
     await _send_next_due(update.effective_chat.id, update.effective_user.id, context)
 
@@ -193,6 +194,7 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
     if user_data is None:
         user_data = context.user_data
     shown = user_data.get("review_shown", set())
+    new_shown = user_data.get("review_new_shown", 0)
     overdue, scheduled = db.get_due_words_split(user_id)
 
     # Filter out already shown in this session
@@ -203,18 +205,29 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
         await context.bot.send_message(chat_id, "Нет слов для повторения сегодня 🎉")
         return
 
-    if len(shown) >= REVIEW_SESSION_LIMIT:
-        remaining = len(overdue) + len(scheduled)
+    # Overdue first, then scheduled, both ordered by due date. Only brand-new
+    # (never reviewed) words count against the daily cap — words already in
+    # progress are reviewed every time they're due, same as Anki review cards.
+    row = None
+    is_overdue = False
+    for candidate, candidate_is_overdue in [(r, True) for r in overdue] + [(r, False) for r in scheduled]:
+        is_new = (candidate["times_reviewed"] or 0) == 0
+        if is_new and new_shown >= NEW_WORDS_DAILY_LIMIT:
+            continue
+        row, is_overdue = candidate, candidate_is_overdue
+        break
+
+    if row is None:
         await context.bot.send_message(
             chat_id,
-            f"На сегодня достаточно — повторили {REVIEW_SESSION_LIMIT} слов 👍\n"
-            f"Осталось ещё {remaining}, увидимся в следующий раз.",
+            f"Новых слов на сегодня достаточно — изучили {NEW_WORDS_DAILY_LIMIT} 👍\n"
+            f"Слова на повторение из старого расписания на сегодня закончились.",
         )
         return
 
-    is_overdue = bool(overdue)
-    row = overdue[0] if overdue else scheduled[0]
-
+    is_new = (row["times_reviewed"] or 0) == 0
+    if is_new:
+        user_data["review_new_shown"] = new_shown + 1
     shown.add(row["id"])
     user_data["review_shown"] = shown
 
@@ -491,6 +504,7 @@ async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
             )
             user_data = context.application.user_data[user_id]
             user_data["review_shown"] = set()
+            user_data["review_new_shown"] = 0
             db.detect_and_mark_overdue(user_id)
             await _send_next_due(user_id, user_id, context, user_data)
 
