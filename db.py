@@ -10,9 +10,9 @@ INTERVALS = [1, 3, 7, 14, 30, 90]
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 
-def _stage_to_status(stage: int) -> str:
+def _stage_to_status(stage: int, times_reviewed: int = 0) -> str:
     if stage == 0:
-        return "collected"
+        return "collected" if times_reviewed == 0 else "learning"
     if stage <= 2:
         return "learning"
     if stage <= 4:
@@ -87,12 +87,32 @@ def init_db():
     )
     _safe_add_column(conn, "pool TEXT DEFAULT 'scheduled'")
     _safe_add_column(conn, "added_window TEXT DEFAULT 'morning'")
+    conn.execute(
+        "UPDATE words SET status = 'learning' WHERE status = 'collected' AND times_reviewed > 0"
+    )
     conn.commit()
     conn.close()
 
 
+def find_word_by_phrase(user_id: int, phrase: str):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM words WHERE user_id = ? AND phrase = ? COLLATE NOCASE",
+        (user_id, phrase),
+    ).fetchone()
+    conn.close()
+    return row
+
+
 def add_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
-             conjugation=None) -> int:
+             conjugation=None):
+    """Returns (word_id, is_new). If the phrase already exists for this
+    user (case-insensitive), returns the existing row instead of inserting
+    a duplicate."""
+    existing = find_word_by_phrase(user_id, phrase)
+    if existing:
+        return existing["id"], False
+
     conn = get_connection()
     today = date.today().isoformat()
     window = get_current_window()
@@ -109,7 +129,7 @@ def add_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
     conn.commit()
     new_id = cur.lastrowid
     conn.close()
-    return new_id
+    return new_id, True
 
 
 def add_skipped_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
@@ -230,14 +250,14 @@ def get_due_words_split(user_id: int):
     overdue = conn.execute(
         """SELECT * FROM words WHERE user_id = ? AND pool = 'overdue'
            AND status NOT IN ('mastered', 'skipped')
-           ORDER BY next_review_date ASC""",
+           ORDER BY next_review_date ASC, RANDOM()""",
         (user_id,),
     ).fetchall()
     scheduled = conn.execute(
         """SELECT * FROM words WHERE user_id = ? AND pool = 'scheduled'
            AND status NOT IN ('mastered', 'skipped')
            AND next_review_date <= ?
-           ORDER BY next_review_date ASC""",
+           ORDER BY next_review_date ASC, RANDOM()""",
         (user_id, today),
     ).fetchall()
     conn.close()
@@ -333,7 +353,7 @@ def mark_review_result(word_id: int, grade: str):
         conn.close()
         return
 
-    new_status = _stage_to_status(new_stage)
+    new_status = _stage_to_status(new_stage, times)
     conn.execute(
         """UPDATE words SET interval_stage = ?, next_review_date = ?,
            correct_streak = ?, status = ?, times_reviewed = ?,

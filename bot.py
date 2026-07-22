@@ -60,7 +60,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Секунду, ищу...")
 
     info = ai_helper.explain_word(word)
-    db.add_word(
+    word_id, is_new = db.add_word(
         user_id=update.effective_user.id,
         phrase=info.get("phrase", word),
         meaning=info.get("meaning", ""),
@@ -69,6 +69,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         examples=info.get("examples", []),
         conjugation=info.get("conjugation"),
     )
+
+    if not is_new:
+        await update.message.reply_text(
+            f'📖 *{info.get("phrase", word)}* уже есть в твоём словаре — не добавляю дубль.',
+            parse_mode="Markdown",
+        )
+        return
 
     examples_text = "\n".join(f"• {e}" for e in info.get("examples", []))
     conj = info.get("conjugation")
@@ -234,7 +241,7 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
     examples = json.loads(row["examples"] or "[]")
     distractors = db.get_distractors(user_id, exclude_id=row["id"], count=2)
 
-    if examples and len(distractors) >= 2:
+    if examples and len(distractors) >= 2 and random.random() < 0.5:
         sent = await _try_send_fill_blank(chat_id, row, examples, distractors, context, is_overdue)
         if sent:
             return
@@ -473,7 +480,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if op == "save" and idx < len(queue):
             item = queue[idx]
-            db.add_word(
+            _word_id, is_new = db.add_word(
                 user_id=query.from_user.id,
                 phrase=item["phrase"],
                 meaning=item.get("meaning", ""),
@@ -483,8 +490,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 conjugation=item.get("conjugation"),
             )
             context.user_data["words_saved"] = context.user_data.get("words_saved", 0) + 1
+            status_text = "Сохранено" if is_new else "Уже было в словаре"
             await query.edit_message_text(
-                f'Сохранено: *{item["phrase"]}* ✅',
+                f'{status_text}: *{item["phrase"]}* ✅',
                 parse_mode="Markdown",
             )
         else:
