@@ -3,7 +3,7 @@ import re
 import json
 import random
 import logging
-from datetime import time as dtime
+from datetime import date, time as dtime
 
 from dotenv import load_dotenv
 
@@ -361,6 +361,25 @@ async def reset_collected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def debug_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db.get_review_history_words(update.effective_user.id)
+    if not rows:
+        await update.message.reply_text("Нет ни одного слова, которое уже проходило повторение хотя бы раз.")
+        return
+    today = date.today().isoformat()
+    lines = []
+    for r in rows:
+        due_mark = "✅ due" if (r["next_review_date"] or "") <= today else "⏳ ждёт"
+        lines.append(
+            f"{due_mark} | {r['phrase']}\n"
+            f"   status={r['status']} pool={r['pool']} stage={r['interval_stage']} "
+            f"reviews={r['times_reviewed']} next={r['next_review_date']}"
+        )
+    text = f"Слова с историей повторений ({len(rows)}), сегодня={today}:\n\n" + "\n\n".join(lines)
+    for i in range(0, len(text), 3800):
+        await update.message.reply_text(text[i:i + 3800])
+
+
 # ---------------------------------------------------------------------------
 # Button callback handler
 # ---------------------------------------------------------------------------
@@ -546,6 +565,7 @@ def main():
     app.add_handler(CommandHandler("all", review_all))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("reset_collected", reset_collected))
+    app.add_handler(CommandHandler("debug_due", debug_due))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 

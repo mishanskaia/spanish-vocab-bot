@@ -165,6 +165,20 @@ def get_user_words(user_id: int):
     return [r["phrase"] for r in rows]
 
 
+def get_review_history_words(user_id: int):
+    """Every word that has been reviewed at least once, for diagnosing
+    scheduling issues (status/pool/next_review_date at a glance)."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT phrase, status, pool, next_review_date, times_reviewed, interval_stage
+           FROM words WHERE user_id = ? AND times_reviewed > 0
+           ORDER BY next_review_date ASC""",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def reset_collected_review_dates(user_id: int, batch_size: int = 15):
     """Spreads this user's collected words across next_review_date in
     batches of batch_size (oldest first). Returns [(date_iso, count), ...]."""
