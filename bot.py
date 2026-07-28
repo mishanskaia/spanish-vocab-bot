@@ -387,6 +387,20 @@ async def debug_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text[i:i + 3800])
 
 
+async def _maybe_send_mnemonic(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE, grade: str):
+    if grade != "hard":
+        return
+    mnemonic = row["mnemonic"]
+    if not mnemonic:
+        try:
+            mnemonic = ai_helper.get_mnemonic(row["phrase"], row["meaning"], row["part_of_speech"])
+        except Exception:
+            logger.exception("mnemonic generation failed for word_id=%s", row["id"])
+            return
+        db.save_mnemonic(row["id"], mnemonic)
+    await context.bot.send_message(chat_id, mnemonic, parse_mode="Markdown")
+
+
 # ---------------------------------------------------------------------------
 # Button callback handler
 # ---------------------------------------------------------------------------
@@ -434,6 +448,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'*{row["phrase"]}* — {marks.get(grade, "")}',
             parse_mode="Markdown",
         )
+        await _maybe_send_mnemonic(query.message.chat_id, row, context, grade)
         if "all_queue" in context.user_data:
             context.user_data["all_index"] = context.user_data.get("all_index", 0) + 1
             await _send_all_next(query.message.chat_id, query.from_user.id, context)
@@ -457,6 +472,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f'Неверно ❌\n\nПравильный ответ: *{row["phrase"]}* — {row["meaning"]}',
                 parse_mode="Markdown",
             )
+        await _maybe_send_mnemonic(query.message.chat_id, row, context, grade)
         if "all_queue" in context.user_data:
             context.user_data["all_index"] = context.user_data.get("all_index", 0) + 1
             await _send_all_next(query.message.chat_id, query.from_user.id, context)
