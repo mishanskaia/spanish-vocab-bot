@@ -87,6 +87,7 @@ def init_db():
     )
     _safe_add_column(conn, "pool TEXT DEFAULT 'scheduled'")
     _safe_add_column(conn, "added_window TEXT DEFAULT 'morning'")
+    _safe_add_column(conn, "mnemonic TEXT")
     conn.execute(
         "UPDATE words SET status = 'learning' WHERE status = 'collected' AND times_reviewed > 0"
     )
@@ -294,6 +295,13 @@ def count_due_not_reviewed_today(user_id: int) -> int:
     ).fetchone()
     conn.close()
     return row["c"] if row else 0
+
+
+def save_mnemonic(word_id: int, mnemonic: str):
+    conn = get_connection()
+    conn.execute("UPDATE words SET mnemonic = ? WHERE id = ?", (mnemonic, word_id))
+    conn.commit()
+    conn.close()
 
 
 def get_word_by_id(word_id):
