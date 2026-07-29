@@ -398,7 +398,11 @@ async def _maybe_send_mnemonic(chat_id: int, row, context: ContextTypes.DEFAULT_
             logger.exception("mnemonic generation failed for word_id=%s", row["id"])
             return
         db.save_mnemonic(row["id"], mnemonic)
-    await context.bot.send_message(chat_id, mnemonic, parse_mode="Markdown")
+    try:
+        await context.bot.send_message(chat_id, mnemonic, parse_mode="Markdown")
+    except Exception:
+        logger.exception("mnemonic send failed for word_id=%s, retrying as plain text", row["id"])
+        await context.bot.send_message(chat_id, mnemonic)
 
 
 # ---------------------------------------------------------------------------
