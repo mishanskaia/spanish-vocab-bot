@@ -387,6 +387,22 @@ async def debug_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text[i:i + 3800])
 
 
+def _mnemonic_keyboard(word_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Оставить ✅", callback_data=f"mnemo_keep:{word_id}"),
+        InlineKeyboardButton("Другой вариант 🔄", callback_data=f"mnemo_retry:{word_id}"),
+    ]])
+
+
+async def _send_mnemonic_message(chat_id: int, word_id: int, mnemonic: str, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = _mnemonic_keyboard(word_id)
+    try:
+        await context.bot.send_message(chat_id, mnemonic, parse_mode="Markdown", reply_markup=keyboard)
+    except Exception:
+        logger.exception("mnemonic send failed for word_id=%s, retrying as plain text", word_id)
+        await context.bot.send_message(chat_id, mnemonic, reply_markup=keyboard)
+
+
 async def _maybe_send_mnemonic(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE, grade: str):
     if grade != "hard":
         return
@@ -398,11 +414,7 @@ async def _maybe_send_mnemonic(chat_id: int, row, context: ContextTypes.DEFAULT_
             logger.exception("mnemonic generation failed for word_id=%s", row["id"])
             return
         db.save_mnemonic(row["id"], mnemonic)
-    try:
-        await context.bot.send_message(chat_id, mnemonic, parse_mode="Markdown")
-    except Exception:
-        logger.exception("mnemonic send failed for word_id=%s, retrying as plain text", row["id"])
-        await context.bot.send_message(chat_id, mnemonic)
+    await _send_mnemonic_message(chat_id, row["id"], mnemonic, context)
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +494,40 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_all_next(query.message.chat_id, query.from_user.id, context)
         else:
             await _send_next_due(query.message.chat_id, query.from_user.id, context)
+
+    # --- mnemonic accept/retry ---
+    elif action == "mnemo_keep":
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+    elif action == "mnemo_retry":
+        word_id = int(parts[1])
+        row = db.get_word_by_id(word_id)
+        if row is None:
+            return
+        try:
+            new_mnemonic = ai_helper.get_mnemonic(
+                row["phrase"], row["meaning"], row["part_of_speech"], avoid=row["mnemonic"]
+            )
+        except Exception:
+            logger.exception("mnemonic retry failed for word_id=%s", word_id)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await context.bot.send_message(
+                query.message.chat_id, "Не получилось подобрать другой вариант, попробуй позже."
+            )
+            return
+        db.save_mnemonic(word_id, new_mnemonic)
+        keyboard = _mnemonic_keyboard(word_id)
+        try:
+            await query.edit_message_text(new_mnemonic, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception:
+            logger.exception("mnemonic retry edit failed for word_id=%s", word_id)
+            await query.edit_message_text(new_mnemonic, reply_markup=keyboard)
 
     # --- delete word by button ---
     elif action == "del_word":

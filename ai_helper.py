@@ -44,15 +44,18 @@ MNEMONIC_SYSTEM_PROMPT = """Ты помогаешь запомнить испа�
 Пиши сжато, разговорным тоном, без академичности. Максимум 4-5 строк всего."""
 
 
-def get_mnemonic(phrase: str, meaning: str, part_of_speech: str = "") -> str:
+def get_mnemonic(phrase: str, meaning: str, part_of_speech: str = "", avoid: str = None) -> str:
+    content = f'Слово/фраза: "{phrase}" — {meaning} ({part_of_speech})'
+    if avoid:
+        content += (
+            f'\n\nЭтот вариант пользователю не подошёл:\n{avoid}\n\n'
+            f'Предложи другой — обязательно другим способом из трёх (не тем же, что выше).'
+        )
     response = client.messages.create(
         model=MODEL,
         max_tokens=400,
         system=MNEMONIC_SYSTEM_PROMPT,
-        messages=[{
-            "role": "user",
-            "content": f'Слово/фраза: "{phrase}" — {meaning} ({part_of_speech})',
-        }],
+        messages=[{"role": "user", "content": content}],
     )
     return response.content[0].text.strip()
 
@@ -76,8 +79,8 @@ def explain_word(word: str) -> dict:
   "conjugation": null
 }}
 
-Если это глагол — поле conjugation должно быть строкой с таблицей спряжения:
-"yo ..., tú ..., él/ella ..., nosotros ..., ellos/ellas ..."
+Если это глагол — поле conjugation должно быть строкой с таблицей спряжения, ОБЯЗАТЕЛЬНО все 6 лиц:
+"yo ..., tú ..., él/ella ..., nosotros ..., vosotros ..., ellos/ellas ..."
 
 Если не глагол — conjugation = null"""
     return _ask_claude(prompt)
@@ -106,7 +109,7 @@ def find_frequent_words(existing_words: list, count: int = 10) -> list:
     "part_of_speech": "существительное" | "глагол" | "прилагательное" | "наречие" | "предлог" | "местоимение" | "другое",
     "cefr_level": "A1" | "A2",
     "examples": ["пример 1 (испанский — русский)", "пример 2 (испанский — русский)"],
-    "conjugation": "yo ..., tú ..., él/ella ..., nosotros ..., ellos/ellas ..." или null
+    "conjugation": "yo ..., tú ..., él/ella ..., nosotros ..., vosotros ..., ellos/ellas ..." (все 6 лиц) или null
   }}
 ]"""
     result = _ask_claude(prompt)
