@@ -400,7 +400,10 @@ async def _send_mnemonic_message(chat_id: int, word_id: int, mnemonic: str, cont
         await context.bot.send_message(chat_id, mnemonic, parse_mode="Markdown", reply_markup=keyboard)
     except Exception:
         logger.exception("mnemonic send failed for word_id=%s, retrying as plain text", word_id)
-        await context.bot.send_message(chat_id, mnemonic, reply_markup=keyboard)
+        try:
+            await context.bot.send_message(chat_id, mnemonic, reply_markup=keyboard)
+        except Exception:
+            logger.exception("mnemonic plain-text send also failed for word_id=%s", word_id)
 
 
 async def _maybe_send_mnemonic(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE, grade: str):
@@ -527,7 +530,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(new_mnemonic, parse_mode="Markdown", reply_markup=keyboard)
         except Exception:
             logger.exception("mnemonic retry edit failed for word_id=%s", word_id)
-            await query.edit_message_text(new_mnemonic, reply_markup=keyboard)
+            try:
+                await query.edit_message_text(new_mnemonic, reply_markup=keyboard)
+            except Exception:
+                logger.exception("mnemonic retry plain-text edit also failed for word_id=%s", word_id)
 
     # --- delete word by button ---
     elif action == "del_word":
