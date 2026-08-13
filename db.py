@@ -395,6 +395,17 @@ def get_all_words_for_review(user_id):
     return rows
 
 
+def get_words_for_export(user_id: int):
+    """All of a user's words (skipped included), for the read-only API."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM words WHERE user_id = ? ORDER BY added_date DESC",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
 def get_stats(user_id) -> dict:
     conn = get_connection()
     rows = conn.execute(
