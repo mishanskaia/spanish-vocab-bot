@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -26,6 +27,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+API_KEY = os.environ.get("API_KEY")
 # 10:00 Moscow = 07:00 UTC; 18:00 Moscow = 15:00 UTC
 REMINDER_MORNING_UTC = (7, 0)
 REMINDER_EVENING_UTC = (15, 0)
@@ -621,6 +623,52 @@ async def evening_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Read-only API — lets another site of yours pull your word list.
+# Runs in the same process/container as the bot, reading the same DB file.
+# ---------------------------------------------------------------------------
+
+def _word_row_to_dict(row) -> dict:
+    d = dict(row)
+    try:
+        d["examples"] = json.loads(d.get("examples") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        d["examples"] = []
+    return d
+
+
+async def handle_api_words(request: web.Request) -> web.Response:
+    if not API_KEY or request.query.get("key") != API_KEY:
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    user_id_param = request.query.get("user_id")
+    if not user_id_param or not user_id_param.isdigit():
+        return web.json_response({"error": "user_id query param is required"}, status=400)
+
+    rows = db.get_words_for_export(int(user_id_param))
+    words = [_word_row_to_dict(r) for r in rows]
+    return web.json_response(words, headers={"Access-Control-Allow-Origin": "*"})
+
+
+async def handle_api_health(request: web.Request) -> web.Response:
+    return web.json_response({"status": "ok"})
+
+
+async def start_api_server(app: Application):
+    if not API_KEY:
+        logger.warning("API_KEY is not set — the read-only API will reject every request.")
+    api = web.Application()
+    api.router.add_get("/words", handle_api_words)
+    api.router.add_get("/health", handle_api_health)
+    runner = web.AppRunner(api)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    app.bot_data["api_runner"] = runner  # keep a reference so it isn't garbage-collected
+    logger.info(f"Read-only API listening on port {port}")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
@@ -632,6 +680,7 @@ async def post_init(app: Application):
         ("delete", "Удалить слово из базы"),
         ("stats", "Статистика словаря"),
     ])
+    await start_api_server(app)
 
 
 def main():
