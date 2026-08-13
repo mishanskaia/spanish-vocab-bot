@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API_KEY = os.environ.get("API_KEY")
+API_WRITE_KEY = os.environ.get("API_WRITE_KEY")
 # 10:00 Moscow = 07:00 UTC; 18:00 Moscow = 15:00 UTC
 REMINDER_MORNING_UTC = (7, 0)
 REMINDER_EVENING_UTC = (15, 0)
@@ -623,9 +624,13 @@ async def evening_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Read-only API — lets another site of yours pull your word list.
-# Runs in the same process/container as the bot, reading the same DB file.
+# API — lets another site of yours read your word list, and (with a separate
+# write key) add new words the same way typing to the bot directly would.
+# Runs in the same process/container as the bot, reading/writing the same DB file.
 # ---------------------------------------------------------------------------
+
+_CORS_HEADERS = {"Access-Control-Allow-Origin": "*"}
+
 
 def _word_row_to_dict(row) -> dict:
     d = dict(row)
@@ -638,15 +643,70 @@ def _word_row_to_dict(row) -> dict:
 
 async def handle_api_words(request: web.Request) -> web.Response:
     if not API_KEY or request.query.get("key") != API_KEY:
-        return web.json_response({"error": "unauthorized"}, status=401)
+        return web.json_response({"error": "unauthorized"}, status=401, headers=_CORS_HEADERS)
 
     user_id_param = request.query.get("user_id")
     if not user_id_param or not user_id_param.isdigit():
-        return web.json_response({"error": "user_id query param is required"}, status=400)
+        return web.json_response(
+            {"error": "user_id query param is required"}, status=400, headers=_CORS_HEADERS
+        )
 
     rows = db.get_words_for_export(int(user_id_param))
     words = [_word_row_to_dict(r) for r in rows]
-    return web.json_response(words, headers={"Access-Control-Allow-Origin": "*"})
+    return web.json_response(words, headers=_CORS_HEADERS)
+
+
+async def handle_api_add_word(request: web.Request) -> web.Response:
+    if not API_WRITE_KEY:
+        return web.json_response({"error": "unauthorized"}, status=401, headers=_CORS_HEADERS)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON body"}, status=400, headers=_CORS_HEADERS)
+
+    if payload.get("key") != API_WRITE_KEY:
+        return web.json_response({"error": "unauthorized"}, status=401, headers=_CORS_HEADERS)
+
+    try:
+        user_id = int(payload.get("user_id"))
+    except (TypeError, ValueError):
+        user_id = None
+    word = (payload.get("word") or "").strip()
+    if user_id is None or not word:
+        return web.json_response(
+            {"error": "user_id (number) and word are required"}, status=400, headers=_CORS_HEADERS
+        )
+
+    try:
+        info = ai_helper.explain_word(word)
+    except Exception:
+        logger.exception("api add_word: explain_word failed for %r", word)
+        return web.json_response({"error": "failed to look up word"}, status=502, headers=_CORS_HEADERS)
+
+    word_id, is_new = db.add_word(
+        user_id=user_id,
+        phrase=info.get("phrase", word),
+        meaning=info.get("meaning", ""),
+        part_of_speech=info.get("part_of_speech", ""),
+        cefr_level=info.get("cefr_level", ""),
+        examples=info.get("examples", []),
+        conjugation=info.get("conjugation"),
+    )
+    result = _word_row_to_dict(db.get_word_by_id(word_id))
+    return web.json_response(
+        {"is_new": is_new, "word": result},
+        status=201 if is_new else 200,
+        headers=_CORS_HEADERS,
+    )
+
+
+async def handle_api_words_options(request: web.Request) -> web.Response:
+    return web.Response(headers={
+        **_CORS_HEADERS,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+    })
 
 
 async def handle_api_health(request: web.Request) -> web.Response:
@@ -656,8 +716,12 @@ async def handle_api_health(request: web.Request) -> web.Response:
 async def start_api_server(app: Application):
     if not API_KEY:
         logger.warning("API_KEY is not set — the read-only API will reject every request.")
+    if not API_WRITE_KEY:
+        logger.warning("API_WRITE_KEY is not set — the add-word API will reject every request.")
     api = web.Application()
     api.router.add_get("/words", handle_api_words)
+    api.router.add_post("/words", handle_api_add_word)
+    api.router.add_route("OPTIONS", "/words", handle_api_words_options)
     api.router.add_get("/health", handle_api_health)
     runner = web.AppRunner(api)
     await runner.setup()
@@ -665,7 +729,7 @@ async def start_api_server(app: Application):
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     app.bot_data["api_runner"] = runner  # keep a reference so it isn't garbage-collected
-    logger.info(f"Read-only API listening on port {port}")
+    logger.info(f"API listening on port {port}")
 
 
 # ---------------------------------------------------------------------------
