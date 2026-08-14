@@ -390,6 +390,39 @@ async def debug_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text[i:i + 3800])
 
 
+async def debug_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    db.detect_and_mark_overdue(user_id)
+    overdue, scheduled = db.get_due_words_split(user_id)
+    combined = overdue + scheduled
+    today = date.today().isoformat()
+
+    if not combined:
+        await update.message.reply_text(f"Очередь /review пуста сегодня ({today}).")
+        return
+
+    new_count = sum(1 for r in combined if (r["times_reviewed"] or 0) == 0)
+    review_count = len(combined) - new_count
+    capped_new = max(0, new_count - NEW_WORDS_DAILY_LIMIT)
+
+    lines = [
+        f"Очередь /review сейчас, сегодня={today}:",
+        f"Всего due: {len(combined)} (🆕 новых: {new_count}, 🔁 на повторение: {review_count})",
+        f"Лимит новых в сессию: {NEW_WORDS_DAILY_LIMIT}"
+        + (f" — {capped_new} новых НЕ покажутся в этой сессии" if capped_new else ""),
+        "",
+    ]
+    for r in combined:
+        is_new = (r["times_reviewed"] or 0) == 0
+        tag = "🆕" if is_new else "🔁"
+        lines.append(
+            f"{tag} {r['phrase']} | pool={r['pool']} next={r['next_review_date']} reviews={r['times_reviewed']}"
+        )
+    text = "\n".join(lines)
+    for i in range(0, len(text), 3800):
+        await update.message.reply_text(text[i:i + 3800])
+
+
 def _mnemonic_keyboard(word_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("Оставить ✅", callback_data=f"mnemo_keep:{word_id}"),
@@ -759,6 +792,7 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("reset_collected", reset_collected))
     app.add_handler(CommandHandler("debug_due", debug_due))
+    app.add_handler(CommandHandler("debug_queue", debug_queue))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
