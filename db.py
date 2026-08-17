@@ -88,6 +88,8 @@ def init_db():
     _safe_add_column(conn, "pool TEXT DEFAULT 'scheduled'")
     _safe_add_column(conn, "added_window TEXT DEFAULT 'morning'")
     _safe_add_column(conn, "mnemonic TEXT")
+    _safe_add_column(conn, "collocations TEXT")
+    _safe_add_column(conn, "gerund TEXT")
     conn.execute(
         "UPDATE words SET status = 'learning' WHERE status = 'collected' AND times_reviewed > 0"
     )
@@ -106,7 +108,7 @@ def find_word_by_phrase(user_id: int, phrase: str):
 
 
 def add_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
-             conjugation=None):
+             conjugation=None, collocations=None, gerund=None):
     """Returns (word_id, is_new). If the phrase already exists for this
     user (case-insensitive), returns the existing row instead of inserting
     a duplicate."""
@@ -121,11 +123,12 @@ def add_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
     cur = conn.execute(
         """INSERT INTO words
            (user_id, phrase, meaning, part_of_speech, cefr_level, examples,
-            conjugation, added_date, interval_stage, next_review_date,
+            conjugation, collocations, gerund, added_date, interval_stage, next_review_date,
             correct_streak, times_reviewed, success_rate, status, pool, added_window)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0, 0.0, 'collected', 'scheduled', ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, 0, 0, 0.0, 'collected', 'scheduled', ?)""",
         (user_id, phrase, meaning, part_of_speech, cefr_level,
-         json.dumps(examples), conjugation, today, first_review, added_window),
+         json.dumps(examples), conjugation, json.dumps(collocations or []), gerund,
+         today, first_review, added_window),
     )
     conn.commit()
     new_id = cur.lastrowid

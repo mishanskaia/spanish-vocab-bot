@@ -35,6 +35,22 @@ REMINDER_EVENING_UTC = (15, 0)
 NEW_WORDS_DAILY_LIMIT = 15
 
 
+def _format_conj_gerund(conjugation, gerund) -> str:
+    if not conjugation:
+        return ""
+    block = f"\n\n📝 Спряжение: {conjugation}"
+    if gerund:
+        block += f"\nГерундий: {gerund}"
+    return block
+
+
+def _format_collocations(collocations) -> str:
+    if not collocations:
+        return ""
+    lines = "\n".join(f"• {c}" for c in collocations)
+    return f"\n\n💬 Устойчивые выражения:\n{lines}"
+
+
 # ---------------------------------------------------------------------------
 # /start
 # ---------------------------------------------------------------------------
@@ -71,6 +87,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cefr_level=info.get("cefr_level", ""),
         examples=info.get("examples", []),
         conjugation=info.get("conjugation"),
+        collocations=info.get("collocations", []),
+        gerund=info.get("gerund"),
     )
 
     if not is_new:
@@ -81,8 +99,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     examples_text = "\n".join(f"• {e}" for e in info.get("examples", []))
-    conj = info.get("conjugation")
-    conj_block = f"\n\n📝 Спряжение: {conj}" if conj else ""
+    conj_block = _format_conj_gerund(info.get("conjugation"), info.get("gerund"))
+    collocations_block = _format_collocations(info.get("collocations"))
 
     window = db.get_current_window()
     if window == 'morning':
@@ -95,7 +113,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f'{info.get("meaning", "")}\n'
         f'_{info.get("part_of_speech", "")} · {info.get("cefr_level", "")}_\n\n'
         f'Примеры:\n{examples_text}'
-        f'{conj_block}\n\n'
+        f'{conj_block}'
+        f'{collocations_block}\n\n'
         f'{review_hint}',
         parse_mode="Markdown",
     )
@@ -140,8 +159,8 @@ async def _send_words_item(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
 
     item = queue[idx]
     examples_text = "\n".join(f"• {e}" for e in item.get("examples", []))
-    conj = item.get("conjugation")
-    conj_block = f"\n\n📝 Спряжение: {conj}" if conj else ""
+    conj_block = _format_conj_gerund(item.get("conjugation"), item.get("gerund"))
+    collocations_block = _format_collocations(item.get("collocations"))
 
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("Сохранить ✅", callback_data=f"words_save:{idx}"),
@@ -152,7 +171,8 @@ async def _send_words_item(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
         f'*{item["phrase"]}* — {item.get("meaning", "")}\n'
         f'_{item.get("part_of_speech", "")} · {item.get("cefr_level", "")}_\n\n'
         f'Примеры:\n{examples_text}'
-        f'{conj_block}',
+        f'{conj_block}'
+        f'{collocations_block}',
         reply_markup=keyboard,
         parse_mode="Markdown",
     )
@@ -476,14 +496,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         examples = json.loads(row["examples"] or "[]")
         examples_text = "\n".join(f"• {e}" for e in examples)
-        conj = row["conjugation"]
-        conj_block = f"\n\n📝 Спряжение: {conj}" if conj else ""
+        conj_block = _format_conj_gerund(row["conjugation"], row["gerund"])
+        collocations_block = _format_collocations(json.loads(row["collocations"] or "[]"))
 
         await query.edit_message_text(
             f'*{row["phrase"]}* — {row["meaning"]}\n'
             f'_{row["part_of_speech"]} · {row["cefr_level"]}_\n\n'
             f'Примеры:\n{examples_text}'
-            f'{conj_block}\n\nТы вспомнил(а)?',
+            f'{conj_block}'
+            f'{collocations_block}\n\nТы вспомнил(а)?',
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Легко 🟢", callback_data=f"grade:{word_id}:easy"),
                 InlineKeyboardButton("Помню 🟡", callback_data=f"grade:{word_id}:remember"),
@@ -596,6 +617,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 cefr_level=item.get("cefr_level", ""),
                 examples=item.get("examples", []),
                 conjugation=item.get("conjugation"),
+                collocations=item.get("collocations", []),
+                gerund=item.get("gerund"),
             )
             context.user_data["words_saved"] = context.user_data.get("words_saved", 0) + 1
             status_text = "Сохранено" if is_new else "Уже было в словаре"
@@ -671,6 +694,10 @@ def _word_row_to_dict(row) -> dict:
         d["examples"] = json.loads(d.get("examples") or "[]")
     except (TypeError, json.JSONDecodeError):
         d["examples"] = []
+    try:
+        d["collocations"] = json.loads(d.get("collocations") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        d["collocations"] = []
     return d
 
 
@@ -725,6 +752,8 @@ async def handle_api_add_word(request: web.Request) -> web.Response:
         cefr_level=info.get("cefr_level", ""),
         examples=info.get("examples", []),
         conjugation=info.get("conjugation"),
+        collocations=info.get("collocations", []),
+        gerund=info.get("gerund"),
     )
     result = _word_row_to_dict(db.get_word_by_id(word_id))
     return web.json_response(
