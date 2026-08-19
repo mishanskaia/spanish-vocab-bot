@@ -78,7 +78,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Секунду, ищу...")
 
-    info = ai_helper.explain_word(word)
+    try:
+        info = ai_helper.explain_word(word)
+    except Exception:
+        logger.exception("explain_word failed for %r", word)
+        await update.message.reply_text(
+            "Не получилось найти это слово — попробуй ещё раз через минуту."
+        )
+        return
+
     word_id, is_new = db.add_word(
         user_id=update.effective_user.id,
         phrase=info.get("phrase", word),
@@ -131,7 +139,11 @@ async def words(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Подбираю слова, подожди немного...")
 
     existing = db.get_user_words(update.effective_user.id)
-    new_words = ai_helper.find_frequent_words(existing, count=5)
+    try:
+        new_words = ai_helper.find_frequent_words(existing, count=5)
+    except Exception:
+        logger.exception("find_frequent_words failed")
+        new_words = []
 
     if not new_words:
         await update.message.reply_text("Не удалось подобрать слова. Попробуй ещё раз.")
