@@ -12,10 +12,10 @@ SYSTEM_PROMPT = (
 )
 
 
-def _ask_claude(prompt: str):
+def _ask_claude(prompt: str, max_tokens: int = 2500):
     response = client.messages.create(
         model=MODEL,
-        max_tokens=1500,
+        max_tokens=max_tokens,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -119,5 +119,5 @@ def find_frequent_words(existing_words: list, count: int = 10) -> list:
     "conjugation": "yo ..., tú ..., él/ella ..., nosotros ..., vosotros ..., ellos/ellas ..." (все 6 лиц) или null
   }}
 ]"""
-    result = _ask_claude(prompt)
+    result = _ask_claude(prompt, max_tokens=4000)
     return result if isinstance(result, list) else []
