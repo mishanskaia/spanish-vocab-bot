@@ -107,6 +107,19 @@ def find_word_by_phrase(user_id: int, phrase: str):
     return row
 
 
+def _coerce_text(value):
+    """Claude doesn't always follow the requested type for free-form fields
+    (e.g. conjugation as a dict instead of a string) — normalize to a plain
+    string (or None) so it can be bound as a SQLite parameter."""
+    if value is None or isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return ", ".join(f"{k} {v}" for k, v in value.items())
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
 def add_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
              conjugation=None, collocations=None, gerund=None):
     """Returns (word_id, is_new). If the phrase already exists for this
@@ -115,6 +128,9 @@ def add_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
     existing = find_word_by_phrase(user_id, phrase)
     if existing:
         return existing["id"], False
+
+    conjugation = _coerce_text(conjugation)
+    gerund = _coerce_text(gerund)
 
     conn = get_connection()
     today = date.today().isoformat()
