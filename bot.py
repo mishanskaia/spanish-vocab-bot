@@ -32,7 +32,6 @@ API_WRITE_KEY = os.environ.get("API_WRITE_KEY")
 # 10:00 Moscow = 07:00 UTC; 18:00 Moscow = 15:00 UTC
 REMINDER_MORNING_UTC = (7, 0)
 REMINDER_EVENING_UTC = (15, 0)
-NEW_WORDS_DAILY_LIMIT = 15
 
 
 def _format_conj_gerund(conjugation, gerund) -> str:
@@ -227,7 +226,6 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("all_queue", None)
     context.user_data["review_shown"] = set()
-    context.user_data["review_new_shown"] = 0
     db.detect_and_mark_overdue(update.effective_user.id)
     await _send_next_due(update.effective_chat.id, update.effective_user.id, context)
 
@@ -236,7 +234,6 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
     if user_data is None:
         user_data = context.user_data
     shown = user_data.get("review_shown", set())
-    new_shown = user_data.get("review_new_shown", 0)
     overdue, scheduled = db.get_due_words_split(user_id)
 
     # Filter out already shown in this session
@@ -247,29 +244,9 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
         await context.bot.send_message(chat_id, "Нет слов для повторения сегодня 🎉")
         return
 
-    # Overdue first, then scheduled, both ordered by due date. Only brand-new
-    # (never reviewed) words count against the daily cap — words already in
-    # progress are reviewed every time they're due, same as Anki review cards.
-    row = None
-    is_overdue = False
-    for candidate, candidate_is_overdue in [(r, True) for r in overdue] + [(r, False) for r in scheduled]:
-        is_new = (candidate["times_reviewed"] or 0) == 0
-        if is_new and new_shown >= NEW_WORDS_DAILY_LIMIT:
-            continue
-        row, is_overdue = candidate, candidate_is_overdue
-        break
+    # Overdue first, then scheduled, both ordered by due date.
+    row, is_overdue = (overdue + scheduled)[0], bool(overdue)
 
-    if row is None:
-        await context.bot.send_message(
-            chat_id,
-            f"Новых слов на сегодня достаточно — изучили {NEW_WORDS_DAILY_LIMIT} 👍\n"
-            f"Слова на повторение из старого расписания на сегодня закончились.",
-        )
-        return
-
-    is_new = (row["times_reviewed"] or 0) == 0
-    if is_new:
-        user_data["review_new_shown"] = new_shown + 1
     shown.add(row["id"])
     user_data["review_shown"] = shown
 
@@ -435,13 +412,10 @@ async def debug_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     new_count = sum(1 for r in combined if (r["times_reviewed"] or 0) == 0)
     review_count = len(combined) - new_count
-    capped_new = max(0, new_count - NEW_WORDS_DAILY_LIMIT)
 
     lines = [
         f"Очередь /review сейчас, сегодня={today}:",
         f"Всего due: {len(combined)} (🆕 новых: {new_count}, 🔁 на повторение: {review_count})",
-        f"Лимит новых в сессию: {NEW_WORDS_DAILY_LIMIT}"
-        + (f" — {capped_new} новых НЕ покажутся в этой сессии" if capped_new else ""),
         "",
     ]
     for r in combined:
@@ -462,30 +436,17 @@ def _mnemonic_keyboard(word_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-async def _send_mnemonic_message(chat_id: int, word_id: int, mnemonic: str, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = _mnemonic_keyboard(word_id)
-    try:
-        await context.bot.send_message(chat_id, mnemonic, parse_mode="Markdown", reply_markup=keyboard)
-    except Exception:
-        logger.exception("mnemonic send failed for word_id=%s, retrying as plain text", word_id)
-        try:
-            await context.bot.send_message(chat_id, mnemonic, reply_markup=keyboard)
-        except Exception:
-            logger.exception("mnemonic plain-text send also failed for word_id=%s", word_id)
-
-
-async def _maybe_send_mnemonic(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE, grade: str):
+async def _maybe_ask_mnemonic(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE, grade: str):
     if grade != "hard":
         return
-    mnemonic = row["mnemonic"]
-    if not mnemonic:
-        try:
-            mnemonic = ai_helper.get_mnemonic(row["phrase"], row["meaning"], row["part_of_speech"])
-        except Exception:
-            logger.exception("mnemonic generation failed for word_id=%s", row["id"])
-            return
-        db.save_mnemonic(row["id"], mnemonic)
-    await _send_mnemonic_message(chat_id, row["id"], mnemonic, context)
+    await context.bot.send_message(
+        chat_id,
+        "Показать ассоциацию для запоминания?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Да", callback_data=f"mnemo_ask:{row['id']}:yes"),
+            InlineKeyboardButton("Нет", callback_data=f"mnemo_ask:{row['id']}:no"),
+        ]]),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -518,8 +479,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'{conj_block}'
             f'{collocations_block}\n\nТы вспомнил(а)?',
             reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("Легко 🟢", callback_data=f"grade:{word_id}:easy"),
-                InlineKeyboardButton("Помню 🟡", callback_data=f"grade:{word_id}:remember"),
+                InlineKeyboardButton("Помню 🟢", callback_data=f"grade:{word_id}:remember"),
                 InlineKeyboardButton("Сложно 🔴", callback_data=f"grade:{word_id}:hard"),
             ]]),
             parse_mode="Markdown",
@@ -531,12 +491,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         grade = parts[2]
         db.mark_review_result(word_id, grade)
         row = db.get_word_by_id(word_id)
-        marks = {"easy": "Легко 🟢", "remember": "Помню 🟡", "hard": "Сложно 🔴"}
+        marks = {"remember": "Помню 🟢", "hard": "Сложно 🔴"}
         await query.edit_message_text(
             f'*{row["phrase"]}* — {marks.get(grade, "")}',
             parse_mode="Markdown",
         )
-        await _maybe_send_mnemonic(query.message.chat_id, row, context, grade)
+        await _maybe_ask_mnemonic(query.message.chat_id, row, context, grade)
         if "all_queue" in context.user_data:
             context.user_data["all_index"] = context.user_data.get("all_index", 0) + 1
             await _send_all_next(query.message.chat_id, query.from_user.id, context)
@@ -560,12 +520,47 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f'Неверно ❌\n\nПравильный ответ: *{row["phrase"]}* — {row["meaning"]}',
                 parse_mode="Markdown",
             )
-        await _maybe_send_mnemonic(query.message.chat_id, row, context, grade)
+        await _maybe_ask_mnemonic(query.message.chat_id, row, context, grade)
         if "all_queue" in context.user_data:
             context.user_data["all_index"] = context.user_data.get("all_index", 0) + 1
             await _send_all_next(query.message.chat_id, query.from_user.id, context)
         else:
             await _send_next_due(query.message.chat_id, query.from_user.id, context)
+
+    # --- mnemonic show prompt ---
+    elif action == "mnemo_ask":
+        word_id = int(parts[1])
+        answer = parts[2]
+        if answer == "no":
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            return
+        row = db.get_word_by_id(word_id)
+        if row is None:
+            return
+        mnemonic = row["mnemonic"]
+        if not mnemonic:
+            try:
+                mnemonic = ai_helper.get_mnemonic(row["phrase"], row["meaning"], row["part_of_speech"])
+            except Exception:
+                logger.exception("mnemonic generation failed for word_id=%s", word_id)
+                try:
+                    await query.edit_message_text("Не получилось подобрать ассоциацию, попробуй позже.")
+                except Exception:
+                    pass
+                return
+            db.save_mnemonic(word_id, mnemonic)
+        keyboard = _mnemonic_keyboard(word_id)
+        try:
+            await query.edit_message_text(mnemonic, parse_mode="Markdown", reply_markup=keyboard)
+        except Exception:
+            logger.exception("mnemonic edit failed for word_id=%s", word_id)
+            try:
+                await query.edit_message_text(mnemonic, reply_markup=keyboard)
+            except Exception:
+                logger.exception("mnemonic plain-text edit also failed for word_id=%s", word_id)
 
     # --- mnemonic accept/retry ---
     elif action == "mnemo_keep":
@@ -674,7 +669,6 @@ async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
             )
             user_data = context.application.user_data[user_id]
             user_data["review_shown"] = set()
-            user_data["review_new_shown"] = 0
             db.detect_and_mark_overdue(user_id)
             await _send_next_due(user_id, user_id, context, user_data)
 

@@ -332,8 +332,7 @@ def get_word_by_id(word_id):
 
 def mark_review_result(word_id: int, grade: str):
     """
-    grade: 'easy' | 'remember' | 'hard'
-    easy:    advance stage, interval × 1.3
+    grade: 'remember' | 'hard'
     remember: advance stage, normal interval
     hard:    stay stage, interval × 0.6 (min 1 day)
     """
@@ -347,17 +346,13 @@ def mark_review_result(word_id: int, grade: str):
     streak = row["correct_streak"]
     times = (row["times_reviewed"] or 0) + 1
     old_rate = row["success_rate"] or 0.0
-    is_correct = grade in ('easy', 'remember')
+    is_correct = grade == 'remember'
     new_rate = ((old_rate * (times - 1)) + (1.0 if is_correct else 0.0)) / times
     today = date.today().isoformat()
 
     base_interval = INTERVALS[min(stage, len(INTERVALS) - 1)]
 
-    if grade == 'easy':
-        days = math.ceil(base_interval * 1.3)
-        new_stage = stage + 1
-        streak += 1
-    elif grade == 'remember':
+    if grade == 'remember':
         days = base_interval
         new_stage = stage + 1
         streak += 1
