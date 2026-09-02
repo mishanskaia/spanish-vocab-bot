@@ -1,7 +1,6 @@
 import os
 import re
 import json
-import random
 import logging
 from datetime import date, time as dtime
 
@@ -33,6 +32,12 @@ API_WRITE_KEY = os.environ.get("API_WRITE_KEY")
 REMINDER_MORNING_UTC = (7, 0)
 REMINDER_EVENING_UTC = (15, 0)
 
+RECALL_DISCLAIMER = (
+    "💡 Ответ в карточках повторения — в словарной форме "
+    "(инфинитив для глаголов, с артиклем для существительных), "
+    "даже если в примере слово стоит в другой форме."
+)
+
 
 def _format_conj_gerund(conjugation, gerund) -> str:
     if not conjugation:
@@ -48,6 +53,43 @@ def _format_collocations(collocations) -> str:
         return ""
     lines = "\n".join(f"• {c}" for c in collocations)
     return f"\n\n💬 Устойчивые выражения:\n{lines}"
+
+
+def _split_example(example: str):
+    """Examples are stored as "испанский — русский перевод" in one string."""
+    if " — " in example:
+        es, ru = example.split(" — ", 1)
+        return es.strip(), ru.strip()
+    return example.strip(), None
+
+
+def _make_blank(phrase: str, example_es: str):
+    word_for_search = phrase
+    if " " in phrase and phrase.split()[0].lower() in ("el", "la", "los", "las"):
+        word_for_search = phrase.split(" ", 1)[1]
+
+    blank = re.sub(re.escape(word_for_search), "_____", example_es, count=1, flags=re.IGNORECASE)
+    if "_____" not in blank:
+        blank = re.sub(re.escape(phrase), "_____", example_es, count=1, flags=re.IGNORECASE)
+    if "_____" not in blank:
+        return None
+    return blank
+
+
+def _build_recall_prompt(row) -> str:
+    """Active-recall prompt: cloze sentence when we can find the word in the
+    example, otherwise the example's Russian translation as context, otherwise
+    just the bare meaning."""
+    examples = json.loads(row["examples"] or "[]")
+    if examples:
+        example_es, example_ru = _split_example(examples[0])
+        blank = _make_blank(row["phrase"], example_es)
+        if blank:
+            suffix = f" — {example_ru}" if example_ru else ""
+            return f'Вставь пропущенное слово:\n\n*{blank}{suffix}*'
+        if example_ru:
+            return f'Контекст: _{example_ru}_\n\nКак будет по-испански: *{row["meaning"]}*'
+    return f'Как будет по-испански:\n\n*{row["meaning"]}*'
 
 
 # ---------------------------------------------------------------------------
@@ -220,13 +262,14 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# /review — recognition + fill-in-the-blank
+# /review — active recall (cloze context, self-graded)
 # ---------------------------------------------------------------------------
 
 async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("all_queue", None)
     context.user_data["review_shown"] = set()
     db.detect_and_mark_overdue(update.effective_user.id)
+    await update.message.reply_text(RECALL_DISCLAIMER)
     await _send_next_due(update.effective_chat.id, update.effective_user.id, context)
 
 
@@ -250,64 +293,20 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
     shown.add(row["id"])
     user_data["review_shown"] = shown
 
-    examples = json.loads(row["examples"] or "[]")
-    distractors = db.get_distractors(user_id, exclude_id=row["id"], count=2)
-
-    if examples and len(distractors) >= 2 and random.random() < 0.5:
-        sent = await _try_send_fill_blank(chat_id, row, examples, distractors, context, is_overdue)
-        if sent:
-            return
-
-    await _send_recognition(chat_id, row, context, is_overdue)
+    await _send_recall_card(chat_id, row, context, is_overdue)
 
 
-async def _send_recognition(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE, is_overdue: bool = False):
+async def _send_recall_card(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE, is_overdue: bool = False):
     prefix = "⚠️ *Пропущено ранее*\n\n" if is_overdue else ""
     keyboard = InlineKeyboardMarkup(
         [[InlineKeyboardButton("Показать ответ", callback_data=f"show:{row['id']}")]]
     )
     await context.bot.send_message(
         chat_id,
-        f'{prefix}Как будет по-испански:\n\n*{row["meaning"]}*',
+        f'{prefix}{_build_recall_prompt(row)}',
         reply_markup=keyboard,
         parse_mode="Markdown",
     )
-
-
-async def _try_send_fill_blank(chat_id, row, examples, distractors, context, is_overdue=False) -> bool:
-    phrase = row["phrase"]
-    example = examples[0]
-
-    word_for_search = phrase
-    if " " in phrase and phrase.split()[0].lower() in ("el", "la", "los", "las"):
-        word_for_search = phrase.split(" ", 1)[1]
-
-    blank_sentence = re.sub(re.escape(word_for_search), "_____", example, count=1, flags=re.IGNORECASE)
-    if "_____" not in blank_sentence:
-        blank_sentence = re.sub(re.escape(phrase), "_____", example, count=1, flags=re.IGNORECASE)
-    if "_____" not in blank_sentence:
-        return False
-
-    options = [phrase] + [d["phrase"] for d in distractors]
-    random.shuffle(options)
-
-    buttons = [
-        InlineKeyboardButton(
-            opt,
-            callback_data=f"fill:{row['id']}:{'correct' if opt == phrase else 'wrong'}",
-        )
-        for opt in options
-    ]
-    keyboard = InlineKeyboardMarkup([buttons])
-    prefix = "⚠️ *Пропущено ранее*\n\n" if is_overdue else ""
-
-    await context.bot.send_message(
-        chat_id,
-        f'{prefix}Вставь пропущенное слово:\n\n*{blank_sentence}*',
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +320,7 @@ async def review_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["all_queue"] = [dict(r) for r in all_words]
     context.user_data["all_index"] = 0
+    await update.message.reply_text(RECALL_DISCLAIMER)
     await _send_all_next(update.effective_chat.id, update.effective_user.id, context)
 
 
@@ -331,13 +331,7 @@ async def _send_all_next(chat_id: int, user_id: int, context: ContextTypes.DEFAU
         await context.bot.send_message(chat_id, "Все слова пройдены! 🎉")
         return
     row = queue[idx]
-    examples = json.loads(row.get("examples") or "[]")
-    distractors = db.get_distractors(user_id, exclude_id=row["id"], count=2)
-    if examples and len(distractors) >= 2:
-        sent = await _try_send_fill_blank(chat_id, row, examples, distractors, context)
-        if sent:
-            return
-    await _send_recognition(chat_id, row, context)
+    await _send_recall_card(chat_id, row, context)
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +431,7 @@ def _mnemonic_keyboard(word_id: int) -> InlineKeyboardMarkup:
 
 
 async def _maybe_ask_mnemonic(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE, grade: str):
-    if grade != "hard":
+    if grade == "remember":
         return
     await context.bot.send_message(
         chat_id,
@@ -480,6 +474,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'{collocations_block}\n\nТы вспомнил(а)?',
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Помню 🟢", callback_data=f"grade:{word_id}:remember"),
+                InlineKeyboardButton("Почти помню 🟡", callback_data=f"grade:{word_id}:almost"),
                 InlineKeyboardButton("Сложно 🔴", callback_data=f"grade:{word_id}:hard"),
             ]]),
             parse_mode="Markdown",
@@ -491,35 +486,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         grade = parts[2]
         db.mark_review_result(word_id, grade)
         row = db.get_word_by_id(word_id)
-        marks = {"remember": "Помню 🟢", "hard": "Сложно 🔴"}
+        marks = {"remember": "Помню 🟢", "almost": "Почти помню 🟡", "hard": "Сложно 🔴"}
         await query.edit_message_text(
             f'*{row["phrase"]}* — {marks.get(grade, "")}',
             parse_mode="Markdown",
         )
-        await _maybe_ask_mnemonic(query.message.chat_id, row, context, grade)
-        if "all_queue" in context.user_data:
-            context.user_data["all_index"] = context.user_data.get("all_index", 0) + 1
-            await _send_all_next(query.message.chat_id, query.from_user.id, context)
-        else:
-            await _send_next_due(query.message.chat_id, query.from_user.id, context)
-
-    # --- fill-in-the-blank ---
-    elif action == "fill":
-        word_id = int(parts[1])
-        result = parts[2]
-        grade = "remember" if result == "correct" else "hard"
-        db.mark_review_result(word_id, grade)
-        row = db.get_word_by_id(word_id)
-        if result == "correct":
-            await query.edit_message_text(
-                f'Правильно! ✅\n\n*{row["phrase"]}* — {row["meaning"]}',
-                parse_mode="Markdown",
-            )
-        else:
-            await query.edit_message_text(
-                f'Неверно ❌\n\nПравильный ответ: *{row["phrase"]}* — {row["meaning"]}',
-                parse_mode="Markdown",
-            )
         await _maybe_ask_mnemonic(query.message.chat_id, row, context, grade)
         if "all_queue" in context.user_data:
             context.user_data["all_index"] = context.user_data.get("all_index", 0) + 1

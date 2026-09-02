@@ -93,6 +93,21 @@ def init_db():
     conn.execute(
         "UPDATE words SET status = 'learning' WHERE status = 'collected' AND times_reviewed > 0"
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS review_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            word_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            grade TEXT NOT NULL,
+            stage_before INTEGER NOT NULL,
+            reviewed_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_review_log_word_id ON review_log(word_id)"
+    )
     conn.commit()
     conn.close()
 
@@ -332,8 +347,10 @@ def get_word_by_id(word_id):
 
 def mark_review_result(word_id: int, grade: str):
     """
-    grade: 'remember' | 'hard'
+    grade: 'remember' | 'almost' | 'hard'
     remember: advance stage, normal interval
+    almost:  stay stage, interval × 0.8 (min 1 day) — recalled with hesitation,
+             not clean enough to advance, but stronger than a miss
     hard:    stay stage, interval × 0.6 (min 1 day)
     """
     conn = get_connection()
@@ -346,8 +363,8 @@ def mark_review_result(word_id: int, grade: str):
     streak = row["correct_streak"]
     times = (row["times_reviewed"] or 0) + 1
     old_rate = row["success_rate"] or 0.0
-    is_correct = grade == 'remember'
-    new_rate = ((old_rate * (times - 1)) + (1.0 if is_correct else 0.0)) / times
+    credit = {"remember": 1.0, "almost": 0.5}.get(grade, 0.0)
+    new_rate = ((old_rate * (times - 1)) + credit) / times
     today = date.today().isoformat()
 
     base_interval = INTERVALS[min(stage, len(INTERVALS) - 1)]
@@ -356,12 +373,22 @@ def mark_review_result(word_id: int, grade: str):
         days = base_interval
         new_stage = stage + 1
         streak += 1
+    elif grade == 'almost':
+        days = max(1, round(base_interval * 0.8))
+        new_stage = stage
+        streak = 0
     else:  # hard
         days = max(1, math.floor(base_interval * 0.6))
         new_stage = stage
         streak = 0
 
     next_review = (date.today() + timedelta(days=days)).isoformat()
+
+    conn.execute(
+        """INSERT INTO review_log (word_id, user_id, grade, stage_before, reviewed_at)
+           VALUES (?, ?, ?, ?, ?)""",
+        (word_id, row["user_id"], grade, stage, get_moscow_now().isoformat()),
+    )
 
     if new_stage >= len(INTERVALS):
         conn.execute(
@@ -385,16 +412,6 @@ def mark_review_result(word_id: int, grade: str):
     )
     conn.commit()
     conn.close()
-
-
-def get_distractors(user_id: int, exclude_id: int, count: int = 2):
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM words WHERE user_id = ? AND id != ? ORDER BY RANDOM() LIMIT ?",
-        (user_id, exclude_id, count),
-    ).fetchall()
-    conn.close()
-    return rows
 
 
 def get_all_words_for_review(user_id):
