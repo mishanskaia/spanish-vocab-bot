@@ -474,7 +474,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f'{collocations_block}\n\nТы вспомнил(а)?',
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("Помню 🟢", callback_data=f"grade:{word_id}:remember"),
-                InlineKeyboardButton("Почти помню 🟡", callback_data=f"grade:{word_id}:almost"),
+                InlineKeyboardButton("Почти 🟡", callback_data=f"grade:{word_id}:almost"),
                 InlineKeyboardButton("Сложно 🔴", callback_data=f"grade:{word_id}:hard"),
             ]]),
             parse_mode="Markdown",
