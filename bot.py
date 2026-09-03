@@ -28,9 +28,12 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API_KEY = os.environ.get("API_KEY")
 API_WRITE_KEY = os.environ.get("API_WRITE_KEY")
-# 10:00 Moscow = 07:00 UTC; 18:00 Moscow = 15:00 UTC
+# 10:00 Moscow = 07:00 UTC; 14:00 Moscow = 11:00 UTC; 18:00 Moscow = 15:00 UTC
 REMINDER_MORNING_UTC = (7, 0)
+REMINDER_MIDDAY_UTC = (11, 0)
 REMINDER_EVENING_UTC = (15, 0)
+
+SESSION_WORD_LIMIT = 30
 
 RECALL_DISCLAIMER = (
     "💡 Ответ в карточках повторения — в словарной форме "
@@ -285,6 +288,14 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
 
     if not overdue and not scheduled:
         await context.bot.send_message(chat_id, "Нет слов для повторения сегодня 🎉")
+        return
+
+    if len(shown) >= SESSION_WORD_LIMIT:
+        await context.bot.send_message(
+            chat_id,
+            f"На эту сессию хватит — {SESSION_WORD_LIMIT} слов сделано 👍\n"
+            f"Остальное подождёт следующей сессии (10:00 / 14:00 / 18:00 МСК)."
+        )
         return
 
     # Overdue first, then scheduled, both ordered by due date.
@@ -630,30 +641,31 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Daily reminders
 # ---------------------------------------------------------------------------
 
-async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
+async def _run_reminder(context: ContextTypes.DEFAULT_TYPE, greeting: str):
     for user_id in db.get_all_due_users():
         count = db.count_due_not_reviewed_today(user_id)
         if count > 0:
-            await context.bot.send_message(
-                user_id,
-                f"☀️ Доброе утро! Слов на повторение: {count}"
-            )
+            session_count = min(count, SESSION_WORD_LIMIT)
+            text = f"{greeting} Слов на эту сессию: {session_count}"
+            if count > SESSION_WORD_LIMIT:
+                text += f"\n(всего в очереди: {count})"
+            await context.bot.send_message(user_id, text)
             user_data = context.application.user_data[user_id]
             user_data["review_shown"] = set()
             db.detect_and_mark_overdue(user_id)
             await _send_next_due(user_id, user_id, context, user_data)
 
 
+async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
+    await _run_reminder(context, "☀️ Доброе утро!")
+
+
+async def midday_reminder(context: ContextTypes.DEFAULT_TYPE):
+    await _run_reminder(context, "🕑 Дневная сессия!")
+
+
 async def evening_reminder(context: ContextTypes.DEFAULT_TYPE):
-    for user_id in db.get_all_due_users():
-        count = db.count_due_not_reviewed_today(user_id)
-        if count > 0:
-            await context.bot.send_message(
-                user_id,
-                f"🌙 Добрый вечер! Слов на повторение: {count}"
-            )
-            user_data = context.application.user_data[user_id]
-            await _send_next_due(user_id, user_id, context, user_data)
+    await _run_reminder(context, "🌙 Добрый вечер!")
 
 
 # ---------------------------------------------------------------------------
@@ -803,6 +815,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     app.job_queue.run_daily(morning_reminder, time=dtime(hour=REMINDER_MORNING_UTC[0], minute=REMINDER_MORNING_UTC[1]))
+    app.job_queue.run_daily(midday_reminder, time=dtime(hour=REMINDER_MIDDAY_UTC[0], minute=REMINDER_MIDDAY_UTC[1]))
     app.job_queue.run_daily(evening_reminder, time=dtime(hour=REMINDER_EVENING_UTC[0], minute=REMINDER_EVENING_UTC[1]))
 
     print("Bot started. Stop with Ctrl+C.")
