@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import time
+import asyncio
 import logging
 from datetime import date, time as dtime
 
@@ -28,12 +30,15 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API_KEY = os.environ.get("API_KEY")
 API_WRITE_KEY = os.environ.get("API_WRITE_KEY")
+OWNER_TELEGRAM_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0") or "0")
+DAILY_NEW_WORD_LIMIT = int(os.environ.get("DAILY_NEW_WORD_LIMIT", "5"))
 # 10:00 Moscow = 07:00 UTC; 14:00 Moscow = 11:00 UTC; 18:00 Moscow = 15:00 UTC
 REMINDER_MORNING_UTC = (7, 0)
 REMINDER_MIDDAY_UTC = (11, 0)
 REMINDER_EVENING_UTC = (15, 0)
 
 SESSION_WORD_LIMIT = 30
+MNEMONIC_RETRY_LIMIT = 3
 
 RECALL_DISCLAIMER = (
     "💡 Ответ в карточках повторения — в словарной форме "
@@ -103,12 +108,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я помогу тебе учить испанские слова 🇪🇸\n\n"
         "Просто напиши любое испанское слово — я объясню и сохраню его.\n\n"
-        "/words — добавить новые слова автоматически\n"
         "/review — повторить слова по расписанию\n"
         "/all — повторить все слова из базы\n"
         "/delete — удалить слово из базы\n"
         "/stats — статистика словаря"
     )
+
+
+# ---------------------------------------------------------------------------
+# Дневной лимит на добавление новых слов — каждый вызов explain_word() стоит
+# денег с личного ANTHROPIC_API_KEY владельца бота, поэтому у всех кроме
+# OWNER_TELEGRAM_ID он ограничен.
+# ---------------------------------------------------------------------------
+
+def _is_owner(user_id: int) -> bool:
+    return bool(OWNER_TELEGRAM_ID) and user_id == OWNER_TELEGRAM_ID
+
+
+def _daily_limit_reached(user_id: int) -> bool:
+    if _is_owner(user_id):
+        return False
+    return db.count_words_added_today(user_id) >= DAILY_NEW_WORD_LIMIT
+
+
+def _mnemonic_retry_allowed(user_id: int, word_id: int) -> bool:
+    if _is_owner(user_id):
+        return True
+    return db.get_mnemonic_retries(word_id) < MNEMONIC_RETRY_LIMIT
+
+
+DAILY_LIMIT_MESSAGE = (
+    f"На сегодня лимит новых слов исчерпан ({DAILY_NEW_WORD_LIMIT}/день). "
+    f"Приходи завтра — то, что уже в словаре, никуда не денется 🙂"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +152,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not word or word.startswith("/"):
         return
 
+    if _daily_limit_reached(update.effective_user.id):
+        await update.message.reply_text(DAILY_LIMIT_MESSAGE)
+        return
+
     await update.message.reply_text("Секунду, ищу...")
 
     try:
-        info = ai_helper.explain_word(word)
+        info = await asyncio.to_thread(ai_helper.explain_word, word)
     except Exception:
         logger.exception("explain_word failed for %r", word)
         await update.message.reply_text(
@@ -163,73 +199,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f'✅ *{info.get("phrase", word)}*\n'
         f'{info.get("meaning", "")}\n'
-        f'_{info.get("part_of_speech", "")} · {info.get("cefr_level", "")}_\n\n'
+        f'_{info.get("part_of_speech", "")}_\n\n'
         f'Примеры:\n{examples_text}'
         f'{conj_block}'
         f'{collocations_block}\n\n'
         f'{review_hint}',
-        parse_mode="Markdown",
-    )
-
-
-# ---------------------------------------------------------------------------
-# /words — новые слова
-# ---------------------------------------------------------------------------
-
-async def words(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("all_queue", None)
-    context.user_data.pop("words_saved", None)
-    context.user_data.pop("words_skipped", None)
-    await update.message.reply_text("Подбираю слова, подожди немного...")
-
-    existing = db.get_user_words(update.effective_user.id)
-    try:
-        new_words = ai_helper.find_frequent_words(existing, count=5)
-    except Exception:
-        logger.exception("find_frequent_words failed")
-        new_words = []
-
-    if not new_words:
-        await update.message.reply_text("Не удалось подобрать слова. Попробуй ещё раз.")
-        return
-
-    context.user_data["words_queue"] = new_words
-    context.user_data["words_index"] = 0
-    await _send_words_item(update.effective_chat.id, context)
-
-
-async def _send_words_item(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
-    queue = context.user_data.get("words_queue", [])
-    idx = context.user_data.get("words_index", 0)
-
-    if idx >= len(queue):
-        saved = context.user_data.get("words_saved", 0)
-        skipped = context.user_data.get("words_skipped", 0)
-        context.user_data.pop("words_saved", None)
-        context.user_data.pop("words_skipped", None)
-        await context.bot.send_message(
-            chat_id,
-            f"Готово! Сохранено: {saved}, пропущено: {skipped}."
-        )
-        return
-
-    item = queue[idx]
-    examples_text = "\n".join(f"• {e}" for e in item.get("examples", []))
-    conj_block = _format_conj_gerund(item.get("conjugation"), item.get("gerund"))
-    collocations_block = _format_collocations(item.get("collocations"))
-
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Сохранить ✅", callback_data=f"words_save:{idx}"),
-        InlineKeyboardButton("Пропустить ➡️", callback_data=f"words_skip:{idx}"),
-    ]])
-    await context.bot.send_message(
-        chat_id,
-        f'*{item["phrase"]}* — {item.get("meaning", "")}\n'
-        f'_{item.get("part_of_speech", "")} · {item.get("cefr_level", "")}_\n\n'
-        f'Примеры:\n{examples_text}'
-        f'{conj_block}'
-        f'{collocations_block}',
-        reply_markup=keyboard,
         parse_mode="Markdown",
     )
 
@@ -374,6 +348,8 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def reset_collected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update.effective_user.id):
+        return
     batches = db.reset_collected_review_dates(update.effective_user.id)
     if not batches:
         await update.message.reply_text("Нет слов в статусе «собрано» — распределять нечего.")
@@ -386,6 +362,8 @@ async def reset_collected(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def debug_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update.effective_user.id):
+        return
     rows = db.get_review_history_words(update.effective_user.id)
     if not rows:
         await update.message.reply_text("Нет ни одного слова, которое уже проходило повторение хотя бы раз.")
@@ -406,6 +384,8 @@ async def debug_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def debug_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if not _is_owner(user_id):
+        return
     db.detect_and_mark_overdue(user_id)
     overdue, scheduled = db.get_due_words_split(user_id)
     combined = overdue + scheduled
@@ -434,11 +414,11 @@ async def debug_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text[i:i + 3800])
 
 
-def _mnemonic_keyboard(word_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Оставить ✅", callback_data=f"mnemo_keep:{word_id}"),
-        InlineKeyboardButton("Другой вариант 🔄", callback_data=f"mnemo_retry:{word_id}"),
-    ]])
+def _mnemonic_keyboard(word_id: int, show_retry: bool = True) -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton("Оставить ✅", callback_data=f"mnemo_keep:{word_id}")]
+    if show_retry:
+        buttons.append(InlineKeyboardButton("Другой вариант 🔄", callback_data=f"mnemo_retry:{word_id}"))
+    return InlineKeyboardMarkup([buttons])
 
 
 async def _maybe_ask_mnemonic(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE, grade: str):
@@ -479,7 +459,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await query.edit_message_text(
             f'*{row["phrase"]}* — {row["meaning"]}\n'
-            f'_{row["part_of_speech"]} · {row["cefr_level"]}_\n\n'
+            f'_{row["part_of_speech"]}_\n\n'
             f'Примеры:\n{examples_text}'
             f'{conj_block}'
             f'{collocations_block}\n\nТы вспомнил(а)?',
@@ -525,7 +505,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mnemonic = row["mnemonic"]
         if not mnemonic:
             try:
-                mnemonic = ai_helper.get_mnemonic(row["phrase"], row["meaning"], row["part_of_speech"])
+                mnemonic = await asyncio.to_thread(
+                    ai_helper.get_mnemonic, row["phrase"], row["meaning"], row["part_of_speech"]
+                )
             except Exception:
                 logger.exception("mnemonic generation failed for word_id=%s", word_id)
                 try:
@@ -556,9 +538,26 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         row = db.get_word_by_id(word_id)
         if row is None:
             return
+
+        if not _mnemonic_retry_allowed(query.from_user.id, word_id):
+            try:
+                await query.edit_message_text(
+                    row["mnemonic"],
+                    parse_mode="Markdown",
+                    reply_markup=_mnemonic_keyboard(word_id, show_retry=False),
+                )
+            except Exception:
+                pass
+            await context.bot.send_message(
+                query.message.chat_id,
+                f"Лимит вариантов для этого слова исчерпан ({MNEMONIC_RETRY_LIMIT}) — оставляем этот 🙂",
+            )
+            return
+
         try:
-            new_mnemonic = ai_helper.get_mnemonic(
-                row["phrase"], row["meaning"], row["part_of_speech"], avoid=row["mnemonic"]
+            new_mnemonic = await asyncio.to_thread(
+                ai_helper.get_mnemonic,
+                row["phrase"], row["meaning"], row["part_of_speech"], avoid=row["mnemonic"],
             )
         except Exception:
             logger.exception("mnemonic retry failed for word_id=%s", word_id)
@@ -571,7 +570,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         db.save_mnemonic(word_id, new_mnemonic)
-        keyboard = _mnemonic_keyboard(word_id)
+        retries = db.increment_mnemonic_retries(word_id)
+        show_retry = (
+            _is_owner(query.from_user.id)
+            or retries < MNEMONIC_RETRY_LIMIT
+        )
+        keyboard = _mnemonic_keyboard(word_id, show_retry=show_retry)
         try:
             await query.edit_message_text(new_mnemonic, parse_mode="Markdown", reply_markup=keyboard)
         except Exception:
@@ -589,52 +593,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f'Слово *{word}* удалено.', parse_mode="Markdown")
         else:
             await query.edit_message_text(f'Слово *{word}* не найдено.', parse_mode="Markdown")
-
-    # --- /words queue ---
-    elif action in ("words_save", "words_skip"):
-        op = action.split("_")[1]
-        idx = int(parts[1])
-        queue = context.user_data.get("words_queue", [])
-
-        if op == "save" and idx < len(queue):
-            item = queue[idx]
-            _word_id, is_new = db.add_word(
-                user_id=query.from_user.id,
-                phrase=item["phrase"],
-                meaning=item.get("meaning", ""),
-                part_of_speech=item.get("part_of_speech", ""),
-                cefr_level=item.get("cefr_level", ""),
-                examples=item.get("examples", []),
-                conjugation=item.get("conjugation"),
-                collocations=item.get("collocations", []),
-                gerund=item.get("gerund"),
-            )
-            context.user_data["words_saved"] = context.user_data.get("words_saved", 0) + 1
-            status_text = "Сохранено" if is_new else "Уже было в словаре"
-            await query.edit_message_text(
-                f'{status_text}: *{item["phrase"]}* ✅',
-                parse_mode="Markdown",
-            )
-        else:
-            if idx < len(queue):
-                item = queue[idx]
-                context.user_data["words_skipped"] = context.user_data.get("words_skipped", 0) + 1
-                db.add_skipped_word(
-                    user_id=query.from_user.id,
-                    phrase=item["phrase"],
-                    meaning=item.get("meaning", ""),
-                    part_of_speech=item.get("part_of_speech", ""),
-                    cefr_level=item.get("cefr_level", ""),
-                    examples=item.get("examples", []),
-                    conjugation=item.get("conjugation"),
-                )
-                await query.edit_message_text(
-                    f'Пропущено: *{item["phrase"]}*',
-                    parse_mode="Markdown",
-                )
-
-        context.user_data["words_index"] = idx + 1
-        await _send_words_item(query.message.chat_id, context)
 
 
 # ---------------------------------------------------------------------------
@@ -727,8 +685,15 @@ async def handle_api_add_word(request: web.Request) -> web.Response:
             {"error": "user_id (number) and word are required"}, status=400, headers=_CORS_HEADERS
         )
 
+    if _daily_limit_reached(user_id):
+        return web.json_response(
+            {"error": f"daily limit of {DAILY_NEW_WORD_LIMIT} new words reached"},
+            status=429,
+            headers=_CORS_HEADERS,
+        )
+
     try:
-        info = ai_helper.explain_word(word)
+        info = await asyncio.to_thread(ai_helper.explain_word, word)
     except Exception:
         logger.exception("api add_word: explain_word failed for %r", word)
         return web.json_response({"error": "failed to look up word"}, status=502, headers=_CORS_HEADERS)
@@ -784,12 +749,51 @@ async def start_api_server(app: Application):
 
 
 # ---------------------------------------------------------------------------
+# Глобальный обработчик ошибок — иначе необработанное исключение в хендлере
+# просто уходит в лог Railway, а пользователь молча не получает ответа.
+# ---------------------------------------------------------------------------
+
+ERROR_NOTIFY_THROTTLE_SECONDS = 60
+_last_owner_error_notify_at = 0.0
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    global _last_owner_error_notify_at
+
+    logger.error("Unhandled exception while processing update: %s", update, exc_info=context.error)
+
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                update.effective_chat.id, "Что-то пошло не так, попробуй ещё раз."
+            )
+        except Exception:
+            logger.exception("Failed to notify user about the error")
+
+    if not OWNER_TELEGRAM_ID:
+        return
+
+    now = time.monotonic()
+    if now - _last_owner_error_notify_at < ERROR_NOTIFY_THROTTLE_SECONDS:
+        return
+    _last_owner_error_notify_at = now
+
+    user_id = update.effective_user.id if isinstance(update, Update) and update.effective_user else "?"
+    try:
+        await context.bot.send_message(
+            OWNER_TELEGRAM_ID,
+            f"⚠️ Ошибка у пользователя {user_id}: {type(context.error).__name__}: {context.error}",
+        )
+    except Exception:
+        logger.exception("Failed to notify owner about the error")
+
+
+# ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
 
 async def post_init(app: Application):
     await app.bot.set_my_commands([
-        ("words", "Добавить новые слова"),
         ("review", "Повторить слова по расписанию"),
         ("all", "Повторить все слова из базы"),
         ("delete", "Удалить слово из базы"),
@@ -803,7 +807,6 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("words", words))
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("review", review))
     app.add_handler(CommandHandler("all", review_all))
@@ -813,6 +816,7 @@ def main():
     app.add_handler(CommandHandler("debug_queue", debug_queue))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(error_handler)
 
     app.job_queue.run_daily(morning_reminder, time=dtime(hour=REMINDER_MORNING_UTC[0], minute=REMINDER_MORNING_UTC[1]))
     app.job_queue.run_daily(midday_reminder, time=dtime(hour=REMINDER_MIDDAY_UTC[0], minute=REMINDER_MIDDAY_UTC[1]))

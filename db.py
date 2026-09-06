@@ -88,6 +88,7 @@ def init_db():
     _safe_add_column(conn, "pool TEXT DEFAULT 'scheduled'")
     _safe_add_column(conn, "added_window TEXT DEFAULT 'morning'")
     _safe_add_column(conn, "mnemonic TEXT")
+    _safe_add_column(conn, "mnemonic_retries INTEGER DEFAULT 0")
     _safe_add_column(conn, "collocations TEXT")
     _safe_add_column(conn, "gerund TEXT")
     conn.execute(
@@ -165,25 +166,6 @@ def add_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
     new_id = cur.lastrowid
     conn.close()
     return new_id, True
-
-
-def add_skipped_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
-                     conjugation=None) -> int:
-    conn = get_connection()
-    today = date.today().isoformat()
-    cur = conn.execute(
-        """INSERT OR IGNORE INTO words
-           (user_id, phrase, meaning, part_of_speech, cefr_level, examples,
-            conjugation, added_date, interval_stage, next_review_date,
-            correct_streak, times_reviewed, success_rate, status, pool, added_window)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, 0, 0, 0.0, 'skipped', 'scheduled', 'morning')""",
-        (user_id, phrase, meaning, part_of_speech, cefr_level,
-         json.dumps(examples), conjugation, today),
-    )
-    conn.commit()
-    new_id = cur.lastrowid
-    conn.close()
-    return new_id
 
 
 def delete_word(user_id: int, phrase: str) -> bool:
@@ -304,6 +286,20 @@ def get_due_words(user_id):
     return overdue + scheduled
 
 
+def count_words_added_today(user_id: int) -> int:
+    """Counts rows inserted today for this user — tracks token spend
+    (a Claude call already happened by the time a lookup turns out to be
+    a duplicate), not just successfully-kept vocabulary."""
+    conn = get_connection()
+    today = date.today().isoformat()
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM words WHERE user_id = ? AND added_date = ?",
+        (user_id, today),
+    ).fetchone()
+    conn.close()
+    return row["c"]
+
+
 def get_all_due_users():
     conn = get_connection()
     today = date.today().isoformat()
@@ -336,6 +332,25 @@ def save_mnemonic(word_id: int, mnemonic: str):
     conn.execute("UPDATE words SET mnemonic = ? WHERE id = ?", (mnemonic, word_id))
     conn.commit()
     conn.close()
+
+
+def get_mnemonic_retries(word_id: int) -> int:
+    conn = get_connection()
+    row = conn.execute("SELECT mnemonic_retries FROM words WHERE id = ?", (word_id,)).fetchone()
+    conn.close()
+    return row["mnemonic_retries"] if row and row["mnemonic_retries"] is not None else 0
+
+
+def increment_mnemonic_retries(word_id: int) -> int:
+    conn = get_connection()
+    conn.execute(
+        "UPDATE words SET mnemonic_retries = COALESCE(mnemonic_retries, 0) + 1 WHERE id = ?",
+        (word_id,),
+    )
+    conn.commit()
+    row = conn.execute("SELECT mnemonic_retries FROM words WHERE id = ?", (word_id,)).fetchone()
+    conn.close()
+    return row["mnemonic_retries"]
 
 
 def get_word_by_id(word_id):
