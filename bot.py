@@ -32,6 +32,9 @@ API_WRITE_KEY = os.environ.get("API_WRITE_KEY")
 REMINDER_MORNING_UTC = (7, 0)
 REMINDER_EVENING_UTC = (15, 0)
 
+# Max cards shown per /review session (resets when /review is pressed again).
+REVIEW_SESSION_LIMIT = 20
+
 RECALL_DISCLAIMER = (
     "💡 Ответ в карточках повторения — в словарной форме "
     "(инфинитив для глаголов, с артиклем для существительных), "
@@ -277,6 +280,15 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
     if user_data is None:
         user_data = context.user_data
     shown = user_data.get("review_shown", set())
+
+    if len(shown) >= REVIEW_SESSION_LIMIT:
+        await context.bot.send_message(
+            chat_id,
+            f"Показано {REVIEW_SESSION_LIMIT} слов за эту сессию 💪\n"
+            "Нажми /review, чтобы продолжить со следующей порции.",
+        )
+        return
+
     overdue, scheduled = db.get_due_words_split(user_id)
 
     # Filter out already shown in this session
