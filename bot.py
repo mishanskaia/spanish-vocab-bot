@@ -11,7 +11,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from aiohttp import web
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+)
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -964,13 +970,32 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # main
 # ---------------------------------------------------------------------------
 
+PUBLIC_COMMANDS = [
+    ("start", "Начать"),
+    ("review", "Повторить слова по расписанию"),
+    ("all", "Повторить все слова из базы"),
+    ("delete", "Удалить слово из базы"),
+    ("stats", "Статистика словаря"),
+]
+
+OWNER_ONLY_COMMANDS = [
+    ("invite", "Сгенерировать инвайт-ссылку"),
+    ("reset_collected", "Распределить collected-слова по датам"),
+    ("debug_due", "История повторений"),
+    ("debug_queue", "Текущая очередь /review"),
+    ("newtopic", "Добавить тему для Study Coach"),
+    ("topics", "Активные темы Study Coach"),
+    ("canceltopic", "Отменить тему Study Coach"),
+]
+
+
 async def post_init(app: Application):
-    await app.bot.set_my_commands([
-        ("review", "Повторить слова по расписанию"),
-        ("all", "Повторить все слова из базы"),
-        ("delete", "Удалить слово из базы"),
-        ("stats", "Статистика словаря"),
-    ])
+    await app.bot.set_my_commands(PUBLIC_COMMANDS, scope=BotCommandScopeDefault())
+    if OWNER_TELEGRAM_ID:
+        await app.bot.set_my_commands(
+            PUBLIC_COMMANDS + OWNER_ONLY_COMMANDS,
+            scope=BotCommandScopeChat(chat_id=OWNER_TELEGRAM_ID),
+        )
     await start_api_server(app)
 
 
