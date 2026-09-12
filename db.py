@@ -2,6 +2,7 @@ import os
 import sqlite3
 import json
 import math
+import secrets
 from datetime import date, timedelta, datetime, timezone
 
 DB_PATH = os.environ.get("DB_PATH", "spanish_vocab_bot.db")
@@ -128,6 +129,17 @@ def init_db():
             x14_sent INTEGER DEFAULT 0,
             x30_sent INTEGER DEFAULT 0,
             status TEXT DEFAULT 'active'
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS invites (
+            code TEXT PRIMARY KEY,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_by INTEGER,
+            used_at TEXT
         )
         """
     )
@@ -626,3 +638,55 @@ def mark_speech_activation_shown(word_ids):
     )
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Invite-code gate — access control while the bot is shared with a small
+# circle instead of the owner only. See CLAUDE.md "Доступ по инвайт-кодам"
+# for the full rationale (why one-time codes, why a TTL, why no separate
+# status-tracking command).
+# ---------------------------------------------------------------------------
+
+def create_invite(ttl_days: int) -> str:
+    """Generates a one-time invite code, unused until someone redeems it via
+    /start <code>. Unredeemed codes go stale after ttl_days — pure
+    housekeeping, not a security boundary (codes are long enough that
+    guessing one before it expires isn't a realistic risk)."""
+    conn = get_connection()
+    code = secrets.token_urlsafe(9)
+    expires_at = (date.today() + timedelta(days=ttl_days)).isoformat()
+    conn.execute(
+        "INSERT INTO invites (code, created_at, expires_at) VALUES (?, ?, ?)",
+        (code, date.today().isoformat(), expires_at),
+    )
+    conn.commit()
+    conn.close()
+    return code
+
+
+def redeem_invite(code: str, user_id: int) -> bool:
+    """Ties the code to user_id if it's unused and not expired. Whoever gets
+    there first wins — a code shared with two people only ever authorizes
+    the first to open the link."""
+    conn = get_connection()
+    today = date.today().isoformat()
+    cur = conn.execute(
+        """UPDATE invites SET used_by = ?, used_at = ?
+           WHERE code = ? AND used_by IS NULL AND expires_at >= ?""",
+        (user_id, get_moscow_now().isoformat(), code, today),
+    )
+    conn.commit()
+    redeemed = cur.rowcount > 0
+    conn.close()
+    return redeemed
+
+
+def is_user_authorized(user_id: int) -> bool:
+    """A user is authorized once they've ever redeemed a code — this is
+    permanent, not tied to the code's later expiry or reuse elsewhere."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT 1 FROM invites WHERE used_by = ? LIMIT 1", (user_id,)
+    ).fetchone()
+    conn.close()
+    return row is not None

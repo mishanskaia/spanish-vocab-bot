@@ -14,6 +14,7 @@ from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
@@ -32,6 +33,8 @@ API_KEY = os.environ.get("API_KEY")
 API_WRITE_KEY = os.environ.get("API_WRITE_KEY")
 OWNER_TELEGRAM_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0") or "0")
 DAILY_NEW_WORD_LIMIT = int(os.environ.get("DAILY_NEW_WORD_LIMIT", "5"))
+AUTHOR_TELEGRAM_USERNAME = os.environ.get("AUTHOR_TELEGRAM_USERNAME", "")
+INVITE_TTL_DAYS = 15
 # 10:00 Moscow = 07:00 UTC; 14:00 Moscow = 11:00 UTC; 18:00 Moscow = 15:00 UTC
 REMINDER_MORNING_UTC = (7, 0)
 REMINDER_MIDDAY_UTC = (11, 0)
@@ -41,6 +44,12 @@ STUDY_COACH_UTC = (4, 0)
 
 SESSION_WORD_LIMIT = 30
 MNEMONIC_RETRY_LIMIT = 3
+
+ACCESS_TEST_MESSAGE = (
+    "Бот сейчас тестируется. Если тебе нужен доступ — спроси автора"
+    + (f" (@{AUTHOR_TELEGRAM_USERNAME})" if AUTHOR_TELEGRAM_USERNAME else "")
+    + "."
+)
 
 RECALL_DISCLAIMER = (
     "💡 Ответ в карточках повторения — в словарной форме "
@@ -107,6 +116,13 @@ def _build_recall_prompt(row) -> str:
 # ---------------------------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not _is_authorized(user_id):
+        code = context.args[0] if context.args else None
+        if not (code and db.redeem_invite(code, user_id)):
+            await update.message.reply_text(ACCESS_TEST_MESSAGE)
+            return
+
     await update.message.reply_text(
         "Привет! Я помогу тебе учить испанские слова 🇪🇸\n\n"
         "Просто напиши любое испанское слово — я объясню и сохраню его.\n\n"
@@ -127,6 +143,10 @@ def _is_owner(user_id: int) -> bool:
     return bool(OWNER_TELEGRAM_ID) and user_id == OWNER_TELEGRAM_ID
 
 
+def _is_authorized(user_id: int) -> bool:
+    return _is_owner(user_id) or db.is_user_authorized(user_id)
+
+
 def _daily_limit_reached(user_id: int) -> bool:
     if _is_owner(user_id):
         return False
@@ -143,6 +163,30 @@ DAILY_LIMIT_MESSAGE = (
     f"На сегодня лимит новых слов исчерпан ({DAILY_NEW_WORD_LIMIT}/день). "
     f"Приходи завтра — то, что уже в словаре, никуда не денется 🙂"
 )
+
+
+# ---------------------------------------------------------------------------
+# Гейт доступа — бот в закрытом тесте, пускаем только по инвайт-коду
+# (см. CLAUDE.md «Доступ по инвайт-кодам»). Регистрируется в group=-1, раньше
+# всех остальных хендлеров: неавторизованный пользователь получает
+# ACCESS_TEST_MESSAGE и дальше update не идёт (ApplicationHandlerStop) — кроме
+# /start, у него своя логика погашения кода в start() выше.
+# ---------------------------------------------------------------------------
+
+async def access_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user is None or _is_authorized(user.id):
+        return
+
+    message = update.effective_message
+    if message is not None and message.text and message.text.startswith("/start"):
+        return
+
+    if update.callback_query:
+        await update.callback_query.answer(ACCESS_TEST_MESSAGE, show_alert=True)
+    elif message is not None:
+        await message.reply_text(ACCESS_TEST_MESSAGE)
+    raise ApplicationHandlerStop
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +404,16 @@ async def reset_collected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = "\n".join(f"{d}: {c} слов" for d, c in batches)
     await update.message.reply_text(
         f"Распределила {total} слов по датам:\n{lines}\n\nТеперь заходи в /review как обычно."
+    )
+
+
+async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update.effective_user.id):
+        return
+    code = db.create_invite(ttl_days=INVITE_TTL_DAYS)
+    link = f"https://t.me/{context.bot.username}?start={code}"
+    await update.message.reply_text(
+        f"Приглашение (одноразовое, действует {INVITE_TTL_DAYS} дней, если не использовать):\n{link}"
     )
 
 
@@ -924,11 +978,15 @@ def main():
     db.init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
 
+    app.add_handler(MessageHandler(filters.ALL, access_gate), group=-1)
+    app.add_handler(CallbackQueryHandler(access_gate), group=-1)
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("delete", delete))
     app.add_handler(CommandHandler("review", review))
     app.add_handler(CommandHandler("all", review_all))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("invite", invite))
     app.add_handler(CommandHandler("reset_collected", reset_collected))
     app.add_handler(CommandHandler("debug_due", debug_due))
     app.add_handler(CommandHandler("debug_queue", debug_queue))
