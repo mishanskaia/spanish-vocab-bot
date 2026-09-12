@@ -55,6 +55,13 @@ def get_current_window(utc_offset_hours: int = 3) -> str:
     return 'night'
 
 
+def _local_today(utc_offset_hours: int = 3) -> str:
+    """Calendar date in the given UTC offset — for anything that should reset
+    at *that user's* midnight (daily new-word limit, added_date), not the
+    server's UTC date. Same default-to-Moscow convention as get_current_window."""
+    return (datetime.now(timezone.utc) + timedelta(hours=utc_offset_hours)).date().isoformat()
+
+
 def first_review_for_window(window: str) -> tuple:
     """Returns (next_review_date_iso, stored_added_window)"""
     today = date.today()
@@ -229,7 +236,7 @@ def add_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
         offset = 3  # Moscow default, matches get_current_window()'s own default
 
     conn = get_connection()
-    today = date.today().isoformat()
+    today = _local_today(offset)
     window = get_current_window(offset)
     first_review, added_window = first_review_for_window(window)
     cur = conn.execute(
@@ -371,9 +378,16 @@ def get_due_words(user_id):
 def count_words_added_today(user_id: int) -> int:
     """Counts rows inserted today for this user — tracks token spend
     (a Claude call already happened by the time a lookup turns out to be
-    a duplicate), not just successfully-kept vocabulary."""
+    a duplicate), not just successfully-kept vocabulary.
+
+    "Today" is the user's own local date (their stored UTC offset, or Moscow
+    default), matching added_date in add_word() — not the server's UTC date,
+    so the daily limit resets at each user's own midnight, not a fixed UTC one."""
+    offset = get_user_utc_offset(user_id)
+    if offset is None:
+        offset = 3
     conn = get_connection()
-    today = date.today().isoformat()
+    today = _local_today(offset)
     row = conn.execute(
         "SELECT COUNT(*) AS c FROM words WHERE user_id = ? AND added_date = ?",
         (user_id, today),
