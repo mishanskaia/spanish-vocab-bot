@@ -109,6 +109,28 @@ def init_db():
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_review_log_word_id ON review_log(word_id)"
     )
+    _safe_add_column(conn, "speech_activation_last_shown TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS study_topics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            topic TEXT NOT NULL,
+            added_date TEXT NOT NULL,
+            x2_date TEXT NOT NULL,
+            x7_date TEXT NOT NULL,
+            x10_date TEXT NOT NULL,
+            x14_date TEXT NOT NULL,
+            x30_date TEXT NOT NULL,
+            x2_sent INTEGER DEFAULT 0,
+            x7_sent INTEGER DEFAULT 0,
+            x10_sent INTEGER DEFAULT 0,
+            x14_sent INTEGER DEFAULT 0,
+            x30_sent INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active'
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -476,3 +498,131 @@ def get_stats(user_id) -> dict:
             cefr[r["cefr_level"]] = r["c"]
     result["cefr"] = cefr
     return result
+
+
+# ---------------------------------------------------------------------------
+# Study Coach — admin-only feature, gated by OWNER_TELEGRAM_ID in bot.py.
+# Grammar topics cycle through 5 fixed checkpoints from the input date X:
+# X+2 and X+7 (drills), X+14 and X+30 (spaced repeats of the same drill idea),
+# plus X+10 for a separate "use it in speech" nudge. All five dates are fixed
+# at insert time and never recalculated — a checkpoint that can't be shown
+# today (anchor day, or another topic's checkpoint already took the slot)
+# just stays due (date <= today) until a day where it can be shown.
+# ---------------------------------------------------------------------------
+
+GRAMMAR_STAGE_ORDER = ["x2", "x7", "x14", "x30"]
+
+
+def add_study_topic(user_id: int, topic: str) -> int:
+    today = date.today()
+    conn = get_connection()
+    cur = conn.execute(
+        """INSERT INTO study_topics
+           (user_id, topic, added_date, x2_date, x7_date, x10_date, x14_date, x30_date)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            user_id, topic, today.isoformat(),
+            (today + timedelta(days=2)).isoformat(),
+            (today + timedelta(days=7)).isoformat(),
+            (today + timedelta(days=10)).isoformat(),
+            (today + timedelta(days=14)).isoformat(),
+            (today + timedelta(days=30)).isoformat(),
+        ),
+    )
+    conn.commit()
+    topic_id = cur.lastrowid
+    conn.close()
+    return topic_id
+
+
+def get_study_topic(topic_id: int):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM study_topics WHERE id = ?", (topic_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def get_active_topics(user_id: int):
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM study_topics WHERE user_id = ? AND status = 'active' ORDER BY added_date, id",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def cancel_topic(user_id: int, topic_id: int) -> bool:
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE study_topics SET status = 'cancelled' WHERE id = ? AND user_id = ? AND status = 'active'",
+        (topic_id, user_id),
+    )
+    conn.commit()
+    cancelled = cur.rowcount > 0
+    conn.close()
+    return cancelled
+
+
+def get_due_grammar_item(user_id: int):
+    """The oldest active topic (by added_date) that has an un-sent grammar
+    checkpoint whose date has arrived. Stages are checked in chronological
+    order per topic, so a badly delayed topic still surfaces its earliest
+    pending stage first rather than jumping ahead."""
+    today_iso = date.today().isoformat()
+    for row in get_active_topics(user_id):
+        for stage in GRAMMAR_STAGE_ORDER:
+            if row[f"{stage}_sent"] == 0 and row[f"{stage}_date"] <= today_iso:
+                return {"topic_id": row["id"], "topic": row["topic"], "stage": stage}
+    return None
+
+
+def mark_grammar_stage_sent(topic_id: int, stage: str):
+    conn = get_connection()
+    conn.execute(f"UPDATE study_topics SET {stage}_sent = 1 WHERE id = ?", (topic_id,))
+    if stage == "x30":
+        conn.execute("UPDATE study_topics SET status = 'done' WHERE id = ?", (topic_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_due_speaking_item(user_id: int):
+    today_iso = date.today().isoformat()
+    for row in get_active_topics(user_id):
+        if row["x10_sent"] == 0 and row["x10_date"] <= today_iso:
+            return {"topic_id": row["id"], "topic": row["topic"]}
+    return None
+
+
+def mark_speaking_sent(topic_id: int):
+    conn = get_connection()
+    conn.execute("UPDATE study_topics SET x10_sent = 1 WHERE id = ?", (topic_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_speech_activation_words(user_id: int, limit: int = 3):
+    """Oldest-shown-first (NULL = never shown sorts first in SQLite), so the
+    whole pool of familiar+ words rotates through before anything repeats —
+    no separate 'used' flag or manual reset needed."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT * FROM words WHERE user_id = ? AND status IN ('familiar', 'active', 'mastered')
+           ORDER BY speech_activation_last_shown ASC, RANDOM() LIMIT ?""",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def mark_speech_activation_shown(word_ids):
+    if not word_ids:
+        return
+    conn = get_connection()
+    today = date.today().isoformat()
+    conn.executemany(
+        "UPDATE words SET speech_activation_last_shown = ? WHERE id = ?",
+        [(today, wid) for wid in word_ids],
+    )
+    conn.commit()
+    conn.close()

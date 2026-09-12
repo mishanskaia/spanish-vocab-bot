@@ -36,6 +36,8 @@ DAILY_NEW_WORD_LIMIT = int(os.environ.get("DAILY_NEW_WORD_LIMIT", "5"))
 REMINDER_MORNING_UTC = (7, 0)
 REMINDER_MIDDAY_UTC = (11, 0)
 REMINDER_EVENING_UTC = (15, 0)
+# 7:00 Moscow = 04:00 UTC — Study Coach, separate from the vocab reminders above
+STUDY_COACH_UTC = (4, 0)
 
 SESSION_WORD_LIMIT = 30
 MNEMONIC_RETRY_LIMIT = 3
@@ -627,6 +629,122 @@ async def evening_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Study Coach — admin-only (OWNER_TELEGRAM_ID), hidden from regular users:
+# not in set_my_commands, same as the /debug_* commands below. One message a
+# day at 7:00 MSK with up to three independent blocks: the day's grammar
+# slot (tutor-homework/listening/reading anchor, or a due grammar drill),
+# 3 words to actively use in speech, and a due "use this topic in speech"
+# nudge. See CLAUDE.md for the full weekly grid and why dates never get
+# recalculated when a checkpoint has to wait for a free day.
+# ---------------------------------------------------------------------------
+
+STUDY_COACH_ANCHOR = {
+    0: "📚 ДЗ репетитора — не забудь сделать.",
+    1: "📚 Не забудь сделать ДЗ репетитора, если ещё не сделал(а).",
+    2: "🎧 Аудирование — сегодня день послушать что-нибудь на испанском.",
+    5: "📖 Чтение — сегодня день почитать что-нибудь на испанском.",
+}
+
+# Grammar due-topics only ever show on these days (Tue also gets the anchor
+# above in the same slot); Mon/Wed/Sat are anchor-only and a due topic just
+# waits for the next of these days.
+STUDY_COACH_DUE_TOPIC_WEEKDAYS = (1, 3, 4, 6)
+
+STUDY_COACH_STAGE_TEXT = {
+    "x2": "✍️ Составь 10 предложений на тему «{topic}».",
+    "x7": "🔁 Новый drills по «{topic}».",
+    "x14": "🔁 Ещё раз drills по «{topic}» — третий подход.",
+    "x30": "🔁 Финальные drills по «{topic}» — последний подход перед тем, как закрыть тему.",
+}
+
+
+def _build_study_coach_slot1(user_id: int, weekday: int) -> str:
+    parts = []
+    if weekday in STUDY_COACH_ANCHOR:
+        parts.append(STUDY_COACH_ANCHOR[weekday])
+    if weekday in STUDY_COACH_DUE_TOPIC_WEEKDAYS:
+        due = db.get_due_grammar_item(user_id)
+        if due:
+            parts.append(STUDY_COACH_STAGE_TEXT[due["stage"]].format(topic=due["topic"]))
+            db.mark_grammar_stage_sent(due["topic_id"], due["stage"])
+    return "\n".join(parts)
+
+
+async def study_coach_reminder(context: ContextTypes.DEFAULT_TYPE):
+    if not OWNER_TELEGRAM_ID:
+        return
+    user_id = OWNER_TELEGRAM_ID
+    weekday = date.today().weekday()
+    blocks = []
+
+    slot1 = _build_study_coach_slot1(user_id, weekday)
+    if slot1:
+        blocks.append(slot1)
+
+    words = db.get_speech_activation_words(user_id, limit=3)
+    if words:
+        word_lines = "\n".join(f"• {w['phrase']} — {w['meaning']}" for w in words)
+        blocks.append(f"🧠 Слова для использования в речи сегодня:\n{word_lines}")
+        db.mark_speech_activation_shown([w["id"] for w in words])
+
+    speaking_due = db.get_due_speaking_item(user_id)
+    if speaking_due:
+        blocks.append(f'🗣 Попробуй сегодня использовать в речи: «{speaking_due["topic"]}».')
+        db.mark_speaking_sent(speaking_due["topic_id"])
+
+    if not blocks:
+        return
+    await context.bot.send_message(user_id, "\n\n".join(blocks))
+
+
+async def newtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /newtopic <тема>")
+        return
+    topic = " ".join(context.args).strip()
+    topic_id = db.add_study_topic(update.effective_user.id, topic)
+    row = db.get_study_topic(topic_id)
+    await update.message.reply_text(
+        f'✅ Тема добавлена: «{topic}» (id={topic_id})\n'
+        f'X+2: {row["x2_date"]}\n'
+        f'X+7: {row["x7_date"]}\n'
+        f'X+10 (спикинг): {row["x10_date"]}\n'
+        f'X+14: {row["x14_date"]}\n'
+        f'X+30: {row["x30_date"]}'
+    )
+
+
+async def topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update.effective_user.id):
+        return
+    rows = db.get_active_topics(update.effective_user.id)
+    if not rows:
+        await update.message.reply_text("Очередь тем пуста.")
+        return
+    lines = []
+    for r in rows:
+        stage_bits = []
+        for stage, label in (("x2", "X+2"), ("x7", "X+7"), ("x10", "X+10 🗣"), ("x14", "X+14"), ("x30", "X+30")):
+            mark = "✅" if r[f"{stage}_sent"] else r[f"{stage}_date"]
+            stage_bits.append(f"{label}: {mark}")
+        lines.append(f'#{r["id"]} «{r["topic"]}» (добавлена {r["added_date"]})\n  ' + " | ".join(stage_bits))
+    await update.message.reply_text("\n\n".join(lines))
+
+
+async def canceltopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update.effective_user.id):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Использование: /canceltopic <id>")
+        return
+    topic_id = int(context.args[0])
+    ok = db.cancel_topic(update.effective_user.id, topic_id)
+    await update.message.reply_text("Тема отменена." if ok else "Тема не найдена в активной очереди.")
+
+
+# ---------------------------------------------------------------------------
 # API — lets another site of yours read your word list, and (with a separate
 # write key) add new words the same way typing to the bot directly would.
 # Runs in the same process/container as the bot, reading/writing the same DB file.
@@ -814,6 +932,9 @@ def main():
     app.add_handler(CommandHandler("reset_collected", reset_collected))
     app.add_handler(CommandHandler("debug_due", debug_due))
     app.add_handler(CommandHandler("debug_queue", debug_queue))
+    app.add_handler(CommandHandler("newtopic", newtopic))
+    app.add_handler(CommandHandler("topics", topics))
+    app.add_handler(CommandHandler("canceltopic", canceltopic))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
@@ -821,6 +942,7 @@ def main():
     app.job_queue.run_daily(morning_reminder, time=dtime(hour=REMINDER_MORNING_UTC[0], minute=REMINDER_MORNING_UTC[1]))
     app.job_queue.run_daily(midday_reminder, time=dtime(hour=REMINDER_MIDDAY_UTC[0], minute=REMINDER_MIDDAY_UTC[1]))
     app.job_queue.run_daily(evening_reminder, time=dtime(hour=REMINDER_EVENING_UTC[0], minute=REMINDER_EVENING_UTC[1]))
+    app.job_queue.run_daily(study_coach_reminder, time=dtime(hour=STUDY_COACH_UTC[0], minute=STUDY_COACH_UTC[1]))
 
     print("Bot started. Stop with Ctrl+C.")
     app.run_polling()
