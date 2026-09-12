@@ -41,8 +41,13 @@ def get_moscow_now() -> datetime:
     return datetime.now(MOSCOW_TZ)
 
 
-def get_current_window() -> str:
-    hour = get_moscow_now().hour
+def get_current_window(utc_offset_hours: int = 3) -> str:
+    """'morning' (6-14) / 'evening' (14-23) / 'night' in the given UTC offset
+    — defaults to Moscow (3) for callers that don't have a specific user's
+    offset on hand. Callers that add a word for a specific user should pass
+    that user's own db.get_user_utc_offset() instead, so "first review
+    today/tomorrow" matches their own morning/evening, not Moscow's."""
+    hour = (datetime.now(timezone.utc).hour + utc_offset_hours) % 24
     if 6 <= hour < 14:
         return 'morning'
     elif 14 <= hour < 23:
@@ -58,6 +63,35 @@ def first_review_for_window(window: str) -> tuple:
         return today.isoformat(), 'morning'
     else:
         return tomorrow.isoformat(), 'evening'
+
+
+# ---------------------------------------------------------------------------
+# Per-user UTC offset — asked once at /start (see bot.py) so the three daily
+# vocab reminders land at 10/14/18 in *that user's* local time instead of
+# always Moscow. Whole-hour precision only (no DST, no half-hour zones) —
+# plenty for "don't wake someone at 3am", not meant to be exact. A user who
+# hasn't answered yet has no row here; callers default that to 3 (Moscow),
+# matching pre-timezone behavior so nothing changes for them until they set it.
+# ---------------------------------------------------------------------------
+
+def get_user_utc_offset(user_id: int):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT utc_offset_hours FROM user_settings WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return row["utc_offset_hours"] if row else None
+
+
+def set_user_utc_offset(user_id: int, offset_hours: int):
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO user_settings (user_id, utc_offset_hours) VALUES (?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET utc_offset_hours = excluded.utc_offset_hours""",
+        (user_id, offset_hours),
+    )
+    conn.commit()
+    conn.close()
 
 
 def init_db():
@@ -111,6 +145,14 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_review_log_word_id ON review_log(word_id)"
     )
     _safe_add_column(conn, "speech_activation_last_shown TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            utc_offset_hours INTEGER
+        )
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS study_topics (
@@ -182,9 +224,13 @@ def add_word(user_id, phrase, meaning, part_of_speech, cefr_level, examples,
     conjugation = _coerce_text(conjugation)
     gerund = _coerce_text(gerund)
 
+    offset = get_user_utc_offset(user_id)
+    if offset is None:
+        offset = 3  # Moscow default, matches get_current_window()'s own default
+
     conn = get_connection()
     today = date.today().isoformat()
-    window = get_current_window()
+    window = get_current_window(offset)
     first_review, added_window = first_review_for_window(window)
     cur = conn.execute(
         """INSERT INTO words
@@ -638,6 +684,23 @@ def mark_speech_activation_shown(word_ids):
     )
     conn.commit()
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Backup — owner-only /backup and a weekly auto-backup job send this file to
+# the owner as a Telegram document (see CLAUDE.md "Бэкапы"). Uses SQLite's
+# own backup API rather than copying the raw file, so it produces a
+# consistent snapshot even if a write is in flight (a plain file copy could
+# grab a half-written page).
+# ---------------------------------------------------------------------------
+
+def create_backup(dest_path: str):
+    src = get_connection()
+    dest = sqlite3.connect(dest_path)
+    with dest:
+        src.backup(dest)
+    dest.close()
+    src.close()
 
 
 # ---------------------------------------------------------------------------

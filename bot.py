@@ -4,7 +4,8 @@ import json
 import time
 import asyncio
 import logging
-from datetime import date, time as dtime
+import tempfile
+from datetime import date, datetime, time as dtime, timezone as dt_timezone
 
 from dotenv import load_dotenv
 
@@ -41,12 +42,22 @@ OWNER_TELEGRAM_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0") or "0")
 DAILY_NEW_WORD_LIMIT = int(os.environ.get("DAILY_NEW_WORD_LIMIT", "5"))
 AUTHOR_TELEGRAM_USERNAME = os.environ.get("AUTHOR_TELEGRAM_USERNAME", "")
 INVITE_TTL_DAYS = 15
-# 10:00 Moscow = 07:00 UTC; 14:00 Moscow = 11:00 UTC; 18:00 Moscow = 15:00 UTC
-REMINDER_MORNING_UTC = (7, 0)
-REMINDER_MIDDAY_UTC = (11, 0)
-REMINDER_EVENING_UTC = (15, 0)
+# Vocab reminders fire at these hours in each user's own local time (see
+# get_user_utc_offset) rather than a fixed UTC time — checked hourly by
+# hourly_reminder_job(). A user who hasn't answered the /start timezone
+# question defaults to UTC+3 (Moscow), so this reduces to the old fixed
+# schedule for anyone who never sets a timezone.
+REMINDER_LOCAL_SLOTS = {
+    10: "☀️ Доброе утро!",
+    14: "🕑 Дневная сессия!",
+    18: "🌙 Добрый вечер!",
+}
+DEFAULT_UTC_OFFSET = 3  # Moscow — used until a user answers the /start timezone question
 # 7:00 Moscow = 04:00 UTC — Study Coach, separate from the vocab reminders above
 STUDY_COACH_UTC = (4, 0)
+# Sunday 06:00 Moscow = 03:00 UTC — weekly DB backup, quiet time before the day's reminders
+BACKUP_WEEKLY_UTC = (3, 0)
+BACKUP_WEEKDAY = 6  # Monday=0 .. Sunday=6, per job_queue's `days`
 
 SESSION_WORD_LIMIT = 30
 MNEMONIC_RETRY_LIMIT = 3
@@ -129,6 +140,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(ACCESS_TEST_MESSAGE)
             return
 
+    if db.get_user_utc_offset(user_id) is None:
+        context.user_data["awaiting_tz_reply"] = True
+        await update.message.reply_text(
+            "Привет! Прежде чем начать — подскажи, который у тебя сейчас час "
+            "(например, 14:30)? Нужно, чтобы напоминания о повторении приходили "
+            "в удобное для тебя время, а не по московскому."
+        )
+        return
+
+    await _send_welcome(update)
+
+
+async def _send_welcome(update: Update):
     await update.message.reply_text(
         "Привет! Я помогу тебе учить испанские слова 🇪🇸\n\n"
         "Просто напиши любое испанское слово — я объясню и сохраню его.\n\n"
@@ -137,6 +161,37 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/delete — удалить слово из базы\n"
         "/stats — статистика словаря"
     )
+
+
+# ---------------------------------------------------------------------------
+# Ответ на вопрос про время из /start — перехватывается в handle_message()
+# раньше добавления слова, пока не разберёт смещение (см. REMINDER_LOCAL_SLOTS
+# выше и CLAUDE.md «Часовой пояс пользователя»).
+# ---------------------------------------------------------------------------
+
+_TZ_REPLY_RE = re.compile(r'^(\d{1,2})(?:[:.,](\d{2}))?\s*$')
+
+
+async def _handle_tz_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    m = _TZ_REPLY_RE.match(text)
+    local_hour = int(m.group(1)) if m else -1
+    local_minute = int(m.group(2) or 0) if m else -1
+    if not m or not (0 <= local_hour <= 23 and 0 <= local_minute <= 59):
+        await update.message.reply_text(
+            "Не поняла — напиши текущее время цифрами, например 14:30 или просто 14."
+        )
+        return
+
+    now_utc = datetime.now(dt_timezone.utc)
+    diff_minutes = (local_hour * 60 + local_minute) - (now_utc.hour * 60 + now_utc.minute)
+    diff_minutes = ((diff_minutes + 720) % 1440) - 720  # normalize across midnight wraparound
+    offset_hours = round(diff_minutes / 60)
+
+    db.set_user_utc_offset(update.effective_user.id, offset_hours)
+    context.user_data.pop("awaiting_tz_reply", None)
+    await update.message.reply_text(f"Записала, спасибо! (смещение UTC{offset_hours:+d})")
+    await _send_welcome(update)
 
 
 # ---------------------------------------------------------------------------
@@ -200,8 +255,20 @@ async def access_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("awaiting_tz_reply"):
+        await _handle_tz_reply(update, context)
+        return
+
     word = update.message.text.strip()
     if not word or word.startswith("/"):
+        return
+
+    existing = db.find_word_by_phrase(update.effective_user.id, word)
+    if existing:
+        await update.message.reply_text(
+            f'📖 *{existing["phrase"]}* уже есть в твоём словаре — не добавляю дубль.',
+            parse_mode="Markdown",
+        )
         return
 
     if _daily_limit_reached(update.effective_user.id):
@@ -242,7 +309,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conj_block = _format_conj_gerund(info.get("conjugation"), info.get("gerund"))
     collocations_block = _format_collocations(info.get("collocations"))
 
-    window = db.get_current_window()
+    user_offset = db.get_user_utc_offset(update.effective_user.id)
+    if user_offset is None:
+        user_offset = DEFAULT_UTC_OFFSET
+    window = db.get_current_window(user_offset)
     if window == 'morning':
         review_hint = "Первое повторение — сегодня вечером."
     else:
@@ -421,6 +491,34 @@ async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Приглашение (одноразовое, действует {INVITE_TTL_DAYS} дней, если не использовать):\n{link}"
     )
+
+
+async def _send_backup(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    tmp_path = tempfile.mktemp(suffix=".db")
+    try:
+        await asyncio.to_thread(db.create_backup, tmp_path)
+        with open(tmp_path, "rb") as f:
+            await context.bot.send_document(
+                chat_id,
+                document=f,
+                filename=f"spanish_vocab_bot_{date.today().isoformat()}.db",
+                caption=f"Бэкап БД на {date.today().isoformat()}",
+            )
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
+async def backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update.effective_user.id):
+        return
+    await _send_backup(update.effective_chat.id, context)
+
+
+async def weekly_backup_job(context: ContextTypes.DEFAULT_TYPE):
+    if not OWNER_TELEGRAM_ID:
+        return
+    await _send_backup(OWNER_TELEGRAM_ID, context)
 
 
 async def debug_due(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -658,34 +756,37 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Daily reminders
+# Daily reminders — checked hourly rather than three fixed UTC times, so each
+# user gets their morning/midday/evening slot in their own local time (see
+# REMINDER_LOCAL_SLOTS / get_user_utc_offset above). Runs every hour; a user's
+# local hour only matches one slot at most once a day, so this doesn't double
+# -send. See CLAUDE.md «Часовой пояс пользователя» for why hourly polling was
+# chosen over scheduling a dynamic per-user job.
 # ---------------------------------------------------------------------------
 
-async def _run_reminder(context: ContextTypes.DEFAULT_TYPE, greeting: str):
+async def hourly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    utc_hour = datetime.now(dt_timezone.utc).hour
     for user_id in db.get_all_due_users():
+        offset = db.get_user_utc_offset(user_id)
+        if offset is None:
+            offset = DEFAULT_UTC_OFFSET
+        local_hour = (utc_hour + offset) % 24
+        greeting = REMINDER_LOCAL_SLOTS.get(local_hour)
+        if greeting is None:
+            continue
+
         count = db.count_due_not_reviewed_today(user_id)
-        if count > 0:
-            session_count = min(count, SESSION_WORD_LIMIT)
-            text = f"{greeting} Слов на эту сессию: {session_count}"
-            if count > SESSION_WORD_LIMIT:
-                text += f"\n(всего в очереди: {count})"
-            await context.bot.send_message(user_id, text)
-            user_data = context.application.user_data[user_id]
-            user_data["review_shown"] = set()
-            db.detect_and_mark_overdue(user_id)
-            await _send_next_due(user_id, user_id, context, user_data)
-
-
-async def morning_reminder(context: ContextTypes.DEFAULT_TYPE):
-    await _run_reminder(context, "☀️ Доброе утро!")
-
-
-async def midday_reminder(context: ContextTypes.DEFAULT_TYPE):
-    await _run_reminder(context, "🕑 Дневная сессия!")
-
-
-async def evening_reminder(context: ContextTypes.DEFAULT_TYPE):
-    await _run_reminder(context, "🌙 Добрый вечер!")
+        if count <= 0:
+            continue
+        session_count = min(count, SESSION_WORD_LIMIT)
+        text = f"{greeting} Слов на эту сессию: {session_count}"
+        if count > SESSION_WORD_LIMIT:
+            text += f"\n(всего в очереди: {count})"
+        await context.bot.send_message(user_id, text)
+        user_data = context.application.user_data[user_id]
+        user_data["review_shown"] = set()
+        db.detect_and_mark_overdue(user_id)
+        await _send_next_due(user_id, user_id, context, user_data)
 
 
 # ---------------------------------------------------------------------------
@@ -863,6 +964,14 @@ async def handle_api_add_word(request: web.Request) -> web.Response:
             {"error": "user_id (number) and word are required"}, status=400, headers=_CORS_HEADERS
         )
 
+    existing = db.find_word_by_phrase(user_id, word)
+    if existing:
+        return web.json_response(
+            {"is_new": False, "word": _word_row_to_dict(existing)},
+            status=200,
+            headers=_CORS_HEADERS,
+        )
+
     if _daily_limit_reached(user_id):
         return web.json_response(
             {"error": f"daily limit of {DAILY_NEW_WORD_LIMIT} new words reached"},
@@ -980,6 +1089,7 @@ PUBLIC_COMMANDS = [
 
 OWNER_ONLY_COMMANDS = [
     ("invite", "Сгенерировать инвайт-ссылку"),
+    ("backup", "Прислать бэкап БД"),
     ("reset_collected", "Распределить collected-слова по датам"),
     ("debug_due", "История повторений"),
     ("debug_queue", "Текущая очередь /review"),
@@ -1012,6 +1122,7 @@ def main():
     app.add_handler(CommandHandler("all", review_all))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("invite", invite))
+    app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("reset_collected", reset_collected))
     app.add_handler(CommandHandler("debug_due", debug_due))
     app.add_handler(CommandHandler("debug_queue", debug_queue))
@@ -1022,10 +1133,13 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
-    app.job_queue.run_daily(morning_reminder, time=dtime(hour=REMINDER_MORNING_UTC[0], minute=REMINDER_MORNING_UTC[1]))
-    app.job_queue.run_daily(midday_reminder, time=dtime(hour=REMINDER_MIDDAY_UTC[0], minute=REMINDER_MIDDAY_UTC[1]))
-    app.job_queue.run_daily(evening_reminder, time=dtime(hour=REMINDER_EVENING_UTC[0], minute=REMINDER_EVENING_UTC[1]))
+    app.job_queue.run_repeating(hourly_reminder_job, interval=3600, first=0)
     app.job_queue.run_daily(study_coach_reminder, time=dtime(hour=STUDY_COACH_UTC[0], minute=STUDY_COACH_UTC[1]))
+    app.job_queue.run_daily(
+        weekly_backup_job,
+        time=dtime(hour=BACKUP_WEEKLY_UTC[0], minute=BACKUP_WEEKLY_UTC[1]),
+        days=(BACKUP_WEEKDAY,),
+    )
 
     print("Bot started. Stop with Ctrl+C.")
     app.run_polling()
