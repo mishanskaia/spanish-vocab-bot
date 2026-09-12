@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import hmac
 import asyncio
 import logging
 import tempfile
@@ -28,6 +29,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.helpers import escape_markdown
 
 import db
 import ai_helper
@@ -75,19 +77,43 @@ RECALL_DISCLAIMER = (
 )
 
 
+_MD_LINK_RE = re.compile(r'\[([^\]]*)\]\([^)]*\)')
+
+
+def _strip_markdown_links(text: str) -> str:
+    """The mnemonic is the one place we deliberately render Claude's raw
+    Markdown as-is (bold/italic are part of the intended output — see
+    MNEMONIC_SYSTEM_PROMPT), so it can't be run through _md() like
+    explain_word() output. That leaves it as the one spot a crafted "word"
+    input could still try to smuggle a clickable `[text](url)` phishing link
+    into a message that looks like normal bot output — strip just that
+    pattern (down to its label) while leaving real formatting untouched."""
+    return _MD_LINK_RE.sub(r'\1', text) if text else text
+
+
+def _md(text) -> str:
+    """Escape Telegram Markdown (v1) special chars (`*_[`) before interpolating
+    AI-generated text into a parse_mode="Markdown" message. Claude's output for
+    explain_word() is meant to be plain text, not formatted — without this, a
+    stray `*`/`_`/`[` in a word/example (accidental, or a deliberately crafted
+    input trying to smuggle in a clickable markdown link) either breaks message
+    rendering or renders as if it were trusted formatting."""
+    return escape_markdown(str(text), version=1) if text else text
+
+
 def _format_conj_gerund(conjugation, gerund) -> str:
     if not conjugation:
         return ""
-    block = f"\n\n📝 Спряжение: {conjugation}"
+    block = f"\n\n📝 Спряжение: {_md(conjugation)}"
     if gerund:
-        block += f"\nГерундий: {gerund}"
+        block += f"\nГерундий: {_md(gerund)}"
     return block
 
 
 def _format_collocations(collocations) -> str:
     if not collocations:
         return ""
-    lines = "\n".join(f"• {c}" for c in collocations)
+    lines = "\n".join(f"• {_md(c)}" for c in collocations)
     return f"\n\n💬 Устойчивые выражения:\n{lines}"
 
 
@@ -119,13 +145,17 @@ def _build_recall_prompt(row) -> str:
     examples = json.loads(row["examples"] or "[]")
     if examples:
         example_es, example_ru = _split_example(examples[0])
+        # Escape before blanking, not after: _make_blank() inserts a literal
+        # "_____" placeholder that must stay as-is, not become escaped underscores.
+        example_es = _md(example_es)
+        example_ru = _md(example_ru) if example_ru else example_ru
         blank = _make_blank(row["phrase"], example_es)
         if blank:
             suffix = f" — {example_ru}" if example_ru else ""
             return f'Вставь пропущенное слово:\n\n*{blank}{suffix}*'
         if example_ru:
-            return f'Контекст: _{example_ru}_\n\nКак будет по-испански: *{row["meaning"]}*'
-    return f'Как будет по-испански:\n\n*{row["meaning"]}*'
+            return f'Контекст: _{example_ru}_\n\nКак будет по-испански: *{_md(row["meaning"])}*'
+    return f'Как будет по-испански:\n\n*{_md(row["meaning"])}*'
 
 
 # ---------------------------------------------------------------------------
@@ -140,26 +170,71 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(ACCESS_TEST_MESSAGE)
             return
 
+    await _send_welcome(update)
+
     if db.get_user_utc_offset(user_id) is None:
         context.user_data["awaiting_tz_reply"] = True
         await update.message.reply_text(
-            "Привет! Прежде чем начать — подскажи, который у тебя сейчас час "
-            "(например, 14:30)? Нужно, чтобы напоминания о повторении приходили "
-            "в удобное для тебя время, а не по московскому."
+            "Кстати — скажи, который у тебя сейчас час (например, 14:30)? "
+            "Подстрою напоминания под твой часовой пояс."
         )
-        return
-
-    await _send_welcome(update)
 
 
 async def _send_welcome(update: Update):
     await update.message.reply_text(
         "Привет! Я помогу тебе учить испанские слова 🇪🇸\n\n"
-        "Просто напиши любое испанское слово — я объясню и сохраню его.\n\n"
-        "/review — повторить слова по расписанию\n"
-        "/all — повторить все слова из базы\n"
-        "/delete — удалить слово из базы\n"
-        "/stats — статистика словаря"
+        "Работаю по методу интервальных повторений (spaced repetition) — "
+        "научно доказанному способу запоминать надолго, а не зубрить и "
+        "забывать. Слово показывается снова именно тогда, когда ты вот-вот "
+        "готов его забыть.\n\n"
+        "Как это работает:\n"
+        "— Просто пиши слово или фразу по-испански — объясню, переведу, дам "
+        "примеры и сохраню. Отдельной команды не нужно. Любое сообщение сюда "
+        "без команды падает в список слов для изучения.\n"
+        "— Напоминать о повторении буду сам 3 раза в день — в 10, 14 и 18 по "
+        "твоему времени, по 30 слов за раз (~90 в день, чтобы не "
+        "перегружаться). Либо запускай вручную: /review — подробнее про "
+        "повторения: /help\n"
+        "— Если слово сложное — предложу мнемонику: ассоциацию, которая "
+        "поможет его закрепить в памяти.\n"
+        "— /delete — удалить слово, если добавлено по ошибке\n\n"
+        f"Это пока тест: до {DAILY_NEW_WORD_LIMIT} новых слов в день, чтобы не "
+        "жечь бюджет. Если что-то работает не так — пиши Оле лично, разберёмся"
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Что я умею:\n\n"
+        "📖 Добавить слово — просто напиши его по-испански, объясню и "
+        "сохраню.\n\n"
+        "🔁 Повторение\n"
+        "/review — слова по расписанию (что пора повторить сейчас)\n"
+        "/all — вообще всё из словаря, без расписания\n\n"
+        "Принцип — интервальное повторение: каждый раз, когда правильно "
+        "вспоминаешь слово, промежуток до следующего показа растёт — "
+        "примерно так: завтра → через 3 дня → через неделю → через 2 "
+        "недели → через месяц → через 3 месяца. После этого слово "
+        "считается выученным и больше не показывается.\n\n"
+        "Оцениваешь себя сам тремя кнопками:\n"
+        "— Помню 🟢 — двигает по этой лестнице вперёд, увидишь нескоро\n"
+        "— Почти помню 🟡 — лестница не двигается, промежуток чуть короче "
+        "— увидишь пораньше\n"
+        "— Сложно 🔴 — то же самое, но покороче — увидишь уже завтра\n\n"
+        "Это не экзамен и не наказание — просто подстройка, когда слово "
+        "вернётся. Если долго не открывал бота — сначала покажу то, что "
+        "просрочено.\n\n"
+        "За одну сессию — не больше 30 слов, чтобы не перегружаться. "
+        "Обычно напоминаю сам 3 раза в день (10, 14, 18 по твоему времени) "
+        "— получается около 90 слов в день. Если хочешь наверстать быстрее "
+        "— можешь запускать /review вручную сколько угодно раз, каждый раз "
+        "будет свежая порция.\n\n"
+        "🧠 Мнемоника — на \"Почти помню\"/\"Сложно\" предложу ассоциацию для "
+        "запоминания.\n\n"
+        "🗑 /delete — удалить слово из словаря\n"
+        "📊 /stats — сколько слов и как идёт прогресс\n\n"
+        f"Пока тест: до {DAILY_NEW_WORD_LIMIT} новых слов в день. Если "
+        "что-то не работает — пиши Оле лично."
     )
 
 
@@ -190,8 +265,10 @@ async def _handle_tz_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     db.set_user_utc_offset(update.effective_user.id, offset_hours)
     context.user_data.pop("awaiting_tz_reply", None)
-    await update.message.reply_text(f"Записала, спасибо! (смещение UTC{offset_hours:+d})")
-    await _send_welcome(update)
+    await update.message.reply_text(
+        "Записала! Можешь присылать первое слово — например, conseguir или "
+        "sin embargo 🙂"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +285,8 @@ def _is_authorized(user_id: int) -> bool:
     return _is_owner(user_id) or db.is_user_authorized(user_id)
 
 
-def _daily_limit_reached(user_id: int) -> bool:
-    if _is_owner(user_id):
+def _daily_limit_reached(user_id: int, *, allow_owner_bypass: bool = True) -> bool:
+    if allow_owner_bypass and _is_owner(user_id):
         return False
     return db.count_words_added_today(user_id) >= DAILY_NEW_WORD_LIMIT
 
@@ -224,6 +301,26 @@ DAILY_LIMIT_MESSAGE = (
     f"На сегодня лимит новых слов исчерпан ({DAILY_NEW_WORD_LIMIT}/день). "
     f"Приходи завтра — то, что уже в словаре, никуда не денется 🙂"
 )
+
+# ---------------------------------------------------------------------------
+# Per-user lock around "check daily limit → call Claude → insert" — without
+# it, two add-word requests for the same user_id that arrive close together
+# can each see the limit as not-yet-reached (neither has committed its insert
+# yet) and both proceed, bypassing DAILY_NEW_WORD_LIMIT. Telegram updates are
+# already processed one at a time by PTB, so this mainly matters for the HTTP
+# API below (aiohttp handles requests concurrently) — but it's shared so the
+# Telegram and API entry points can't race against each other either.
+# ---------------------------------------------------------------------------
+
+_add_word_locks: dict[int, asyncio.Lock] = {}
+
+
+def _get_add_word_lock(user_id: int) -> asyncio.Lock:
+    lock = _add_word_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _add_word_locks[user_id] = lock
+    return lock
 
 
 # ---------------------------------------------------------------------------
@@ -263,53 +360,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not word or word.startswith("/"):
         return
 
-    existing = db.find_word_by_phrase(update.effective_user.id, word)
-    if existing:
-        await update.message.reply_text(
-            f'📖 *{existing["phrase"]}* уже есть в твоём словаре — не добавляю дубль.',
-            parse_mode="Markdown",
+    user_id = update.effective_user.id
+
+    async with _get_add_word_lock(user_id):
+        existing = db.find_word_by_phrase(user_id, word)
+        if existing:
+            await update.message.reply_text(
+                f'📖 *{_md(existing["phrase"])}* уже есть в твоём словаре — не добавляю дубль.',
+                parse_mode="Markdown",
+            )
+            return
+
+        if _daily_limit_reached(user_id):
+            await update.message.reply_text(DAILY_LIMIT_MESSAGE)
+            return
+
+        await update.message.reply_text("Секунду, ищу...")
+
+        try:
+            info = await asyncio.to_thread(ai_helper.explain_word, word)
+        except Exception:
+            logger.exception("explain_word failed for %r", word)
+            await update.message.reply_text(
+                "Не получилось найти это слово — попробуй ещё раз через минуту."
+            )
+            return
+
+        word_id, is_new = db.add_word(
+            user_id=user_id,
+            phrase=info.get("phrase", word),
+            meaning=info.get("meaning", ""),
+            part_of_speech=info.get("part_of_speech", ""),
+            cefr_level=info.get("cefr_level", ""),
+            examples=info.get("examples", []),
+            conjugation=info.get("conjugation"),
+            collocations=info.get("collocations", []),
+            gerund=info.get("gerund"),
         )
-        return
 
-    if _daily_limit_reached(update.effective_user.id):
-        await update.message.reply_text(DAILY_LIMIT_MESSAGE)
-        return
+        if not is_new:
+            await update.message.reply_text(
+                f'📖 *{_md(info.get("phrase", word))}* уже есть в твоём словаре — не добавляю дубль.',
+                parse_mode="Markdown",
+            )
+            return
 
-    await update.message.reply_text("Секунду, ищу...")
-
-    try:
-        info = await asyncio.to_thread(ai_helper.explain_word, word)
-    except Exception:
-        logger.exception("explain_word failed for %r", word)
-        await update.message.reply_text(
-            "Не получилось найти это слово — попробуй ещё раз через минуту."
-        )
-        return
-
-    word_id, is_new = db.add_word(
-        user_id=update.effective_user.id,
-        phrase=info.get("phrase", word),
-        meaning=info.get("meaning", ""),
-        part_of_speech=info.get("part_of_speech", ""),
-        cefr_level=info.get("cefr_level", ""),
-        examples=info.get("examples", []),
-        conjugation=info.get("conjugation"),
-        collocations=info.get("collocations", []),
-        gerund=info.get("gerund"),
-    )
-
-    if not is_new:
-        await update.message.reply_text(
-            f'📖 *{info.get("phrase", word)}* уже есть в твоём словаре — не добавляю дубль.',
-            parse_mode="Markdown",
-        )
-        return
-
-    examples_text = "\n".join(f"• {e}" for e in info.get("examples", []))
+    examples_text = "\n".join(f"• {_md(e)}" for e in info.get("examples", []))
     conj_block = _format_conj_gerund(info.get("conjugation"), info.get("gerund"))
     collocations_block = _format_collocations(info.get("collocations"))
 
-    user_offset = db.get_user_utc_offset(update.effective_user.id)
+    user_offset = db.get_user_utc_offset(user_id)
     if user_offset is None:
         user_offset = DEFAULT_UTC_OFFSET
     window = db.get_current_window(user_offset)
@@ -319,9 +419,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         review_hint = "Первое повторение — завтра утром."
 
     await update.message.reply_text(
-        f'✅ *{info.get("phrase", word)}*\n'
-        f'{info.get("meaning", "")}\n'
-        f'_{info.get("part_of_speech", "")}_\n\n'
+        f'✅ *{_md(info.get("phrase", word))}*\n'
+        f'{_md(info.get("meaning", ""))}\n'
+        f'_{_md(info.get("part_of_speech", ""))}_\n\n'
         f'Примеры:\n{examples_text}'
         f'{conj_block}'
         f'{collocations_block}\n\n'
@@ -339,10 +439,10 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         word = " ".join(context.args)
         deleted = db.delete_word(update.effective_user.id, word)
         if deleted:
-            await update.message.reply_text(f'Слово *{word}* удалено из базы.', parse_mode="Markdown")
+            await update.message.reply_text(f'Слово *{_md(word)}* удалено из базы.', parse_mode="Markdown")
         else:
             await update.message.reply_text(
-                f'Слово *{word}* не найдено. Напиши точно так, как оно сохранено.',
+                f'Слово *{_md(word)}* не найдено. Напиши точно так, как оно сохранено.',
                 parse_mode="Markdown",
             )
     else:
@@ -352,7 +452,11 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         buttons = []
         for w in words_list[:20]:
-            buttons.append([InlineKeyboardButton(w, callback_data=f"del_word:{w}")])
+            # callback_data must stay short (Telegram caps it at 64 bytes) —
+            # use the word's id, never the phrase itself, which can be long
+            # enough (multi-word collocations) to blow that limit and break
+            # the whole menu.
+            buttons.append([InlineKeyboardButton(w["phrase"], callback_data=f"del_word:{w['id']}")])
         keyboard = InlineKeyboardMarkup(buttons)
         await update.message.reply_text(
             "Выбери слово для удаления (показаны последние 20):",
@@ -610,16 +714,16 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "show":
         word_id = int(parts[1])
         row = db.get_word_by_id(word_id)
-        if row is None:
+        if row is None or row["user_id"] != query.from_user.id:
             return
         examples = json.loads(row["examples"] or "[]")
-        examples_text = "\n".join(f"• {e}" for e in examples)
+        examples_text = "\n".join(f"• {_md(e)}" for e in examples)
         conj_block = _format_conj_gerund(row["conjugation"], row["gerund"])
         collocations_block = _format_collocations(json.loads(row["collocations"] or "[]"))
 
         await query.edit_message_text(
-            f'*{row["phrase"]}* — {row["meaning"]}\n'
-            f'_{row["part_of_speech"]}_\n\n'
+            f'*{_md(row["phrase"])}* — {_md(row["meaning"])}\n'
+            f'_{_md(row["part_of_speech"])}_\n\n'
             f'Примеры:\n{examples_text}'
             f'{conj_block}'
             f'{collocations_block}\n\nТы вспомнил(а)?',
@@ -635,11 +739,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "grade":
         word_id = int(parts[1])
         grade = parts[2]
+        row = db.get_word_by_id(word_id)
+        if row is None or row["user_id"] != query.from_user.id:
+            return
         db.mark_review_result(word_id, grade)
         row = db.get_word_by_id(word_id)
         marks = {"remember": "Помню 🟢", "almost": "Почти помню 🟡", "hard": "Сложно 🔴"}
         await query.edit_message_text(
-            f'*{row["phrase"]}* — {marks.get(grade, "")}',
+            f'*{_md(row["phrase"])}* — {marks.get(grade, "")}',
             parse_mode="Markdown",
         )
         await _maybe_ask_mnemonic(query.message.chat_id, row, context, grade)
@@ -660,7 +767,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             return
         row = db.get_word_by_id(word_id)
-        if row is None:
+        if row is None or row["user_id"] != query.from_user.id:
             return
         mnemonic = row["mnemonic"]
         if not mnemonic:
@@ -676,6 +783,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     pass
                 return
             db.save_mnemonic(word_id, mnemonic)
+        mnemonic = _strip_markdown_links(mnemonic)
         keyboard = _mnemonic_keyboard(word_id)
         try:
             await query.edit_message_text(mnemonic, parse_mode="Markdown", reply_markup=keyboard)
@@ -696,13 +804,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "mnemo_retry":
         word_id = int(parts[1])
         row = db.get_word_by_id(word_id)
-        if row is None:
+        if row is None or row["user_id"] != query.from_user.id:
             return
 
         if not _mnemonic_retry_allowed(query.from_user.id, word_id):
             try:
                 await query.edit_message_text(
-                    row["mnemonic"],
+                    _strip_markdown_links(row["mnemonic"]),
                     parse_mode="Markdown",
                     reply_markup=_mnemonic_keyboard(word_id, show_retry=False),
                 )
@@ -730,6 +838,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         db.save_mnemonic(word_id, new_mnemonic)
+        new_mnemonic = _strip_markdown_links(new_mnemonic)
         retries = db.increment_mnemonic_retries(word_id)
         show_retry = (
             _is_owner(query.from_user.id)
@@ -747,12 +856,15 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # --- delete word by button ---
     elif action == "del_word":
-        word = ":".join(parts[1:])
-        deleted = db.delete_word(query.from_user.id, word)
+        word_id = int(parts[1])
+        row = db.get_word_by_id(word_id)
+        if row is None or row["user_id"] != query.from_user.id:
+            return
+        deleted = db.delete_word_by_id(word_id, query.from_user.id)
         if deleted:
-            await query.edit_message_text(f'Слово *{word}* удалено.', parse_mode="Markdown")
+            await query.edit_message_text(f'Слово *{_md(row["phrase"])}* удалено.', parse_mode="Markdown")
         else:
-            await query.edit_message_text(f'Слово *{word}* не найдено.', parse_mode="Markdown")
+            await query.edit_message_text(f'Слово *{_md(row["phrase"])}* не найдено.', parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -767,6 +879,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def hourly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     utc_hour = datetime.now(dt_timezone.utc).hour
     for user_id in db.get_all_due_users():
+        # Defense in depth: due words for this user_id should be impossible
+        # unless they're authorized (both add-word entry points check this
+        # now), but if that ever changes or old data slips through, the bot
+        # shouldn't proactively DM someone who was never let in.
+        if not _is_authorized(user_id):
+            continue
         offset = db.get_user_utc_offset(user_id)
         if offset is None:
             offset = DEFAULT_UTC_OFFSET
@@ -914,6 +1032,18 @@ async def canceltopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _CORS_HEADERS = {"Access-Control-Allow-Origin": "*"}
 
 
+def _key_matches(candidate, expected: str | None) -> bool:
+    """Constant-time key comparison — `candidate != expected` leaks timing
+    info about how many leading characters matched (a real, if impractical
+    over a real network, side channel). Also rejects up front when the
+    expected key isn't configured, or candidate isn't a string (e.g. a
+    malformed JSON body sending "key" as a number) — compare_digest requires
+    matching str/bytes types on both sides and would raise otherwise."""
+    if not expected or not isinstance(candidate, str) or not candidate:
+        return False
+    return hmac.compare_digest(candidate, expected)
+
+
 def _word_row_to_dict(row) -> dict:
     d = dict(row)
     try:
@@ -928,7 +1058,12 @@ def _word_row_to_dict(row) -> dict:
 
 
 async def handle_api_words(request: web.Request) -> web.Response:
-    if not API_KEY or request.query.get("key") != API_KEY:
+    # Header preferred over the query param — a key in the URL ends up in
+    # server/proxy access logs and (for any browser-facing caller) history and
+    # Referer headers. Query param stays supported so existing callers aren't
+    # broken; new/updated callers should send X-API-Key instead.
+    key = request.headers.get("X-API-Key") or request.query.get("key")
+    if not _key_matches(key, API_KEY):
         return web.json_response({"error": "unauthorized"}, status=401, headers=_CORS_HEADERS)
 
     user_id_param = request.query.get("user_id")
@@ -937,7 +1072,15 @@ async def handle_api_words(request: web.Request) -> web.Response:
             {"error": "user_id query param is required"}, status=400, headers=_CORS_HEADERS
         )
 
-    rows = db.get_words_for_export(int(user_id_param))
+    user_id = int(user_id_param)
+    # The invite gate is meant to cover the whole bot, not just Telegram
+    # messages (see CLAUDE.md "Доступ по инвайт-кодам") — without this check
+    # the API key alone would let a caller read any numeric user_id's words,
+    # invited or not.
+    if not _is_authorized(user_id):
+        return web.json_response({"error": "user is not authorized for this bot"}, status=403, headers=_CORS_HEADERS)
+
+    rows = db.get_words_for_export(user_id)
     words = [_word_row_to_dict(r) for r in rows]
     return web.json_response(words, headers=_CORS_HEADERS)
 
@@ -951,7 +1094,7 @@ async def handle_api_add_word(request: web.Request) -> web.Response:
     except Exception:
         return web.json_response({"error": "invalid JSON body"}, status=400, headers=_CORS_HEADERS)
 
-    if payload.get("key") != API_WRITE_KEY:
+    if not _key_matches(payload.get("key"), API_WRITE_KEY):
         return web.json_response({"error": "unauthorized"}, status=401, headers=_CORS_HEADERS)
 
     try:
@@ -964,38 +1107,59 @@ async def handle_api_add_word(request: web.Request) -> web.Response:
             {"error": "user_id (number) and word are required"}, status=400, headers=_CORS_HEADERS
         )
 
-    existing = db.find_word_by_phrase(user_id, word)
-    if existing:
+    # The invite gate is meant to cover the whole bot (see CLAUDE.md "Доступ
+    # по инвайт-кодам"), but access_gate() only guards Telegram updates —
+    # without this check, the write key alone would let a caller plant words
+    # for ANY numeric user_id, invited or not. That matters beyond privacy:
+    # hourly_reminder_job() below messages every user_id with due words with
+    # no authorization check of its own, so an unauthorized id with planted
+    # words would start getting proactively DMed by the bot.
+    if not _is_authorized(user_id):
         return web.json_response(
-            {"is_new": False, "word": _word_row_to_dict(existing)},
-            status=200,
-            headers=_CORS_HEADERS,
+            {"error": "user is not authorized for this bot"}, status=403, headers=_CORS_HEADERS
         )
 
-    if _daily_limit_reached(user_id):
-        return web.json_response(
-            {"error": f"daily limit of {DAILY_NEW_WORD_LIMIT} new words reached"},
-            status=429,
-            headers=_CORS_HEADERS,
+    # Locked for the same reason as handle_message(): without it, concurrent
+    # POST /words for the same user_id can all see the limit as not-yet-reached
+    # and all proceed. Shared with the Telegram entry point so the two can't
+    # race against each other either.
+    async with _get_add_word_lock(user_id):
+        existing = db.find_word_by_phrase(user_id, word)
+        if existing:
+            return web.json_response(
+                {"is_new": False, "word": _word_row_to_dict(existing)},
+                status=200,
+                headers=_CORS_HEADERS,
+            )
+
+        # allow_owner_bypass=False: the API takes user_id from the request body, so
+        # anyone holding API_WRITE_KEY could otherwise pass OWNER_TELEGRAM_ID and get
+        # the owner's unlimited-words exemption for free. The bypass is only safe on
+        # the Telegram side, where user_id comes from Telegram itself, not a client.
+        if _daily_limit_reached(user_id, allow_owner_bypass=False):
+            return web.json_response(
+                {"error": f"daily limit of {DAILY_NEW_WORD_LIMIT} new words reached"},
+                status=429,
+                headers=_CORS_HEADERS,
+            )
+
+        try:
+            info = await asyncio.to_thread(ai_helper.explain_word, word)
+        except Exception:
+            logger.exception("api add_word: explain_word failed for %r", word)
+            return web.json_response({"error": "failed to look up word"}, status=502, headers=_CORS_HEADERS)
+
+        word_id, is_new = db.add_word(
+            user_id=user_id,
+            phrase=info.get("phrase", word),
+            meaning=info.get("meaning", ""),
+            part_of_speech=info.get("part_of_speech", ""),
+            cefr_level=info.get("cefr_level", ""),
+            examples=info.get("examples", []),
+            conjugation=info.get("conjugation"),
+            collocations=info.get("collocations", []),
+            gerund=info.get("gerund"),
         )
-
-    try:
-        info = await asyncio.to_thread(ai_helper.explain_word, word)
-    except Exception:
-        logger.exception("api add_word: explain_word failed for %r", word)
-        return web.json_response({"error": "failed to look up word"}, status=502, headers=_CORS_HEADERS)
-
-    word_id, is_new = db.add_word(
-        user_id=user_id,
-        phrase=info.get("phrase", word),
-        meaning=info.get("meaning", ""),
-        part_of_speech=info.get("part_of_speech", ""),
-        cefr_level=info.get("cefr_level", ""),
-        examples=info.get("examples", []),
-        conjugation=info.get("conjugation"),
-        collocations=info.get("collocations", []),
-        gerund=info.get("gerund"),
-    )
     result = _word_row_to_dict(db.get_word_by_id(word_id))
     return web.json_response(
         {"is_new": is_new, "word": result},
@@ -1081,6 +1245,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 PUBLIC_COMMANDS = [
     ("start", "Начать"),
+    ("help", "Как всё устроено"),
     ("review", "Повторить слова по расписанию"),
     ("all", "Повторить все слова из базы"),
     ("delete", "Удалить слово из базы"),
@@ -1121,6 +1286,7 @@ def main():
     app.add_handler(CommandHandler("review", review))
     app.add_handler(CommandHandler("all", review_all))
     app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("invite", invite))
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("reset_collected", reset_collected))

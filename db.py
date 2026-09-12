@@ -273,13 +273,15 @@ def delete_word_by_id(word_id: int, user_id: int) -> bool:
 
 
 def get_user_words(user_id: int):
+    """Most-recently-added first — callers slicing this for a "last N" list
+    (e.g. the /delete button menu) rely on that order."""
     conn = get_connection()
     rows = conn.execute(
-        "SELECT phrase FROM words WHERE user_id = ?",
+        "SELECT id, phrase FROM words WHERE user_id = ? ORDER BY id DESC",
         (user_id,),
     ).fetchall()
     conn.close()
-    return [r["phrase"] for r in rows]
+    return rows
 
 
 def get_review_history_words(user_id: int):
