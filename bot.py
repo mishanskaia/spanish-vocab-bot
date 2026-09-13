@@ -41,7 +41,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 API_KEY = os.environ.get("API_KEY")
 API_WRITE_KEY = os.environ.get("API_WRITE_KEY")
 OWNER_TELEGRAM_ID = int(os.environ.get("OWNER_TELEGRAM_ID", "0") or "0")
-DAILY_NEW_WORD_LIMIT = int(os.environ.get("DAILY_NEW_WORD_LIMIT", "5"))
+WEEKLY_NEW_WORD_LIMIT = int(os.environ.get("WEEKLY_NEW_WORD_LIMIT", "35"))
 AUTHOR_TELEGRAM_USERNAME = os.environ.get("AUTHOR_TELEGRAM_USERNAME", "")
 INVITE_TTL_DAYS = 15
 # Vocab reminders fire at these hours in each user's own local time (see
@@ -195,8 +195,9 @@ async def _send_welcome(update: Update):
         "— Если слово сложное, могу предложить мнемонику.\n"
         "— Ошибочно добавленное слово можно удалить через /delete.\n"
         "— Подробнее о повторениях и командах: /help\n\n"
-        f"Это пока тестовая версия: до {DAILY_NEW_WORD_LIMIT} новых слов в "
-        "день. Если что-то работает не так — пиши Оле лично, разберёмся"
+        f"Это пока тестовая версия: до {WEEKLY_NEW_WORD_LIMIT} новых слов в "
+        "неделю (лимит обновляется по понедельникам). Если что-то работает "
+        "не так — пиши Оле лично, разберёмся"
     )
 
 
@@ -230,8 +231,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "запоминания.\n\n"
         "🗑 /delete — удалить слово из словаря\n"
         "📊 /stats — сколько слов и как идёт прогресс\n\n"
-        f"Пока тест: до {DAILY_NEW_WORD_LIMIT} новых слов в день. Если "
-        "что-то не работает — пиши Оле лично."
+        f"Пока тест: до {WEEKLY_NEW_WORD_LIMIT} новых слов в неделю "
+        "(обновляется по понедельникам). Если что-то не работает — пиши Оле лично."
     )
 
 
@@ -269,9 +270,11 @@ async def _handle_tz_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Дневной лимит на добавление новых слов — каждый вызов explain_word() стоит
+# Недельный лимит на добавление новых слов — каждый вызов explain_word() стоит
 # денег с личного ANTHROPIC_API_KEY владельца бота, поэтому у всех кроме
-# OWNER_TELEGRAM_ID он ограничен.
+# OWNER_TELEGRAM_ID он ограничен. Сбрасывается по понедельникам (см.
+# db._local_week_start()), а не "последние 7 дней" — сознательный выбор,
+# см. CLAUDE.md.
 # ---------------------------------------------------------------------------
 
 def _is_owner(user_id: int) -> bool:
@@ -282,10 +285,10 @@ def _is_authorized(user_id: int) -> bool:
     return _is_owner(user_id) or db.is_user_authorized(user_id)
 
 
-def _daily_limit_reached(user_id: int, *, allow_owner_bypass: bool = True) -> bool:
+def _weekly_limit_reached(user_id: int, *, allow_owner_bypass: bool = True) -> bool:
     if allow_owner_bypass and _is_owner(user_id):
         return False
-    return db.count_words_added_today(user_id) >= DAILY_NEW_WORD_LIMIT
+    return db.count_words_added_this_week(user_id) >= WEEKLY_NEW_WORD_LIMIT
 
 
 def _mnemonic_retry_allowed(user_id: int, word_id: int) -> bool:
@@ -294,16 +297,16 @@ def _mnemonic_retry_allowed(user_id: int, word_id: int) -> bool:
     return db.get_mnemonic_retries(word_id) < MNEMONIC_RETRY_LIMIT
 
 
-DAILY_LIMIT_MESSAGE = (
-    f"На сегодня лимит новых слов исчерпан ({DAILY_NEW_WORD_LIMIT}/день). "
-    f"Приходи завтра — то, что уже в словаре, никуда не денется 🙂"
+WEEKLY_LIMIT_MESSAGE = (
+    f"На этой неделе лимит новых слов исчерпан ({WEEKLY_NEW_WORD_LIMIT}/неделю). "
+    f"Лимит обновится в понедельник — то, что уже в словаре, никуда не денется 🙂"
 )
 
 # ---------------------------------------------------------------------------
-# Per-user lock around "check daily limit → call Claude → insert" — without
+# Per-user lock around "check weekly limit → call Claude → insert" — without
 # it, two add-word requests for the same user_id that arrive close together
 # can each see the limit as not-yet-reached (neither has committed its insert
-# yet) and both proceed, bypassing DAILY_NEW_WORD_LIMIT. Telegram updates are
+# yet) and both proceed, bypassing WEEKLY_NEW_WORD_LIMIT. Telegram updates are
 # already processed one at a time by PTB, so this mainly matters for the HTTP
 # API below (aiohttp handles requests concurrently) — but it's shared so the
 # Telegram and API entry points can't race against each other either.
@@ -368,8 +371,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if _daily_limit_reached(user_id):
-            await update.message.reply_text(DAILY_LIMIT_MESSAGE)
+        if _weekly_limit_reached(user_id):
+            await update.message.reply_text(WEEKLY_LIMIT_MESSAGE)
             return
 
         await update.message.reply_text("Секунду, ищу...")
@@ -1133,9 +1136,9 @@ async def handle_api_add_word(request: web.Request) -> web.Response:
         # anyone holding API_WRITE_KEY could otherwise pass OWNER_TELEGRAM_ID and get
         # the owner's unlimited-words exemption for free. The bypass is only safe on
         # the Telegram side, where user_id comes from Telegram itself, not a client.
-        if _daily_limit_reached(user_id, allow_owner_bypass=False):
+        if _weekly_limit_reached(user_id, allow_owner_bypass=False):
             return web.json_response(
-                {"error": f"daily limit of {DAILY_NEW_WORD_LIMIT} new words reached"},
+                {"error": f"weekly limit of {WEEKLY_NEW_WORD_LIMIT} new words reached"},
                 status=429,
                 headers=_CORS_HEADERS,
             )

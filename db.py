@@ -57,9 +57,19 @@ def get_current_window(utc_offset_hours: int = 3) -> str:
 
 def _local_today(utc_offset_hours: int = 3) -> str:
     """Calendar date in the given UTC offset — for anything that should reset
-    at *that user's* midnight (daily new-word limit, added_date), not the
-    server's UTC date. Same default-to-Moscow convention as get_current_window."""
+    at *that user's* midnight (added_date). Same default-to-Moscow convention
+    as get_current_window."""
     return (datetime.now(timezone.utc) + timedelta(hours=utc_offset_hours)).date().isoformat()
+
+
+def _local_week_start(utc_offset_hours: int = 3) -> str:
+    """Monday's date (ISO) of the calendar week containing the user's current
+    local date — for the weekly new-word limit, which resets every Monday in
+    *that user's* own local time, not the server's UTC week. Same
+    default-to-Moscow convention as get_current_window/_local_today."""
+    today = (datetime.now(timezone.utc) + timedelta(hours=utc_offset_hours)).date()
+    monday = today - timedelta(days=today.weekday())
+    return monday.isoformat()
 
 
 def first_review_for_window(window: str) -> tuple:
@@ -375,22 +385,23 @@ def get_due_words(user_id):
     return overdue + scheduled
 
 
-def count_words_added_today(user_id: int) -> int:
-    """Counts rows inserted today for this user — tracks token spend
-    (a Claude call already happened by the time a lookup turns out to be
-    a duplicate), not just successfully-kept vocabulary.
+def count_words_added_this_week(user_id: int) -> int:
+    """Counts rows inserted since Monday of this user's current local week —
+    tracks token spend (a Claude call already happened by the time a lookup
+    turns out to be a duplicate), not just successfully-kept vocabulary.
 
-    "Today" is the user's own local date (their stored UTC offset, or Moscow
-    default), matching added_date in add_word() — not the server's UTC date,
-    so the daily limit resets at each user's own midnight, not a fixed UTC one."""
+    Resets every Monday in the user's own local time (their stored UTC
+    offset, or Moscow default), not the server's UTC week — see
+    _local_week_start(). added_date is an ISO date string, so a plain
+    lexicographic >= comparison against the Monday date works."""
     offset = get_user_utc_offset(user_id)
     if offset is None:
         offset = 3
     conn = get_connection()
-    today = _local_today(offset)
+    week_start = _local_week_start(offset)
     row = conn.execute(
-        "SELECT COUNT(*) AS c FROM words WHERE user_id = ? AND added_date = ?",
-        (user_id, today),
+        "SELECT COUNT(*) AS c FROM words WHERE user_id = ? AND added_date >= ?",
+        (user_id, week_start),
     ).fetchone()
     conn.close()
     return row["c"]
