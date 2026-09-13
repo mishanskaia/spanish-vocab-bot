@@ -29,6 +29,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.error import BadRequest, NetworkError
 from telegram.helpers import escape_markdown
 
 import db
@@ -243,16 +244,34 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 _TZ_REPLY_RE = re.compile(r'^(\d{1,2})(?:[:.,](\d{2}))?\s*$')
+# Escape hatch — without it, anyone who tries to add a word instead of
+# answering (or just doesn't want to) gets stuck forever: every message they
+# send afterward is intercepted here as a bad time reply, "не поняла" on
+# repeat, and they can never add a word until they type digits. Any of these
+# (case-insensitive) skips the question instead, defaulting to Moscow like
+# an unanswered question already does.
+_TZ_SKIP_WORDS = {"позже", "пропустить", "skip", "потом", "не знаю", "неважно"}
 
 
 async def _handle_tz_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
+
+    if text.lower() in _TZ_SKIP_WORDS:
+        context.user_data.pop("awaiting_tz_reply", None)
+        await update.message.reply_text(
+            "Хорошо, пока буду ориентироваться на московское время — если что, "
+            "можно уточнить позже через /start.\n\n"
+            "Можешь присылать первое слово — например, conseguir или sin embargo 🙂"
+        )
+        return
+
     m = _TZ_REPLY_RE.match(text)
     local_hour = int(m.group(1)) if m else -1
     local_minute = int(m.group(2) or 0) if m else -1
     if not m or not (0 <= local_hour <= 23 and 0 <= local_minute <= 59):
         await update.message.reply_text(
-            "Не поняла — напиши текущее время цифрами, например 14:30 или просто 14."
+            "Не поняла — напиши текущее время цифрами, например 14:30 или просто 14 "
+            "(или «позже», если не хочешь отвечать сейчас)."
         )
         return
 
@@ -494,7 +513,7 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
         await context.bot.send_message(
             chat_id,
             f"На эту сессию хватит — {SESSION_WORD_LIMIT} слов сделано 👍\n"
-            f"Остальное подождёт следующей сессии (10:00 / 14:00 / 18:00 МСК)."
+            f"Остальное подождёт следующей сессии (10:00 / 14:00 / 18:00 по твоему времени)."
         )
         return
 
@@ -721,19 +740,28 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conj_block = _format_conj_gerund(row["conjugation"], row["gerund"])
         collocations_block = _format_collocations(json.loads(row["collocations"] or "[]"))
 
-        await query.edit_message_text(
-            f'*{_md(row["phrase"])}* — {_md(row["meaning"])}\n'
-            f'_{_md(row["part_of_speech"])}_\n\n'
-            f'Примеры:\n{examples_text}'
-            f'{conj_block}'
-            f'{collocations_block}\n\nТы вспомнил(а)?',
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("Помню 🟢", callback_data=f"grade:{word_id}:remember"),
-                InlineKeyboardButton("Почти 🟡", callback_data=f"grade:{word_id}:almost"),
-                InlineKeyboardButton("Сложно 🔴", callback_data=f"grade:{word_id}:hard"),
-            ]]),
-            parse_mode="Markdown",
-        )
+        try:
+            await query.edit_message_text(
+                f'*{_md(row["phrase"])}* — {_md(row["meaning"])}\n'
+                f'_{_md(row["part_of_speech"])}_\n\n'
+                f'Примеры:\n{examples_text}'
+                f'{conj_block}'
+                f'{collocations_block}\n\nТы вспомнил(а)?',
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("Помню 🟢", callback_data=f"grade:{word_id}:remember"),
+                    InlineKeyboardButton("Почти 🟡", callback_data=f"grade:{word_id}:almost"),
+                    InlineKeyboardButton("Сложно 🔴", callback_data=f"grade:{word_id}:hard"),
+                ]]),
+                parse_mode="Markdown",
+            )
+        except BadRequest as e:
+            # A double-tap on "Показать ответ" sends two callback updates for
+            # the same card in quick succession — the second edit targets
+            # content Telegram considers identical/already-changed and raises
+            # "message is not modified" (or similar). Harmless: the user
+            # already sees the answer from the first tap, nothing to redo.
+            if "not modified" not in str(e).lower():
+                raise
 
     # --- self-assessment grade ---
     elif action == "grade":
@@ -1220,6 +1248,14 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             logger.exception("Failed to notify user about the error")
+
+    # Transient network blips between Railway and Telegram during long-polling
+    # (getUpdates) surface here with update=None and a NetworkError — they
+    # self-heal (PTB just retries the next poll) and happen to any polling
+    # bot regardless of whether anyone's actually using it. Still logged
+    # above, just not worth personally paging the owner for every one.
+    if isinstance(context.error, NetworkError):
+        return
 
     if not OWNER_TELEGRAM_ID:
         return
