@@ -26,6 +26,25 @@ def _get_client() -> OpenAI:
     return _client
 
 
+# Dictating a new word: Russian or Spanish, usually one word or a short phrase. No `language`
+# parameter (it would force one of the two) — the model detects it, and the prompt says which
+# two languages to expect so a short word isn't guessed as some third language.
+WORD_PROMPT = (
+    "Одно слово или короткая фраза на русском или на испанском языке. "
+    "Una palabra o frase corta en ruso o en español."
+)
+
+
+def transcribe_word(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
+    result = _get_client().audio.transcriptions.create(
+        model=STT_MODEL,
+        file=(filename, audio_bytes),
+        prompt=WORD_PROMPT,
+    )
+    # models tend to add sentence punctuation ("Счёт.") — dedup matches the phrase exactly
+    return result.text.strip().strip(".,!?¿¡…\"«»").strip()
+
+
 def transcribe(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
     result = _get_client().audio.transcriptions.create(
         model=STT_MODEL,
