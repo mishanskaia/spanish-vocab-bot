@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import json
 import time
 import hmac
@@ -29,11 +30,13 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.constants import ChatAction
 from telegram.error import BadRequest, NetworkError
 from telegram.helpers import escape_markdown
 
 import db
 import ai_helper
+import stt_helper
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -61,6 +64,11 @@ STUDY_COACH_UTC = (4, 0)
 # Sunday 06:00 Moscow = 03:00 UTC — weekly DB backup, quiet time before the day's reminders
 BACKUP_WEEKLY_UTC = (3, 0)
 BACKUP_WEEKDAY = 6  # Monday=0 .. Sunday=6, per job_queue's `days`
+
+# Evening practice (owner-only): needs OpenAI for speech-to-text, so it stays off without the key
+EVENING_PRACTICE_ENABLED = bool(os.environ.get("OPENAI_API_KEY"))
+EVENING_PRACTICE_LOCAL_HOUR = 21
+PRACTICE_MAX_ATTEMPTS = 3  # per word; after that the bot moves on instead of looping (and spending) forever
 
 SESSION_WORD_LIMIT = 30
 MNEMONIC_RETRY_LIMIT = 3
@@ -909,6 +917,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 logger.exception("mnemonic retry plain-text edit also failed for word_id=%s", word_id)
 
+    # --- evening practice: next word / stop ---
+    elif action in ("practice_next", "practice_stop"):
+        await _handle_practice_button(query, action, parts)
+
     # --- delete word by button ---
     elif action == "del_word":
         word_id = int(parts[1])
@@ -932,6 +944,11 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def hourly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await _maybe_start_evening_practice(context)
+    except Exception:
+        # must not take down the vocab reminders below
+        logger.exception("evening practice start failed")
     utc_hour = datetime.now(dt_timezone.utc).hour
     for user_id in db.get_all_due_users():
         # Defense in depth: due words for this user_id should be impossible
@@ -1029,6 +1046,237 @@ async def study_coach_reminder(context: ContextTypes.DEFAULT_TYPE):
     if not blocks:
         return
     await context.bot.send_message(user_id, "\n\n".join(blocks))
+
+
+# ---------------------------------------------------------------------------
+# Evening practice — owner-only, 21:00 owner-local. Picks up the 3 words Study
+# Coach sent in the morning and asks for a spoken phrase with each one. Words
+# are shown by Russian meaning with the Spanish under a spoiler, so recalling
+# the word is part of the exercise. Session state is in the DB (db.py), not
+# user_data, so a redeploy mid-session doesn't drop it. Voice handling (STT +
+# Claude feedback) is added on top of this; see TODO.md «Вечерняя практика».
+# ---------------------------------------------------------------------------
+
+def _practice_keyboard(session_id: int, index: int) -> InlineKeyboardMarkup:
+    # index in callback_data: a double tap on «Дальше» must not skip two words
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("Дальше ⏭", callback_data=f"practice_next:{session_id}:{index}"),
+        InlineKeyboardButton("Закончить", callback_data=f"practice_stop:{session_id}:{index}"),
+    ]])
+
+
+async def _send_practice_word(bot, chat_id: int, session: dict):
+    index = session["current_index"]
+    total = len(session["word_ids"])
+    row = db.get_word_by_id(session["word_ids"][index])
+    if row is None:  # word deleted since the session started — treat as skipped
+        session = db.advance_practice(session["id"], "skipped")
+        if session["status"] == "active":
+            await _send_practice_word(bot, chat_id, session)
+        else:
+            await _send_practice_summary(bot, chat_id, session["id"])
+        return
+    header = "🌙 <b>Пора поговорить!</b>\n\n" if index == 0 else ""
+    text = (
+        f"{header}Слово {index + 1} из {total}: <b>{html.escape(row['meaning'] or '')}</b>\n"
+        f"<tg-spoiler>{html.escape(row['phrase'])}</tg-spoiler>\n\n"
+        "Запиши голосовое с фразой, где есть это слово."
+    )
+    await bot.send_message(
+        chat_id, text, parse_mode="HTML", reply_markup=_practice_keyboard(session["id"], index)
+    )
+
+
+async def _start_evening_practice(bot, user_id: int, words) -> bool:
+    if not words:
+        return False
+    offset = db.get_user_utc_offset(user_id)
+    if offset is None:
+        offset = DEFAULT_UTC_OFFSET
+    session = db.create_practice_session(user_id, db._local_today(offset), [w["id"] for w in words])
+    await _send_practice_word(bot, user_id, session)
+    return True
+
+
+async def _maybe_start_evening_practice(context: ContextTypes.DEFAULT_TYPE):
+    if not (OWNER_TELEGRAM_ID and EVENING_PRACTICE_ENABLED):
+        return
+    offset = db.get_user_utc_offset(OWNER_TELEGRAM_ID)
+    if offset is None:
+        offset = DEFAULT_UTC_OFFSET
+    local_hour = (datetime.now(dt_timezone.utc).hour + offset) % 24
+    if local_hour != EVENING_PRACTICE_LOCAL_HOUR:
+        return
+    # one session per local date — also guards against re-sending after a restart in this hour
+    if db.get_practice_session_for_date(OWNER_TELEGRAM_ID, db._local_today(offset)):
+        return
+    await _start_evening_practice(context.bot, OWNER_TELEGRAM_ID, db.get_today_speech_words(OWNER_TELEGRAM_ID))
+
+
+async def practice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the evening practice right now (for testing without waiting for 21:00).
+    Falls back to the next speech-activation words if Study Coach hasn't sent any today."""
+    user_id = update.effective_user.id
+    if not _is_owner(user_id):
+        return
+    if not EVENING_PRACTICE_ENABLED:
+        await update.message.reply_text("Вечерняя практика выключена: не задан OPENAI_API_KEY.")
+        return
+    words = db.get_today_speech_words(user_id) or db.get_speech_activation_words(user_id, limit=3)
+    if not await _start_evening_practice(context.bot, user_id, words):
+        await update.message.reply_text("Нет слов для практики — нужны слова со статусом familiar и выше.")
+
+
+async def _handle_practice_button(query, action: str, parts):
+    session_id, index = int(parts[1]), int(parts[2])
+    session = db.get_practice_session(session_id)
+    if (
+        session is None
+        or session["user_id"] != query.from_user.id
+        or session["status"] != "active"
+        or session["current_index"] != index
+    ):
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
+            pass
+        return
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except BadRequest:
+        pass
+    chat_id = query.message.chat_id
+    if action == "practice_stop":
+        word_id = session["word_ids"][session["current_index"]]
+        db.stop_practice(session_id, db.get_practice_word_outcome(session_id, word_id))
+        await _send_practice_summary(query.get_bot(), chat_id, session_id)
+        return
+    await _advance_practice_and_continue(query.get_bot(), chat_id, session)
+
+
+async def _advance_practice_and_continue(bot, chat_id: int, session: dict):
+    """Close the current word (outcome derived from its logged attempts) and show the next one."""
+    word_id = session["word_ids"][session["current_index"]]
+    outcome = db.get_practice_word_outcome(session["id"], word_id)
+    session = db.advance_practice(session["id"], outcome)
+    if session["status"] == "active":
+        await _send_practice_word(bot, chat_id, session)
+    else:
+        await _send_practice_summary(bot, chat_id, session["id"])
+
+
+PRACTICE_OUTCOME_LABELS = {
+    "first_try": "✅ сразу",
+    "after_fix": "🟡 после правки",
+    "not_yet": "🔸 пока не получилось",
+    "skipped": "⏭ пропущено",
+}
+
+
+async def _send_practice_summary(bot, chat_id: int, session_id: int):
+    """One line per word reached; for words that needed a fix, the last corrected
+    phrase goes under it — that's the part worth rereading later."""
+    session = db.get_practice_session(session_id)
+    corrections = db.get_practice_last_corrections(session_id)
+    lines = []
+    for word_id, outcome in zip(session["word_ids"], session["outcomes"]):
+        row = db.get_word_by_id(word_id)
+        phrase = html.escape(row["phrase"]) if row else "(слово удалено)"
+        line = f"{PRACTICE_OUTCOME_LABELS.get(outcome, outcome)} — <b>{phrase}</b>"
+        if outcome in ("after_fix", "not_yet") and corrections.get(word_id):
+            line += f"\n      <i>{html.escape(corrections[word_id])}</i>"
+        lines.append(line)
+    text = "Практика на сегодня закончена 🎉"
+    if lines:
+        text += "\n\n" + "\n".join(lines)
+    await bot.send_message(chat_id, text, parse_mode="HTML")
+
+
+async def handle_practice_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Voice note → verbatim transcript (OpenAI) → Claude feedback → retry or next word.
+    Voice notes aren't used anywhere else in the bot, so no awaiting-flag is needed:
+    a voice note from the owner during an active session is always a practice answer."""
+    user_id = update.effective_user.id
+    message = update.message
+    if not _is_owner(user_id) or not EVENING_PRACTICE_ENABLED:
+        return
+    session = db.get_active_practice_session(user_id)
+    if session is None:
+        await message.reply_text("Голосовые я понимаю только во время вечерней практики — запусти /practice.")
+        return
+    index = session["current_index"]
+    word_id = session["word_ids"][index]
+    row = db.get_word_by_id(word_id)
+    if row is None:
+        await _advance_practice_and_continue(context.bot, message.chat_id, session)
+        return
+
+    await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
+    try:
+        tg_file = await message.voice.get_file()
+        audio = bytes(await tg_file.download_as_bytearray())
+        transcript = await asyncio.to_thread(stt_helper.transcribe, audio)
+    except Exception:
+        logger.exception("practice STT failed for session_id=%s", session["id"])
+        await message.reply_text("Не получилось распознать голосовое — попробуй записать ещё раз.")
+        return
+    if not transcript:
+        await message.reply_text("Ничего не расслышал — попробуй записать ещё раз.")
+        return
+    await message.reply_text(f"🎧 Услышал: «{transcript}»")
+
+    try:
+        result = await asyncio.to_thread(
+            ai_helper.check_practice_phrase, row["phrase"], row["meaning"], transcript
+        )
+    except Exception:
+        logger.exception("practice feedback failed for session_id=%s", session["id"])
+        await message.reply_text("Не получилось разобрать фразу — попробуй записать ещё раз.")
+        return
+
+    if result.get("unclear"):
+        await message.reply_text("Не разобрал фразу — попробуй ещё раз, чуть медленнее.")
+        return
+
+    # STT + Claude take a while: «Дальше»/«Закончить» may have been pressed meanwhile
+    current = db.get_practice_session(session["id"])
+    stale = current["status"] != "active" or current["current_index"] != index
+
+    done = bool(result.get("is_correct")) and bool(result.get("uses_target_word"))
+    corrected = result.get("corrected")
+    explanation = html.escape(result.get("explanation") or "")
+    if stale:
+        if not done and corrected:
+            await message.reply_text(
+                f"💡 {explanation}\nПравильнее: <i>{html.escape(corrected)}</i>", parse_mode="HTML"
+            )
+        return
+
+    attempt = db.log_practice_attempt(session["id"], word_id, transcript, done, corrected)
+    chat_id = message.chat_id
+    keyboard = _practice_keyboard(session["id"], index)
+
+    if done and result.get("too_simple"):
+        suggestion = html.escape(result.get("suggestion") or "Попробуй добавить подробностей.")
+        await message.reply_text(
+            f"✅ Верно, но фраза простая. {suggestion}\n\nМожешь записать посложнее или нажми «Дальше».",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        return
+    if done:
+        await message.reply_text("✅ Верно!" + (f" {explanation}" if explanation else ""), parse_mode="HTML")
+        await _advance_practice_and_continue(context.bot, chat_id, current)
+        return
+
+    text = f"💡 {explanation}"
+    if corrected:
+        text += f"\nПравильнее: <i>{html.escape(corrected)}</i>"
+    if attempt >= PRACTICE_MAX_ATTEMPTS:
+        await message.reply_text(text + "\n\nХорошо, запомним — идём дальше.", parse_mode="HTML")
+        await _advance_practice_and_continue(context.bot, chat_id, current)
+        return
+    await message.reply_text(text + "\n\nЗапиши ещё раз 🎙", parse_mode="HTML", reply_markup=keyboard)
 
 
 async def newtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1325,6 +1573,7 @@ OWNER_ONLY_COMMANDS = [
     ("newtopic", "Добавить тему для Study Coach"),
     ("topics", "Активные темы Study Coach"),
     ("canceltopic", "Отменить тему Study Coach"),
+    ("practice", "Вечерняя практика прямо сейчас"),
 ]
 
 
@@ -1360,7 +1609,9 @@ def main():
     app.add_handler(CommandHandler("newtopic", newtopic))
     app.add_handler(CommandHandler("topics", topics))
     app.add_handler(CommandHandler("canceltopic", canceltopic))
+    app.add_handler(CommandHandler("practice", practice))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.VOICE, handle_practice_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
