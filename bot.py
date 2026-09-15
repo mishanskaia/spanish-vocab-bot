@@ -39,6 +39,9 @@ import ai_helper
 import stt_helper
 
 logging.basicConfig(level=logging.INFO)
+# httpx logs every request URL at INFO, and Telegram Bot API URLs contain the bot token —
+# that put the token into Railway logs on every getUpdates poll. Warnings/errors still show.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
