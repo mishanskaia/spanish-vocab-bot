@@ -434,6 +434,17 @@ def count_due_not_reviewed_today(user_id: int) -> int:
     return row["c"] if row else 0
 
 
+def get_words_per_user() -> list[dict]:
+    """Total word count per user_id (excludes legacy 'skipped' rows), most words first."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT user_id, COUNT(*) AS total FROM words WHERE status != 'skipped' "
+        "GROUP BY user_id ORDER BY total DESC"
+    ).fetchall()
+    conn.close()
+    return [{"user_id": r["user_id"], "total": r["total"]} for r in rows]
+
+
 def save_mnemonic(word_id: int, mnemonic: str):
     conn = get_connection()
     conn.execute("UPDATE words SET mnemonic = ? WHERE id = ?", (mnemonic, word_id))
