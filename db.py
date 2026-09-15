@@ -202,6 +202,35 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS practice_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            session_date TEXT NOT NULL,
+            word_ids TEXT NOT NULL,
+            current_index INTEGER DEFAULT 0,
+            attempts INTEGER DEFAULT 0,
+            outcomes TEXT DEFAULT '[]',
+            status TEXT DEFAULT 'active',
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS practice_attempts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            word_id INTEGER NOT NULL,
+            attempt INTEGER NOT NULL,
+            transcript TEXT,
+            is_correct INTEGER,
+            correction TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -720,6 +749,106 @@ def mark_speech_activation_shown(word_ids):
         "UPDATE words SET speech_activation_last_shown = ? WHERE id = ?",
         [(today, wid) for wid in word_ids],
     )
+    conn.commit()
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Evening practice (owner-only) — say a phrase with each of today's 3 Study
+# Coach speech-activation words. Session state lives here, not in
+# context.user_data, so a Railway redeploy mid-session doesn't lose it.
+# One session per user per local date: its existence is also what stops the
+# hourly job from re-sending the practice after a restart within the same hour.
+# ---------------------------------------------------------------------------
+
+def get_today_speech_words(user_id: int):
+    """The words Study Coach showed this morning. Uses date.today() — the same
+    date mark_speech_activation_shown() stamps — not the user's local date."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM words WHERE user_id = ? AND speech_activation_last_shown = ? ORDER BY id",
+        (user_id, date.today().isoformat()),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def _practice_row_to_dict(row):
+    if row is None:
+        return None
+    session = dict(row)
+    session["word_ids"] = json.loads(session["word_ids"])
+    session["outcomes"] = json.loads(session["outcomes"] or "[]")
+    return session
+
+
+def get_practice_session_for_date(user_id: int, session_date: str):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM practice_sessions WHERE user_id = ? AND session_date = ? ORDER BY id DESC LIMIT 1",
+        (user_id, session_date),
+    ).fetchone()
+    conn.close()
+    return _practice_row_to_dict(row)
+
+
+def create_practice_session(user_id: int, session_date: str, word_ids) -> dict:
+    """Expires any still-active older session first — only one live session per user."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE practice_sessions SET status = 'expired' WHERE user_id = ? AND status = 'active'",
+        (user_id,),
+    )
+    cur = conn.execute(
+        """INSERT INTO practice_sessions (user_id, session_date, word_ids, created_at)
+           VALUES (?, ?, ?, ?)""",
+        (user_id, session_date, json.dumps(list(word_ids)), datetime.now(timezone.utc).isoformat()),
+    )
+    session_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return get_practice_session(session_id)
+
+
+def get_practice_session(session_id: int):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM practice_sessions WHERE id = ?", (session_id,)).fetchone()
+    conn.close()
+    return _practice_row_to_dict(row)
+
+
+def get_active_practice_session(user_id: int):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM practice_sessions WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return _practice_row_to_dict(row)
+
+
+def advance_practice(session_id: int, outcome: str) -> dict:
+    """Record the current word's outcome ('first_try' | 'after_fix' | 'skipped'),
+    move to the next word, reset the attempt counter; marks the session 'done'
+    after the last word. Returns the updated session."""
+    session = get_practice_session(session_id)
+    outcomes = session["outcomes"] + [outcome]
+    next_index = session["current_index"] + 1
+    status = "done" if next_index >= len(session["word_ids"]) else "active"
+    conn = get_connection()
+    conn.execute(
+        """UPDATE practice_sessions SET current_index = ?, attempts = 0, outcomes = ?, status = ?
+           WHERE id = ?""",
+        (next_index, json.dumps(outcomes), status, session_id),
+    )
+    conn.commit()
+    conn.close()
+    return get_practice_session(session_id)
+
+
+def finish_practice(session_id: int):
+    conn = get_connection()
+    conn.execute("UPDATE practice_sessions SET status = 'done' WHERE id = ?", (session_id,))
     conn.commit()
     conn.close()
 
