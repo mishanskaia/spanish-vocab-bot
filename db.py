@@ -882,6 +882,33 @@ def get_practice_word_outcome(session_id: int, word_id: int) -> str:
     return "first_try" if first_correct == 1 else "after_fix"
 
 
+def get_practice_last_corrections(session_id: int) -> dict:
+    """{word_id: last non-empty correction} — correct attempts store no correction,
+    so for an 'after_fix' word this is the fix that got accepted afterwards."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT word_id, correction FROM practice_attempts
+           WHERE session_id = ? AND correction IS NOT NULL AND correction != ''
+           ORDER BY attempt""",
+        (session_id,),
+    ).fetchall()
+    conn.close()
+    return {r["word_id"]: r["correction"] for r in rows}
+
+
+def stop_practice(session_id: int, current_outcome: str):
+    """«Закончить» mid-session: keep the current word's outcome for the summary, close the session."""
+    session = get_practice_session(session_id)
+    outcomes = session["outcomes"] + [current_outcome]
+    conn = get_connection()
+    conn.execute(
+        "UPDATE practice_sessions SET outcomes = ?, status = 'done' WHERE id = ?",
+        (json.dumps(outcomes), session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def finish_practice(session_id: int):
     conn = get_connection()
     conn.execute("UPDATE practice_sessions SET status = 'done' WHERE id = ?", (session_id,))

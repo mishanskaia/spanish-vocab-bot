@@ -194,6 +194,16 @@ async def voice_scenarios():
     check("сессия закончена, исход not_yet", s["status"] == "done" and s["outcomes"][-1] == "not_yet")
     check("финальное сообщение", "закончена" in sent_texts(b)[-1])
 
+    print("\n9б. Итог сессии")
+    summary = sent_texts(b)[-1]
+    print("     " + summary.replace("\n", "\n     "))
+    check("итог в HTML", b.send_message.call_args.kwargs.get("parse_mode") == "HTML")
+    check("слово 1 — после правки, с исправленной фразой",
+          "🟡 после правки — <b>la cuenta</b>" in summary and "<i>Pido la cuenta</i>" in summary)
+    check("слово 2 — сразу, без фразы-правки", "✅ сразу — <b>cansado</b>" in summary)
+    check("слово 3 — пока не получилось, с правкой",
+          "🔸 пока не получилось — <b>la playa</b>" in summary and "<i>Voy a la playa</i>" in summary)
+
     print("\n10. Нажали «Дальше», пока шёл разбор")
     s = db.create_practice_session(USER_ID, "2099-03-01", [1, 2, 3])
     script.transcripts.append("Pido cuenta")
@@ -208,6 +218,19 @@ async def voice_scenarios():
     s_after = db.get_practice_session(s["id"])
     check("разбор всё равно показан", "Pido la cuenta" in replies(u)[-1])
     check("попытка не записана на уже закрытое слово", s_after["attempts"] == 0 and s_after["current_index"] == 1)
+
+    print("\n11. «Закончить» посреди слова с попыткой — итог включает текущее слово")
+    bot.ai_helper.check_practice_phrase = script.check
+    s = db.create_practice_session(USER_ID, "2099-04-01", [1, 2, 3])
+    await say(script, b, "Estoy cansado <mucho>", verdict(is_correct=False, corrected="Estoy muy cansado",
+                                                        explanation="Перед прилагательным — muy"))
+    await bot._handle_practice_button(fake_query(b), "practice_stop", ["practice_stop", str(s["id"]), "0"])
+    summary = sent_texts(b)[-1]
+    print("     " + summary.replace("\n", "\n     "))
+    s_after = db.get_practice_session(s["id"])
+    check("сессия done, один исход not_yet", s_after["status"] == "done" and s_after["outcomes"] == ["not_yet"])
+    check("в итоге только слово 1 с правкой",
+          "la cuenta" in summary and "Estoy muy cansado" in summary and "cansado</b>" not in summary)
 
 
 async def main():

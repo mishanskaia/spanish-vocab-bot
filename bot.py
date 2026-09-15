@@ -1074,7 +1074,7 @@ async def _send_practice_word(bot, chat_id: int, session: dict):
         if session["status"] == "active":
             await _send_practice_word(bot, chat_id, session)
         else:
-            await bot.send_message(chat_id, "Практика на сегодня закончена 🎉")
+            await _send_practice_summary(bot, chat_id, session["id"])
         return
     header = "🌙 <b>Пора поговорить!</b>\n\n" if index == 0 else ""
     text = (
@@ -1147,8 +1147,9 @@ async def _handle_practice_button(query, action: str, parts):
         pass
     chat_id = query.message.chat_id
     if action == "practice_stop":
-        db.finish_practice(session_id)
-        await query.get_bot().send_message(chat_id, "Ок, практика на сегодня закончена.")
+        word_id = session["word_ids"][session["current_index"]]
+        db.stop_practice(session_id, db.get_practice_word_outcome(session_id, word_id))
+        await _send_practice_summary(query.get_bot(), chat_id, session_id)
         return
     await _advance_practice_and_continue(query.get_bot(), chat_id, session)
 
@@ -1161,7 +1162,34 @@ async def _advance_practice_and_continue(bot, chat_id: int, session: dict):
     if session["status"] == "active":
         await _send_practice_word(bot, chat_id, session)
     else:
-        await bot.send_message(chat_id, "Практика на сегодня закончена 🎉")
+        await _send_practice_summary(bot, chat_id, session["id"])
+
+
+PRACTICE_OUTCOME_LABELS = {
+    "first_try": "✅ сразу",
+    "after_fix": "🟡 после правки",
+    "not_yet": "🔸 пока не получилось",
+    "skipped": "⏭ пропущено",
+}
+
+
+async def _send_practice_summary(bot, chat_id: int, session_id: int):
+    """One line per word reached; for words that needed a fix, the last corrected
+    phrase goes under it — that's the part worth rereading later."""
+    session = db.get_practice_session(session_id)
+    corrections = db.get_practice_last_corrections(session_id)
+    lines = []
+    for word_id, outcome in zip(session["word_ids"], session["outcomes"]):
+        row = db.get_word_by_id(word_id)
+        phrase = html.escape(row["phrase"]) if row else "(слово удалено)"
+        line = f"{PRACTICE_OUTCOME_LABELS.get(outcome, outcome)} — <b>{phrase}</b>"
+        if outcome in ("after_fix", "not_yet") and corrections.get(word_id):
+            line += f"\n      <i>{html.escape(corrections[word_id])}</i>"
+        lines.append(line)
+    text = "Практика на сегодня закончена 🎉"
+    if lines:
+        text += "\n\n" + "\n".join(lines)
+    await bot.send_message(chat_id, text, parse_mode="HTML")
 
 
 async def handle_practice_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
