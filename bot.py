@@ -607,6 +607,32 @@ async def reset_collected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def friends(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update.effective_user.id):
+        return
+    counts = db.get_words_per_user()
+    if not counts:
+        await update.message.reply_text("В базе пока нет ни одного слова.")
+        return
+
+    lines = []
+    for row in counts:
+        user_id = row["user_id"]
+        label = str(user_id)
+        try:
+            chat = await context.bot.get_chat(user_id)
+            name = f"@{chat.username}" if chat.username else chat.full_name
+            if name:
+                label = f"{name} ({user_id})"
+        except Exception:
+            pass
+        if user_id == OWNER_TELEGRAM_ID:
+            label += " — ты"
+        lines.append(f"{label}: {row['total']}")
+
+    await update.message.reply_text("Слов в словаре по каждому:\n\n" + "\n".join(lines))
+
+
 async def invite(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_owner(update.effective_user.id):
         return
@@ -1290,6 +1316,7 @@ PUBLIC_COMMANDS = [
 ]
 
 OWNER_ONLY_COMMANDS = [
+    ("friends", "Сколько слов у каждого в словаре"),
     ("invite", "Сгенерировать инвайт-ссылку"),
     ("backup", "Прислать бэкап БД"),
     ("reset_collected", "Распределить collected-слова по датам"),
@@ -1324,6 +1351,7 @@ def main():
     app.add_handler(CommandHandler("all", review_all))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("friends", friends))
     app.add_handler(CommandHandler("invite", invite))
     app.add_handler(CommandHandler("backup", backup))
     app.add_handler(CommandHandler("reset_collected", reset_collected))
