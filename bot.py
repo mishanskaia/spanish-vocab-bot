@@ -1,6 +1,7 @@
 import os
 import re
 import html
+import secrets
 import json
 import time
 import hmac
@@ -68,8 +69,10 @@ STUDY_COACH_UTC = (4, 0)
 BACKUP_WEEKLY_UTC = (3, 0)
 BACKUP_WEEKDAY = 6  # Monday=0 .. Sunday=6, per job_queue's `days`
 
-# Evening practice (owner-only): needs OpenAI for speech-to-text, so it stays off without the key
-EVENING_PRACTICE_ENABLED = bool(os.environ.get("OPENAI_API_KEY"))
+# Voice notes (evening practice + dictating new words) need OpenAI for speech-to-text — off without the key
+VOICE_ENABLED = bool(os.environ.get("OPENAI_API_KEY"))
+EVENING_PRACTICE_ENABLED = VOICE_ENABLED
+VOICE_WORD_MAX_CHARS = 80  # a dictated "word" longer than this is almost certainly rambling, not a card
 EVENING_PRACTICE_LOCAL_HOUR = 21
 PRACTICE_MAX_ATTEMPTS = 3  # per word; after that the bot moves on instead of looping (and spending) forever
 
@@ -218,7 +221,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Что я умею:\n\n"
         "📖 Добавить слово — просто напиши его по-испански или по-русски, "
-        "сама переведу в нужную сторону, объясню и сохраню.\n\n"
+        "сама переведу в нужную сторону, объясню и сохраню. Можно и голосовым — "
+        "надиктуй слово, я покажу, что услышала, и добавлю после подтверждения.\n\n"
         "🔁 Повторение\n"
         "/review — слова по расписанию (что пора повторить сейчас)\n"
         "/all — вообще всё из словаря, без расписания\n\n"
@@ -390,29 +394,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     word = update.message.text.strip()
     if not word or word.startswith("/"):
         return
+    await _add_word(update.message, update.effective_user.id, word)
 
-    user_id = update.effective_user.id
 
+async def _add_word(message, user_id: int, word: str):
+    """Shared by typed words and confirmed voice dictation: dedup and weekly limit checked
+    before Claude, then explain_word → add_word → card. `message` is whatever we reply to."""
     async with _get_add_word_lock(user_id):
         existing = db.find_word_by_phrase(user_id, word)
         if existing:
-            await update.message.reply_text(
+            await message.reply_text(
                 f'📖 *{_md(existing["phrase"])}* уже есть в твоём словаре — не добавляю дубль.',
                 parse_mode="Markdown",
             )
             return
 
         if _weekly_limit_reached(user_id):
-            await update.message.reply_text(WEEKLY_LIMIT_MESSAGE)
+            await message.reply_text(WEEKLY_LIMIT_MESSAGE)
             return
 
-        await update.message.reply_text("Секунду, ищу...")
+        await message.reply_text("Секунду, ищу...")
 
         try:
             info = await asyncio.to_thread(ai_helper.explain_word, word)
         except Exception:
             logger.exception("explain_word failed for %r", word)
-            await update.message.reply_text(
+            await message.reply_text(
                 "Не получилось найти это слово — попробуй ещё раз через минуту."
             )
             return
@@ -430,7 +437,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         if not is_new:
-            await update.message.reply_text(
+            await message.reply_text(
                 f'📖 *{_md(info.get("phrase", word))}* уже есть в твоём словаре — не добавляю дубль.',
                 parse_mode="Markdown",
             )
@@ -449,7 +456,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         review_hint = "Первое повторение — завтра утром."
 
-    await update.message.reply_text(
+    await message.reply_text(
         f'✅ *{_md(info.get("phrase", word))}*\n'
         f'{_md(info.get("meaning", ""))}\n'
         f'_{_md(info.get("part_of_speech", ""))}_\n\n'
@@ -924,6 +931,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action in ("practice_next", "practice_stop"):
         await _handle_practice_button(query, action, parts)
 
+    # --- dictated word: confirm / cancel ---
+    elif action == "voice_add":
+        await _handle_voice_add_button(query, context, parts)
+
     # --- delete word by button ---
     elif action == "del_word":
         word_id = int(parts[1])
@@ -1195,18 +1206,86 @@ async def _send_practice_summary(bot, chat_id: int, session_id: int):
     await bot.send_message(chat_id, text, parse_mode="HTML")
 
 
-async def handle_practice_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Voice note → verbatim transcript (OpenAI) → Claude feedback → retry or next word.
-    Voice notes aren't used anywhere else in the bot, so no awaiting-flag is needed:
-    a voice note from the owner during an active session is always a practice answer."""
+def _user_local_today(user_id: int) -> str:
+    offset = db.get_user_utc_offset(user_id)
+    return db._local_today(DEFAULT_UTC_OFFSET if offset is None else offset)
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """All voice notes land here. Owner with today's practice session active → practice answer;
+    anyone else, or the owner outside practice → dictating a new word. No awaiting-flag:
+    the practice session in the DB is the only state that decides the route."""
+    if not VOICE_ENABLED:
+        return
     user_id = update.effective_user.id
+    if _is_owner(user_id):
+        session = db.get_active_practice_session(user_id, _user_local_today(user_id))
+        if session is not None:
+            await handle_practice_voice(update, context, session)
+            return
+    await handle_voice_new_word(update, context)
+
+
+async def handle_voice_new_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dictated word/phrase (Russian or Spanish) → transcript → «add?» confirmation → the same
+    add path as a typed message. Confirmation because a lone short word is where STT mishears
+    most, and each add is a Claude call that also counts toward the weekly limit."""
     message = update.message
-    if not _is_owner(user_id) or not EVENING_PRACTICE_ENABLED:
+    await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
+    try:
+        tg_file = await message.voice.get_file()
+        audio = bytes(await tg_file.download_as_bytearray())
+        transcript = await asyncio.to_thread(stt_helper.transcribe_word, audio)
+    except Exception:
+        logger.exception("voice word STT failed for user_id=%s", update.effective_user.id)
+        await message.reply_text("Не получилось распознать голосовое — попробуй записать ещё раз.")
         return
-    session = db.get_active_practice_session(user_id)
-    if session is None:
-        await message.reply_text("Голосовые я понимаю только во время вечерней практики — запусти /practice.")
+    if not transcript:
+        await message.reply_text("Ничего не расслышала — попробуй записать ещё раз.")
         return
+    if len(transcript) > VOICE_WORD_MAX_CHARS:
+        await message.reply_text(
+            f"🎧 Услышала: «{transcript}»\n\n"
+            "Это длинновато — надиктуй одно слово или короткое выражение."
+        )
+        return
+    token = secrets.token_hex(4)
+    # callback_data is capped at 64 bytes, so the text itself waits in user_data;
+    # losing it on a restart just means «запись устарела — надиктуй ещё раз»
+    context.user_data["pending_voice_word"] = {"token": token, "text": transcript}
+    await message.reply_text(
+        f"🎧 Услышала: «{transcript}»\n\nДобавить в словарь?",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("Добавить ✅", callback_data=f"voice_add:{token}:yes"),
+            InlineKeyboardButton("Отмена", callback_data=f"voice_add:{token}:no"),
+        ]]),
+    )
+
+
+async def _handle_voice_add_button(query, context: ContextTypes.DEFAULT_TYPE, parts):
+    token, choice = parts[1], parts[2]
+    pending = context.user_data.get("pending_voice_word")
+    if not pending or pending["token"] != token:
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
+            pass
+        await query.message.reply_text("Эта запись устарела — надиктуй слово ещё раз.")
+        return
+    context.user_data.pop("pending_voice_word", None)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except BadRequest:
+        pass
+    if choice != "yes":
+        await query.message.reply_text("Ок, не добавляю.")
+        return
+    await _add_word(query.message, query.from_user.id, pending["text"])
+
+
+async def handle_practice_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, session: dict):
+    """Voice note → verbatim transcript (OpenAI) → Claude feedback → retry or next word."""
+    message = update.message
     index = session["current_index"]
     word_id = session["word_ids"][index]
     row = db.get_word_by_id(word_id)
@@ -1224,9 +1303,9 @@ async def handle_practice_voice(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text("Не получилось распознать голосовое — попробуй записать ещё раз.")
         return
     if not transcript:
-        await message.reply_text("Ничего не расслышал — попробуй записать ещё раз.")
+        await message.reply_text("Ничего не расслышала — попробуй записать ещё раз.")
         return
-    await message.reply_text(f"🎧 Услышал: «{transcript}»")
+    await message.reply_text(f"🎧 Услышала: «{transcript}»")
 
     try:
         result = await asyncio.to_thread(
@@ -1238,7 +1317,7 @@ async def handle_practice_voice(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     if result.get("unclear"):
-        await message.reply_text("Не разобрал фразу — попробуй ещё раз, чуть медленнее.")
+        await message.reply_text("Не разобрала фразу — попробуй ещё раз, чуть медленнее.")
         return
 
     # STT + Claude take a while: «Дальше»/«Закончить» may have been pressed meanwhile
@@ -1614,7 +1693,7 @@ def main():
     app.add_handler(CommandHandler("canceltopic", canceltopic))
     app.add_handler(CommandHandler("practice", practice))
     app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.VOICE, handle_practice_voice))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 

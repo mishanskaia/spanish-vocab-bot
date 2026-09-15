@@ -125,35 +125,45 @@ async def say(script, b, transcript, result=None):
     if result is not None:
         script.verdicts.append(result)
     u = voice_update()
-    await bot.handle_practice_voice(u, SimpleNamespace(bot=b))
+    await bot.handle_voice(u, SimpleNamespace(bot=b, user_data={}))
     return u
+
+
+def today():
+    return bot._user_local_today(USER_ID)
 
 
 async def voice_scenarios():
     script = Script()
     bot.stt_helper.transcribe = script.transcribe
+    bot.stt_helper.transcribe_word = script.transcribe
     bot.ai_helper.check_practice_phrase = script.check
-    for s in [db.get_active_practice_session(USER_ID)]:
-        if s:
-            db.finish_practice(s["id"])
+    active = db.get_active_practice_session(USER_ID, today())
+    if active:
+        db.finish_practice(active["id"])
 
-    print("\n5. Голосовое без активной сессии")
+    print("\n5. Маршрутизация голосовых")
     b = SimpleNamespace(send_message=AsyncMock(), send_chat_action=AsyncMock())
+    script.transcripts.append("счёт")
     u = voice_update()
-    await bot.handle_practice_voice(u, SimpleNamespace(bot=b))
-    check("подсказка про /practice", "/practice" in replies(u)[0])
-    u = voice_update(OTHER_ID)
-    await bot.handle_practice_voice(u, SimpleNamespace(bot=b))
-    check("голосовое не-владельца — тишина", u.message.reply_text.await_count == 0)
+    await bot.handle_voice(u, SimpleNamespace(bot=b, user_data={}))
+    check("владелец без практики → добавление слова", "Добавить в словарь?" in replies(u)[0])
+    yesterday = db.create_practice_session(USER_ID, "2000-01-01", [1, 2, 3])
+    script.transcripts.append("пляж")
+    u = voice_update()
+    await bot.handle_voice(u, SimpleNamespace(bot=b, user_data={}))
+    check("незаконченная вчерашняя практика не перехватывает голосовое",
+          "Добавить в словарь?" in replies(u)[0]
+          and db.get_practice_session(yesterday["id"])["attempts"] == 0)
 
     print("\n6. Ошибка → перезапись → верно")
-    s = db.create_practice_session(USER_ID, "2099-02-01", [1, 2, 3])
+    s = db.create_practice_session(USER_ID, today(), [1, 2, 3])
     sid = s["id"]
     u = await say(script, b, "Yo pido <la cuenta>", verdict(is_correct=False, corrected="Pido la cuenta",
                                                           explanation="Лишнее yo — звучит неестественно"))
     r = replies(u)
     print("     " + "\n     ".join(x.replace("\n", "\n     ") for x in r))
-    check("сначала «Услышал» с транскриптом", r[0] == "🎧 Услышал: «Yo pido <la cuenta>»")
+    check("сначала «Услышала» с транскриптом", r[0] == "🎧 Услышала: «Yo pido <la cuenta>»")
     check("разбор с правильным вариантом", "💡" in r[1] and "<i>Pido la cuenta</i>" in r[1])
     check("просит записать ещё раз, с кнопками", "Запиши ещё раз" in r[1]
           and u.message.reply_text.call_args.kwargs.get("reply_markup") is not None)
@@ -175,13 +185,13 @@ async def voice_scenarios():
 
     print("\n8. Нечёткая запись и сбой распознавания не тратят попытку")
     u = await say(script, b, "mmm eh", verdict(unclear=True))
-    check("нечётко → «Не разобрал»", "Не разобрал" in replies(u)[-1])
+    check("нечётко → «Не разобрала»", "Не разобрала" in replies(u)[-1])
     calls = script.claude_calls
     u = await say(script, b, RuntimeError("openai down"))
     check("сбой STT → просьба записать ещё раз", "Не получилось распознать" in replies(u)[-1])
     check("при сбое STT Claude не вызывался", script.claude_calls == calls)
     u = await say(script, b, "")
-    check("пустой транскрипт → «Ничего не расслышал»", "Ничего не расслышал" in replies(u)[-1])
+    check("пустой транскрипт → «Ничего не расслышала»", "Ничего не расслышала" in replies(u)[-1])
     check("попытки на слове 3 не засчитаны", db.get_practice_session(sid)["attempts"] == 0)
 
     print("\n9. Три неудачи подряд → идём дальше")
@@ -205,7 +215,7 @@ async def voice_scenarios():
           "🔸 пока не получилось — <b>la playa</b>" in summary and "<i>Voy a la playa</i>" in summary)
 
     print("\n10. Нажали «Дальше», пока шёл разбор")
-    s = db.create_practice_session(USER_ID, "2099-03-01", [1, 2, 3])
+    s = db.create_practice_session(USER_ID, today(), [1, 2, 3])
     script.transcripts.append("Pido cuenta")
 
     def check_and_press(phrase, meaning, transcript):
@@ -214,14 +224,14 @@ async def voice_scenarios():
 
     bot.ai_helper.check_practice_phrase = check_and_press
     u = voice_update()
-    await bot.handle_practice_voice(u, SimpleNamespace(bot=b))
+    await bot.handle_voice(u, SimpleNamespace(bot=b, user_data={}))
     s_after = db.get_practice_session(s["id"])
     check("разбор всё равно показан", "Pido la cuenta" in replies(u)[-1])
     check("попытка не записана на уже закрытое слово", s_after["attempts"] == 0 and s_after["current_index"] == 1)
 
     print("\n11. «Закончить» посреди слова с попыткой — итог включает текущее слово")
     bot.ai_helper.check_practice_phrase = script.check
-    s = db.create_practice_session(USER_ID, "2099-04-01", [1, 2, 3])
+    s = db.create_practice_session(USER_ID, today(), [1, 2, 3])
     await say(script, b, "Estoy cansado <mucho>", verdict(is_correct=False, corrected="Estoy muy cansado",
                                                         explanation="Перед прилагательным — muy"))
     await bot._handle_practice_button(fake_query(b), "practice_stop", ["practice_stop", str(s["id"]), "0"])
@@ -231,6 +241,77 @@ async def voice_scenarios():
     check("сессия done, один исход not_yet", s_after["status"] == "done" and s_after["outcomes"] == ["not_yet"])
     check("в итоге только слово 1 с правкой",
           "la cuenta" in summary and "Estoy muy cansado" in summary and "cansado</b>" not in summary)
+
+    await voice_word_scenarios(script, b)
+
+
+async def voice_word_scenarios(script, b):
+    print("\n12. Надиктовать новое слово")
+    explained = []
+
+    def fake_explain(word):
+        explained.append(word)
+        return {"phrase": "la ventana", "meaning": "окно", "part_of_speech": "существительное",
+                "cefr_level": "A1", "examples": ["Abro la ventana — Открываю окно"],
+                "collocations": [], "conjugation": None, "gerund": None}
+
+    bot.ai_helper.explain_word = fake_explain
+    ctx = SimpleNamespace(bot=b, user_data={})
+
+    def word_query(user_id=USER_ID):
+        return SimpleNamespace(from_user=SimpleNamespace(id=user_id),
+                               message=SimpleNamespace(reply_text=AsyncMock()),
+                               edit_message_reply_markup=AsyncMock())
+
+    def query_replies(q):
+        return [c.args[0] for c in q.message.reply_text.call_args_list]
+
+    script.transcripts.append("окно")
+    u = voice_update()
+    await bot.handle_voice(u, ctx)
+    check("показано, что услышала, и спрошено подтверждение",
+          replies(u)[-1].startswith("🎧 Услышала: «окно»") and "Добавить в словарь?" in replies(u)[-1])
+    token = ctx.user_data["pending_voice_word"]["token"]
+
+    q = word_query()
+    await bot._handle_voice_add_button(q, ctx, ["voice_add", token, "no"])
+    check("«Отмена» — не добавляет и не зовёт Claude",
+          "не добавляю" in query_replies(q)[-1] and not explained and "pending_voice_word" not in ctx.user_data)
+
+    script.transcripts.append("окно")
+    await bot.handle_voice(voice_update(), ctx)
+    token = ctx.user_data["pending_voice_word"]["token"]
+    q = word_query()
+    await bot._handle_voice_add_button(q, ctx, ["voice_add", token, "yes"])
+    check("«Добавить» — Claude получил распознанный текст", explained == ["окно"])
+    check("слово в словаре", db.find_word_by_phrase(USER_ID, "la ventana") is not None)
+    check("пришла обычная карточка слова", any(r.startswith("✅ *la ventana*") for r in query_replies(q)))
+    check("кнопки подтверждения убраны", q.edit_message_reply_markup.await_count == 1)
+
+    q = word_query()
+    await bot._handle_voice_add_button(q, ctx, ["voice_add", token, "yes"])
+    check("повторное нажатие старой кнопки — «устарела», без второго вызова Claude",
+          "устарела" in query_replies(q)[-1] and explained == ["окно"])
+
+    script.transcripts.append("la ventana")
+    await bot.handle_voice(voice_update(), ctx)
+    token = ctx.user_data["pending_voice_word"]["token"]
+    q = word_query()
+    await bot._handle_voice_add_button(q, ctx, ["voice_add", token, "yes"])
+    check("дубль — «уже есть», Claude не вызывался", "уже есть" in query_replies(q)[-1] and len(explained) == 1)
+
+    ctx.user_data.clear()
+    script.transcripts.append("Bueno, pues hoy he estado pensando en muchas cosas que quiero aprender en español")
+    u = voice_update()
+    await bot.handle_voice(u, ctx)
+    check("длинная запись — просьба надиктовать короче, без подтверждения",
+          "длинновато" in replies(u)[-1] and "pending_voice_word" not in ctx.user_data)
+
+    script.transcripts.append("кошка")
+    friend_ctx = SimpleNamespace(bot=b, user_data={})
+    u = voice_update(OTHER_ID)
+    await bot.handle_voice(u, friend_ctx)
+    check("не-владелец тоже может надиктовать слово", "Добавить в словарь?" in replies(u)[-1])
 
 
 async def main():
@@ -253,12 +334,12 @@ async def main():
     check("испанское — под спойлером", "<tg-spoiler>la cuenta</tg-spoiler>" in first)
     check("parse_mode=HTML", b.send_message.call_args.kwargs.get("parse_mode") == "HTML")
     check("взяты утренние слова, не el tren",
-          db.get_active_practice_session(USER_ID)["word_ids"] == [1, 2, 3])
+          db.get_active_practice_session(USER_ID, today())["word_ids"] == [1, 2, 3])
 
     await bot._maybe_start_evening_practice(SimpleNamespace(bot=b))
     check("повторный запуск в тот же час (рестарт) — дубля нет", b.send_message.call_count == 1)
 
-    session = db.get_active_practice_session(USER_ID)
+    session = db.get_active_practice_session(USER_ID, today())
     sid = session["id"]
 
     print("\n2. Кнопка «Дальше»")
@@ -288,7 +369,7 @@ async def main():
     update = SimpleNamespace(effective_user=SimpleNamespace(id=USER_ID),
                              message=SimpleNamespace(reply_text=AsyncMock()))
     await bot.practice(update, SimpleNamespace(bot=b2))
-    s2 = db.get_active_practice_session(USER_ID)
+    s2 = db.get_active_practice_session(USER_ID, today())
     check("/practice создал новую активную сессию", s2 is not None and s2["id"] != sid)
     await bot._handle_practice_button(fake_query(b2), "practice_stop", ["practice_stop", str(s2["id"]), "0"])
     check("«Закончить» — сессия done", db.get_practice_session(s2["id"])["status"] == "done")

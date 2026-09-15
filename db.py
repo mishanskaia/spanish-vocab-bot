@@ -817,11 +817,14 @@ def get_practice_session(session_id: int):
     return _practice_row_to_dict(row)
 
 
-def get_active_practice_session(user_id: int):
+def get_active_practice_session(user_id: int, session_date: str):
+    """Only today's session counts as active: an evening practice left unfinished must not
+    keep capturing voice notes the next day (they're new-word dictation outside practice)."""
     conn = get_connection()
     row = conn.execute(
-        "SELECT * FROM practice_sessions WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
-        (user_id,),
+        """SELECT * FROM practice_sessions WHERE user_id = ? AND status = 'active' AND session_date = ?
+           ORDER BY id DESC LIMIT 1""",
+        (user_id, session_date),
     ).fetchone()
     conn.close()
     return _practice_row_to_dict(row)
