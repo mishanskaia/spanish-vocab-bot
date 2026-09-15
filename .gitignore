@@ -2,3 +2,4 @@
 *.db
 __pycache__/
 *.pyc
+tests/voice_samples/
