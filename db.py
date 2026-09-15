@@ -846,6 +846,42 @@ def advance_practice(session_id: int, outcome: str) -> dict:
     return get_practice_session(session_id)
 
 
+def log_practice_attempt(session_id: int, word_id: int, transcript: str, is_correct: bool, correction) -> int:
+    """Store one spoken attempt for the session's current word; returns its number (1-based)."""
+    conn = get_connection()
+    attempt = conn.execute(
+        "SELECT COUNT(*) FROM practice_attempts WHERE session_id = ? AND word_id = ?",
+        (session_id, word_id),
+    ).fetchone()[0] + 1
+    conn.execute(
+        """INSERT INTO practice_attempts (session_id, word_id, attempt, transcript, is_correct, correction, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (session_id, word_id, attempt, transcript, int(bool(is_correct)), correction,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    conn.execute("UPDATE practice_sessions SET attempts = ? WHERE id = ?", (attempt, session_id))
+    conn.commit()
+    conn.close()
+    return attempt
+
+
+def get_practice_word_outcome(session_id: int, word_id: int) -> str:
+    """'first_try' (correct on attempt 1) | 'after_fix' (correct later) |
+    'not_yet' (tried, never correct) | 'skipped' (no attempts)."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT attempt, is_correct FROM practice_attempts WHERE session_id = ? AND word_id = ? ORDER BY attempt",
+        (session_id, word_id),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return "skipped"
+    first_correct = next((r["attempt"] for r in rows if r["is_correct"]), None)
+    if first_correct is None:
+        return "not_yet"
+    return "first_try" if first_correct == 1 else "after_fix"
+
+
 def finish_practice(session_id: int):
     conn = get_connection()
     conn.execute("UPDATE practice_sessions SET status = 'done' WHERE id = ?", (session_id,))

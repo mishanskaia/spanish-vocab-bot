@@ -72,6 +72,48 @@ def get_mnemonic(phrase: str, meaning: str, part_of_speech: str = "", avoid: str
     return response.content[0].text.strip()
 
 
+def check_practice_phrase(phrase: str, meaning: str, transcript: str) -> dict:
+    """Evening practice: judge one spoken phrase (already transcribed verbatim by
+    stt_helper) that was supposed to use `phrase`. Deliberately strict about not
+    "correcting" valid alternatives — false corrections were the main risk the
+    llm-council flagged for A1 feedback."""
+    prompt = f"""Ученик (уровень A1-A2) тренирует устную речь на испанском. Задание — сказать фразу со словом
+"{phrase}" ({meaning}). Ниже — автоматическая дословная транскрипция его голосового: ошибки ученика
+в ней сохранены специально.
+
+Транскрипция: "{transcript}"
+
+Правила оценки:
+- Оценивай фразу ровно так, как она записана.
+- Пунктуация, заглавные буквы и лишние/пропущенные значки ударения (например "fué") — огрехи транскрипции,
+  а не ошибки ученика. Не комментируй их.
+- Исправляй ТОЛЬКО настоящие ошибки: спряжение, род и согласование, предлоги, неверно выбранное слово,
+  русские слова вместо испанских. Если фраза грамматически верна и понятна, но её можно сказать иначе
+  или красивее — это НЕ ошибка: is_correct = true, ничего не исправляй.
+- Русское слово внутри фразы — это пробел в словаре: в corrected замени его испанским.
+- Целевое слово засчитывается в любой форме (спряжение, число, род, с артиклем или без).
+- Пол говорящего неизвестен: формы и мужского, и женского рода о себе ("estoy cansado" / "estoy cansada")
+  одинаково верны — никогда не исправляй одну на другую.
+- Не хвали, если есть ошибка. Если всё верно — без восторгов.
+- Если транскрипция пустая, не на испанском или из неё невозможно понять смысл — unclear = true.
+
+Верни JSON строго в таком формате:
+{{
+  "unclear": false,
+  "uses_target_word": true,
+  "is_correct": true,
+  "corrected": "исправленная фраза на испанском, минимально отличающаяся от исходной (сохрани слова и смысл ученика); null если is_correct = true",
+  "explanation": "одно короткое предложение на русском: что не так и почему. Если ошибок нет — пустая строка",
+  "too_simple": false,
+  "suggestion": "если too_simple — одна короткая подсказка на русском, как усложнить (например: добавь, когда и с кем); иначе null"
+}}
+
+- too_simple = true, только если фраза верная, но совсем короткая или шаблонная (примерно до 4 слов,
+  вроде "La playa es bonita").
+- Если целевое слово не использовано — uses_target_word = false, и скажи об этом в explanation."""
+    return _ask_claude(prompt, max_tokens=600)
+
+
 def explain_word(word: str) -> dict:
     prompt = f"""Пользователь написал: "{word}"
 

@@ -30,11 +30,13 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
+from telegram.constants import ChatAction
 from telegram.error import BadRequest, NetworkError
 from telegram.helpers import escape_markdown
 
 import db
 import ai_helper
+import stt_helper
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -66,6 +68,7 @@ BACKUP_WEEKDAY = 6  # Monday=0 .. Sunday=6, per job_queue's `days`
 # Evening practice (owner-only): needs OpenAI for speech-to-text, so it stays off without the key
 EVENING_PRACTICE_ENABLED = bool(os.environ.get("OPENAI_API_KEY"))
 EVENING_PRACTICE_LOCAL_HOUR = 21
+PRACTICE_MAX_ATTEMPTS = 3  # per word; after that the bot moves on instead of looping (and spending) forever
 
 SESSION_WORD_LIMIT = 30
 MNEMONIC_RETRY_LIMIT = 3
@@ -1147,11 +1150,105 @@ async def _handle_practice_button(query, action: str, parts):
         db.finish_practice(session_id)
         await query.get_bot().send_message(chat_id, "Ок, практика на сегодня закончена.")
         return
-    session = db.advance_practice(session_id, "skipped")
+    await _advance_practice_and_continue(query.get_bot(), chat_id, session)
+
+
+async def _advance_practice_and_continue(bot, chat_id: int, session: dict):
+    """Close the current word (outcome derived from its logged attempts) and show the next one."""
+    word_id = session["word_ids"][session["current_index"]]
+    outcome = db.get_practice_word_outcome(session["id"], word_id)
+    session = db.advance_practice(session["id"], outcome)
     if session["status"] == "active":
-        await _send_practice_word(query.get_bot(), chat_id, session)
+        await _send_practice_word(bot, chat_id, session)
     else:
-        await query.get_bot().send_message(chat_id, "Практика на сегодня закончена 🎉")
+        await bot.send_message(chat_id, "Практика на сегодня закончена 🎉")
+
+
+async def handle_practice_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Voice note → verbatim transcript (OpenAI) → Claude feedback → retry or next word.
+    Voice notes aren't used anywhere else in the bot, so no awaiting-flag is needed:
+    a voice note from the owner during an active session is always a practice answer."""
+    user_id = update.effective_user.id
+    message = update.message
+    if not _is_owner(user_id) or not EVENING_PRACTICE_ENABLED:
+        return
+    session = db.get_active_practice_session(user_id)
+    if session is None:
+        await message.reply_text("Голосовые я понимаю только во время вечерней практики — запусти /practice.")
+        return
+    index = session["current_index"]
+    word_id = session["word_ids"][index]
+    row = db.get_word_by_id(word_id)
+    if row is None:
+        await _advance_practice_and_continue(context.bot, message.chat_id, session)
+        return
+
+    await context.bot.send_chat_action(message.chat_id, ChatAction.TYPING)
+    try:
+        tg_file = await message.voice.get_file()
+        audio = bytes(await tg_file.download_as_bytearray())
+        transcript = await asyncio.to_thread(stt_helper.transcribe, audio)
+    except Exception:
+        logger.exception("practice STT failed for session_id=%s", session["id"])
+        await message.reply_text("Не получилось распознать голосовое — попробуй записать ещё раз.")
+        return
+    if not transcript:
+        await message.reply_text("Ничего не расслышал — попробуй записать ещё раз.")
+        return
+    await message.reply_text(f"🎧 Услышал: «{transcript}»")
+
+    try:
+        result = await asyncio.to_thread(
+            ai_helper.check_practice_phrase, row["phrase"], row["meaning"], transcript
+        )
+    except Exception:
+        logger.exception("practice feedback failed for session_id=%s", session["id"])
+        await message.reply_text("Не получилось разобрать фразу — попробуй записать ещё раз.")
+        return
+
+    if result.get("unclear"):
+        await message.reply_text("Не разобрал фразу — попробуй ещё раз, чуть медленнее.")
+        return
+
+    # STT + Claude take a while: «Дальше»/«Закончить» may have been pressed meanwhile
+    current = db.get_practice_session(session["id"])
+    stale = current["status"] != "active" or current["current_index"] != index
+
+    done = bool(result.get("is_correct")) and bool(result.get("uses_target_word"))
+    corrected = result.get("corrected")
+    explanation = html.escape(result.get("explanation") or "")
+    if stale:
+        if not done and corrected:
+            await message.reply_text(
+                f"💡 {explanation}\nПравильнее: <i>{html.escape(corrected)}</i>", parse_mode="HTML"
+            )
+        return
+
+    attempt = db.log_practice_attempt(session["id"], word_id, transcript, done, corrected)
+    chat_id = message.chat_id
+    keyboard = _practice_keyboard(session["id"], index)
+
+    if done and result.get("too_simple"):
+        suggestion = html.escape(result.get("suggestion") or "Попробуй добавить подробностей.")
+        await message.reply_text(
+            f"✅ Верно, но фраза простая. {suggestion}\n\nМожешь записать посложнее или нажми «Дальше».",
+            parse_mode="HTML",
+            reply_markup=keyboard,
+        )
+        return
+    if done:
+        await message.reply_text("✅ Верно!" + (f" {explanation}" if explanation else ""), parse_mode="HTML")
+        await _advance_practice_and_continue(context.bot, chat_id, current)
+        return
+
+    text = f"💡 {explanation}"
+    if corrected:
+        text += f"\nПравильнее: <i>{html.escape(corrected)}</i>"
+    if attempt >= PRACTICE_MAX_ATTEMPTS:
+        await message.reply_text(text + "\n\nХорошо, запомним — идём дальше.", parse_mode="HTML")
+        await _advance_practice_and_continue(context.bot, chat_id, current)
+        return
+    await message.reply_text(text + "\n\nЗапиши ещё раз 🎙", parse_mode="HTML", reply_markup=keyboard)
 
 
 async def newtopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1486,6 +1583,7 @@ def main():
     app.add_handler(CommandHandler("canceltopic", canceltopic))
     app.add_handler(CommandHandler("practice", practice))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.VOICE, handle_practice_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
