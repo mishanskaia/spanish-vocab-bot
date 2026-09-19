@@ -245,6 +245,11 @@ def init_db():
         )
         """
     )
+    try:
+        # Russian words she dropped into Spanish speech, with the Spanish the bot gave: [{"ru", "es"}]
+        conn.execute("ALTER TABLE voice_sessions ADD COLUMN found_words TEXT DEFAULT '[]'")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -1040,7 +1045,7 @@ def get_voice_session(session_id: int):
     if row is None:
         return None
     d = dict(row)
-    for key, default in (("target_words", []), ("transcript", []), ("usage", {})):
+    for key, default in (("target_words", []), ("transcript", []), ("usage", {}), ("found_words", [])):
         try:
             d[key] = json.loads(d[key]) if d[key] else default
         except json.JSONDecodeError:
@@ -1066,3 +1071,25 @@ def save_voice_transcript(session_id: int, transcript, usage, ended: bool):
     )
     conn.commit()
     conn.close()
+
+
+def add_voice_found_words(session_id: int, pairs) -> list:
+    """Appends {"ru", "es"} pairs, skipping a Spanish word already there (the same word can
+    come back when an utterance is re-sent after she carried on talking)."""
+    session = get_voice_session(session_id)
+    if session is None:
+        return []
+    found = session["found_words"]
+    seen = {p["es"].strip().lower() for p in found}
+    for p in pairs:
+        if p["es"].strip().lower() not in seen:
+            found.append({"ru": p["ru"], "es": p["es"]})
+            seen.add(p["es"].strip().lower())
+    conn = get_connection()
+    conn.execute(
+        "UPDATE voice_sessions SET found_words = ? WHERE id = ?",
+        (json.dumps(found, ensure_ascii=False), session_id),
+    )
+    conn.commit()
+    conn.close()
+    return found

@@ -88,6 +88,8 @@
   .line.user { font-size: 15px; color: var(--muted); text-align: right; padding-left: 20%; }
   .line.user::before { content: "ты: "; color: var(--faint); }
   .line.pending { color: var(--faint); }
+  .tr { margin: -8px 0 14px; font-size: 15px; color: var(--cool-1); }
+  .tr::before { content: "🔎 "; }
 
   footer { display: flex; justify-content: center; gap: 28px; padding: 10px 0 18px; }
   .ctl {
@@ -383,6 +385,7 @@
       lastTurn.botEntry.dropped = true;
       lastTurn.botEntry.el.classList.add("dropped");
       lastTurn.botEntry.el.classList.remove("latest");
+      if (lastTurn.botEntry.trEl) lastTurn.botEntry.trEl.remove();  // the merged turn will bring them back
       utter = newUtter();
       utter.prefix = lastTurn.userText;
       utter.entry = lastTurn.userEntry;
@@ -478,6 +481,14 @@
     // reply
     if (utter.entry) setText(utter.entry, res.user_text); else utter.entry = addEntry("user", res.user_text);
     const botEntry = addEntry("assistant", res.reply);
+    if (res.translations && res.translations.length) {
+      // the Russian words she dropped in, and the Spanish for them — visible, not just woven into the reply
+      const tr = document.createElement("div");
+      tr.className = "tr";
+      tr.textContent = res.translations.map((p) => `${p.ru} → ${p.es}`).join(" · ");
+      botEntry.el.after(tr);
+      botEntry.trEl = tr;
+    }
     lastTurn = { userText: res.user_text, userEntry: utter.entry, botEntry };
     utter = newUtter();
     waitingHint = false;
