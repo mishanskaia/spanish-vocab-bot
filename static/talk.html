@@ -17,8 +17,9 @@
     --warm-2: #ff6f61;
     --cool-1: #7fd6ff;
     --cool-2: #6b7bff;
+    --ring: #7fd6ff;
     --danger: #ff5d5d;
-    --orb: 168px;
+    --orb: 160px;
   }
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
   html, body { height: 100%; margin: 0; }
@@ -36,9 +37,7 @@
     padding: 14px 0 0; min-height: 44px;
   }
   #status { color: var(--muted); font-size: 15px; }
-  #diagBtn {
-    border: 0; background: none; color: var(--faint); font-size: 20px; padding: 6px;
-  }
+  #diagBtn { border: 0; background: none; color: var(--faint); font-size: 20px; padding: 6px; }
   #diag {
     display: none; font: 12px/1.5 ui-monospace, Menlo, monospace; color: var(--muted);
     background: #15151c; border-radius: 12px; padding: 10px 12px; margin-top: 8px;
@@ -46,32 +45,35 @@
   }
   #diag.open { display: block; }
 
-  #stage { flex: 0 0 auto; display: grid; place-items: center; padding: 28px 0 20px; }
+  #stage { flex: 0 0 auto; display: grid; place-items: center; padding: 24px 0 16px; }
+  #orbWrap { position: relative; width: calc(var(--orb) + 28px); height: calc(var(--orb) + 28px); display: grid; place-items: center; }
+  #ring { position: absolute; inset: 0; transform: rotate(-90deg); pointer-events: none; }
+  #ring circle { fill: none; stroke: var(--ring); stroke-width: 3; stroke-linecap: round; opacity: .8; transition: stroke-dashoffset .1s linear; }
   #orb {
     width: var(--orb); height: var(--orb); border-radius: 50%; border: 0; padding: 0;
     background: radial-gradient(circle at 35% 30%, #fff8 0 6%, transparent 30%),
                 radial-gradient(circle at 50% 55%, var(--warm-1), var(--warm-2) 70%);
     box-shadow: 0 0 60px -10px var(--warm-2);
-    transition: filter .4s, box-shadow .4s, transform .4s;
+    transition: filter .4s, box-shadow .4s;
     animation: breathe 4s ease-in-out infinite;
     cursor: pointer;
   }
-  body[data-state="connecting"] #orb { animation: spin 1.2s linear infinite; filter: saturate(.6); }
-  body[data-state="listening"] #orb {
+  body[data-state="starting"] #orb { animation: spin 1.2s linear infinite; filter: saturate(.6); }
+  body[data-state="listening"] #orb, body[data-state="thinking"] #orb {
     background: radial-gradient(circle at 35% 30%, #fff8 0 6%, transparent 30%),
                 radial-gradient(circle at 50% 55%, var(--cool-1), var(--cool-2) 70%);
-    box-shadow: 0 0 70px -6px var(--cool-2);
-    animation: listen .9s ease-in-out infinite;
+    box-shadow: 0 0 50px -12px var(--cool-2);
+    animation: breathe 3s ease-in-out infinite;
   }
-  body[data-state="thinking"] #orb { animation: breathe 1.6s ease-in-out infinite; filter: brightness(.8); }
+  body[data-state="listening"].voice #orb { animation: listen .8s ease-in-out infinite; box-shadow: 0 0 70px -4px var(--cool-2); }
+  body[data-state="thinking"] #orb { animation: breathe 1.2s ease-in-out infinite; filter: brightness(.85); }
   body[data-state="speaking"] #orb { animation: speak .5s ease-in-out infinite alternate; box-shadow: 0 0 90px 0 var(--warm-2); }
-  body[data-state="paused"] #orb { animation: none; filter: grayscale(1) brightness(.6); box-shadow: none; }
-  body[data-state="ended"] #orb { animation: none; filter: grayscale(.7) brightness(.5); box-shadow: none; }
-  @keyframes breathe { 0%,100% { transform: scale(.94); } 50% { transform: scale(1); } }
+  body[data-state="paused"] #orb, body[data-state="ended"] #orb { animation: none; filter: grayscale(1) brightness(.55); box-shadow: none; }
+  @keyframes breathe { 0%,100% { transform: scale(.95); } 50% { transform: scale(1); } }
   @keyframes listen { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
-  @keyframes speak { from { transform: scale(1); } to { transform: scale(1.1); } }
+  @keyframes speak { from { transform: scale(1); } to { transform: scale(1.09); } }
   @keyframes spin { from { transform: rotate(0) scale(.9); } to { transform: rotate(360deg) scale(.9); } }
-  #hint { margin-top: 14px; color: var(--muted); font-size: 14px; min-height: 20px; text-align: center; }
+  #hint { margin-top: 10px; color: var(--muted); font-size: 14px; min-height: 20px; text-align: center; }
 
   #subs {
     flex: 1 1 auto; overflow-y: auto; padding: 4px 0 16px;
@@ -82,6 +84,7 @@
   .line { margin: 0 0 14px; transition: opacity .3s; }
   .line.assistant { font-size: 23px; line-height: 1.35; font-weight: 500; opacity: .5; }
   .line.assistant.latest { opacity: 1; }
+  .line.assistant.dropped { font-size: 15px; opacity: .3; text-decoration: line-through; }
   .line.user { font-size: 15px; color: var(--muted); text-align: right; padding-left: 20%; }
   .line.user::before { content: "ты: "; color: var(--faint); }
   .line.pending { color: var(--faint); }
@@ -93,7 +96,7 @@
   }
   #endBtn { background: color-mix(in srgb, var(--danger) 22%, #1c1c24); color: var(--danger); }
   .ctl:disabled { opacity: .3; }
-  #error { color: var(--danger); font-size: 14px; text-align: center; min-height: 0; }
+  #error { color: var(--danger); font-size: 14px; text-align: center; }
 </style>
 </head>
 <body data-state="idle">
@@ -104,7 +107,10 @@
   <div id="diag"></div>
 
   <div id="stage">
-    <button id="orb" aria-label="Начать / пауза"></button>
+    <div id="orbWrap">
+      <svg id="ring" viewBox="0 0 200 200" aria-hidden="true"><circle cx="100" cy="100" r="96"></circle></svg>
+      <button id="orb" aria-label="Начать / я договорила / пропустить"></button>
+    </div>
     <div id="hint"></div>
   </div>
 
@@ -118,6 +124,23 @@
 
 <script>
 (() => {
+  // Pause handling — the whole point of this page (see CLAUDE.md «Живой разговор голосом»).
+  // At A1 she stops mid-sentence to find a word, so "silence = done" would cut her off.
+  // Starting guesses, meant to be tuned after live use.
+  const CFG = {
+    PAUSE_CHECK_MS: 1200,  // silence after speech → ask the server "did she finish?"
+    STUCK_MS: 7000,        // silence this long → answer anyway and help with the word
+    PREROLL_MS: 400,       // audio kept from before the voice was detected
+    MIN_SPEECH_MS: 180,    // sustained voice to count as speech, not a click or cough
+    VOICE_GAP_MS: 250,     // dips inside a word don't count as silence
+    BARGE_MS: 400,         // sustained voice while the bot talks → she's interrupting
+    BARGE_FACTOR: 2.2,     // stricter threshold while the bot talks (its own voice leaks into the mic)
+    EARLY_BARGE_MS: 2500,  // interrupted this early → the bot jumped in too soon; drop its answer, merge her pieces
+    ECHO_TAIL_MS: 350,     // ignore the mic right after the bot stops
+    MAX_UTTER_MS: 60000,
+    TARGET_RATE: 16000,
+  };
+
   const tg = window.Telegram && window.Telegram.WebApp;
   const initData = (tg && tg.initData) || "";
   const linkToken = new URLSearchParams(location.search).get("t") || "";
@@ -125,10 +148,15 @@
   const $ = (id) => document.getElementById(id);
   const statusEl = $("status"), hintEl = $("hint"), subsEl = $("subs"), errEl = $("error");
   const pauseBtn = $("pauseBtn"), endBtn = $("endBtn");
+  const ringCircle = document.querySelector("#ring circle");
+  const RING_LEN = 2 * Math.PI * 96;
+  ringCircle.style.strokeDasharray = RING_LEN;
+  ringCircle.style.strokeDashoffset = RING_LEN;
 
   const diag = {
     "где": initData ? "Telegram" : (linkToken ? "браузер (ссылка)" : "без авторизации"),
-    "микрофон": "—", "экран не гаснет": "—", "звук": "—", "связь": "—", "сессия": "—",
+    "микрофон": "—", "экран не гаснет": "—", "аудио": "—", "шум / порог": "—",
+    "последний ход": "—", "сессия": "—",
   };
   function renderDiag() {
     $("diag").textContent = Object.entries(diag).map(([k, v]) => `${k}: ${v}`).join("\n");
@@ -144,83 +172,96 @@
       tg.setBackgroundColor && tg.setBackgroundColor("#0b0b10");
     } catch (e) {}
   }
-  if (!initData && !linkToken) {
-    statusEl.textContent = "Открой страницу через /talk в боте";
-  }
+  if (!initData && !linkToken) statusEl.textContent = "Открой страницу через /talk в боте";
 
-  function authHeaders() {
-    const h = { "Content-Type": "application/json" };
+  function authHeaders(json) {
+    const h = json ? { "Content-Type": "application/json" } : {};
     if (initData) h["X-Tg-Init-Data"] = initData;
     else if (linkToken) h["X-Talk-Token"] = linkToken;
     return h;
   }
 
+  // ---------- state ----------
+  let state = "idle";
+  let ctx = null, micStream = null, wakeLock = null, tickTimer = null;
+  let sessionId = null;
+  let player = null, playStartedAt = 0;
+  let inflight = null, turnSeq = 0;
+  let noise = 0.004, voicedRun = 0, voiceActive = false, lastVoicedAt = 0, ignoreUntil = 0;
+  let checkedFor = -1, stuckFor = -1, waitingHint = false;
+  let preroll = [], prerollMs = 0;
+  let utter = newUtter();
+  let lastTurn = null;       // {userText, userEntry, botEntry} — for merging after an early answer
+  const entries = [];        // subtitles and history, in order: {role, text, el, pending, dropped}
+  const usage = {};
+
+  function newUtter() { return { chunks: [], ms: 0, hasSpeech: false, prefix: "", entry: null, startedAt: 0 }; }
+
   const STATUS = {
-    idle: "Нажми на шар, чтобы начать",
-    connecting: "Подключаюсь…",
-    listening: "Слушаю",
-    thinking: "…",
-    speaking: "Говорит",
-    ready: "Твоя очередь",
-    paused: "Пауза — нажми на шар",
-    ended: "Разговор закончен",
+    idle: "Нажми на шар, чтобы начать", starting: "Подключаюсь…", listening: "Слушаю",
+    thinking: "Думаю…", speaking: "Говорит", paused: "Пауза", ended: "Разговор закончен",
   };
   function setState(s) {
-    if (paused && s !== "paused" && s !== "ended") return;
-    document.body.dataset.state = s === "ready" ? "idle" : s;
+    state = s;
+    document.body.dataset.state = s;
     statusEl.textContent = STATUS[s] || "";
+    if (s === "speaking") { voiceActive = false; voicedRun = 0; }
+    renderHint();
+  }
+  function renderHint() {
+    let h = "";
+    if (state === "listening" && waitingHint) h = "Жду — подбирай слово спокойно";
+    else if (state === "listening" && utter.hasSpeech) h = "Договорила? Нажми на шар";
+    else if (state === "speaking") h = "Нажми на шар, чтобы пропустить";
+    else if (state === "paused") h = "Нажми ▶, чтобы продолжить";
+    else if (state === "ended") h = "Итог — в чате с ботом";
+    hintEl.textContent = h;
   }
   function showError(msg) { errEl.textContent = msg; }
 
-  // ---------- state ----------
-  let pc = null, dc = null, micTrack = null, audioEl = null, wakeLock = null;
-  let sessionId = null, running = false, paused = false, ended = false;
-  const entries = [];          // {id, role, text, el} in display order
-  const byId = new Map();
-  const usage = {};
-
-  function addUsage(target, src) {
-    if (!src || typeof src !== "object") return;
-    for (const [k, v] of Object.entries(src)) {
-      if (typeof v === "number") target[k] = (target[k] || 0) + v;
-      else if (v && typeof v === "object") addUsage(target[k] = target[k] || {}, v);
-    }
+  function addUsage(src) {
+    for (const [k, v] of Object.entries(src || {})) if (typeof v === "number") usage[k] = (usage[k] || 0) + v;
   }
 
-  // ---------- subtitles ----------
+  // ---------- subtitles / history ----------
   function nearBottom() { return subsEl.scrollHeight - subsEl.scrollTop - subsEl.clientHeight < 80; }
-  function entry(id, role) {
-    let e = byId.get(id);
-    if (e) return e;
+  function addEntry(role, text, pending) {
     const el = document.createElement("p");
     el.className = `line ${role}`;
-    e = { id, role, text: "", el };
-    entries.push(e); byId.set(id, e);
+    const e = { role, text: "", el, pending: false, dropped: false };
+    entries.push(e);
     const stick = nearBottom();
     subsEl.appendChild(el);
     if (role === "assistant") {
       subsEl.querySelectorAll(".assistant.latest").forEach((n) => n.classList.remove("latest"));
       el.classList.add("latest");
     }
+    setText(e, text, pending);
     if (stick) subsEl.scrollTop = subsEl.scrollHeight;
     return e;
   }
   function setText(e, text, pending) {
     const stick = nearBottom();
-    e.text = text;
+    e.text = text; e.pending = !!pending;
     e.el.textContent = text;
     e.el.classList.toggle("pending", !!pending);
     if (stick) subsEl.scrollTop = subsEl.scrollHeight;
   }
+  function removeEntry(e) {
+    const i = entries.indexOf(e);
+    if (i >= 0) entries.splice(i, 1);
+    e.el.remove();
+  }
+  function history() {
+    return entries.filter((e) => !e.pending && !e.dropped && e.text).map((e) => ({ role: e.role, text: e.text }));
+  }
 
-  // ---------- persistence ----------
   async function save(isEnd) {
     if (!sessionId) return;
-    const transcript = entries.filter((e) => e.text && e.text !== "…").map((e) => ({ role: e.role, text: e.text }));
     try {
       await fetch("/talk/transcript", {
-        method: "POST", headers: authHeaders(), keepalive: true,
-        body: JSON.stringify({ session_id: sessionId, transcript, usage, ended: !!isEnd }),
+        method: "POST", headers: authHeaders(true), keepalive: true,
+        body: JSON.stringify({ session_id: sessionId, transcript: history(), usage, ended: !!isEnd }),
       });
     } catch (e) { if (isEnd) showError("Не удалось сохранить разговор: " + e.message); }
   }
@@ -236,140 +277,308 @@
     renderDiag();
   }
   document.addEventListener("visibilitychange", () => {
-    if (!running) return;
-    if (document.visibilityState === "visible") keepAwake();
+    if (!sessionId || state === "ended") return;
+    if (document.visibilityState === "visible") { keepAwake(); ctx && ctx.resume(); }
     else save(false);
   });
 
-  // ---------- realtime events ----------
-  function onEvent(ev) {
-    switch (ev.type) {
-      case "input_audio_buffer.speech_started": setState("listening"); break;
-      case "input_audio_buffer.speech_stopped": setState("thinking"); break;
-      case "input_audio_buffer.committed": setText(entry(ev.item_id, "user"), "…", true); break;
-      case "conversation.item.input_audio_transcription.delta": {
-        const e = entry(ev.item_id, "user");
-        setText(e, (e.text === "…" ? "" : e.text) + (ev.delta || ""), true);
-        break;
+  // ---------- audio in: VAD + capture ----------
+  const WORKLET = `class Tap extends AudioWorkletProcessor {
+    constructor() { super(); this.buf = new Float32Array(1024); this.n = 0; }
+    process(inputs) {
+      const ch = inputs[0] && inputs[0][0];
+      if (ch) for (let i = 0; i < ch.length; i++) {
+        this.buf[this.n++] = ch[i];
+        if (this.n === this.buf.length) { this.port.postMessage(this.buf.slice(0)); this.n = 0; }
       }
-      case "conversation.item.input_audio_transcription.completed":
-        setText(entry(ev.item_id, "user"), (ev.transcript || "").trim() || "(тишина)");
-        addUsage(usage.transcription = usage.transcription || {}, ev.usage);
-        break;
-      case "conversation.item.input_audio_transcription.failed":
-        setText(entry(ev.item_id, "user"), "(не расслышала)");
-        break;
-      case "response.output_audio_transcript.delta": {
-        const e = entry(ev.item_id, "assistant");
-        setText(e, e.text + (ev.delta || ""));
-        setState("speaking");
-        break;
-      }
-      case "response.output_audio_transcript.done":
-        setText(entry(ev.item_id, "assistant"), ev.transcript || byId.get(ev.item_id).text);
-        break;
-      case "output_audio_buffer.started": setState("speaking"); break;
-      case "output_audio_buffer.stopped": setState("ready"); break;
-      case "response.done":
-        addUsage(usage, ev.response && ev.response.usage);
-        save(false);
-        break;
-      case "error":
-        showError((ev.error && ev.error.message) || "Ошибка Realtime");
-        break;
+      return true;
     }
+  }
+  registerProcessor("tap", Tap);`;
+
+  function onChunk(f32) {
+    const dt = (f32.length / ctx.sampleRate) * 1000;
+    const now = performance.now();
+
+    preroll.push(f32); prerollMs += dt;
+    while (prerollMs > CFG.PREROLL_MS + CFG.BARGE_MS && preroll.length > 1) {
+      prerollMs -= (preroll.shift().length / ctx.sampleRate) * 1000;
+    }
+
+    let sum = 0;
+    for (let i = 0; i < f32.length; i++) sum += f32[i] * f32[i];
+    const rms = Math.sqrt(sum / f32.length);
+    if (!voiceActive && state !== "speaking") noise = Math.min(0.05, Math.max(0.001, noise * 0.97 + rms * 0.03));
+    let thr = Math.max(noise * 3, 0.01);
+    if (state === "speaking") thr *= CFG.BARGE_FACTOR;
+
+    const voiced = rms > thr && now > ignoreUntil;
+    if (voiced) { voicedRun += dt; lastVoicedAt = now; }
+    else if (now - lastVoicedAt > CFG.VOICE_GAP_MS) voicedRun = 0;
+
+    // keep recording while a check is in flight too — if she carries on, that audio is part of the same utterance
+    if ((state === "listening" || state === "thinking") && utter.hasSpeech) { utter.chunks.push(f32); utter.ms += dt; }
+
+    const need = state === "speaking" ? CFG.BARGE_MS : CFG.MIN_SPEECH_MS;
+    if (!voiceActive && voicedRun >= need) { voiceActive = true; onVoiceStart(); }
+    if (voiceActive && now - lastVoicedAt > CFG.VOICE_GAP_MS) voiceActive = false;
+    document.body.classList.toggle("voice", voiceActive);
+  }
+
+  function beginUtterFromPreroll() {
+    utter.chunks = preroll.slice();
+    utter.ms = prerollMs;
+    utter.hasSpeech = true;
+    utter.startedAt = performance.now();
+    if (!utter.entry) utter.entry = addEntry("user", utter.prefix ? utter.prefix + " …" : "…", true);
+  }
+
+  function onVoiceStart() {
+    if (state === "speaking") { bargeIn(); return; }
+    if (state !== "listening" && state !== "thinking") return;
+    if (inflight) { inflight.ac.abort(); inflight = null; setState("listening"); }  // she carried on — the check is moot
+    if (!utter.hasSpeech) beginUtterFromPreroll();
+    waitingHint = false; renderHint();
+  }
+
+  function bargeIn() {
+    const played = performance.now() - playStartedAt;
+    stopPlayback();
+    if (lastTurn && played < CFG.EARLY_BARGE_MS) {
+      // The bot answered while she was still mid-thought: drop its answer, keep her words as a prefix.
+      lastTurn.botEntry.dropped = true;
+      lastTurn.botEntry.el.classList.add("dropped");
+      lastTurn.botEntry.el.classList.remove("latest");
+      utter = newUtter();
+      utter.prefix = lastTurn.userText;
+      utter.entry = lastTurn.userEntry;
+      setText(utter.entry, utter.prefix + " …", true);
+    } else {
+      if (lastTurn) setText(lastTurn.botEntry, lastTurn.botEntry.text + " —");
+      utter = newUtter();
+    }
+    lastTurn = null;
+    setState("listening");
+    beginUtterFromPreroll();
+    save(false);
+  }
+
+  // ---------- turns ----------
+  function encodeWav(chunks, rate) {
+    let total = 0;
+    for (const c of chunks) total += c.length;
+    const merged = new Float32Array(total);
+    let off = 0;
+    for (const c of chunks) { merged.set(c, off); off += c.length; }
+    const ratio = rate / CFG.TARGET_RATE;
+    const outLen = Math.floor(total / ratio);
+    const buf = new ArrayBuffer(44 + outLen * 2);
+    const v = new DataView(buf);
+    const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+    w(0, "RIFF"); v.setUint32(4, 36 + outLen * 2, true); w(8, "WAVE"); w(12, "fmt ");
+    v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, CFG.TARGET_RATE, true); v.setUint32(28, CFG.TARGET_RATE * 2, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true); w(36, "data"); v.setUint32(40, outLen * 2, true);
+    for (let i = 0; i < outLen; i++) {
+      const a = Math.floor(i * ratio), b = Math.max(a + 1, Math.floor((i + 1) * ratio));
+      let s = 0;
+      for (let j = a; j < b && j < total; j++) s += merged[j];
+      s = Math.max(-1, Math.min(1, s / (b - a)));
+      v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return new Blob([buf], { type: "audio/wav" });
+  }
+
+  async function sendTurn(mode) {
+    if (!utter.hasSpeech || !sessionId) return;
+    if (inflight) inflight.ac.abort();
+    const seq = ++turnSeq;
+    const ac = new AbortController();
+    inflight = { ac, seq };
+    setState("thinking");
+    const t0 = performance.now();
+    const form = new FormData();
+    form.append("session_id", String(sessionId));
+    form.append("history", JSON.stringify(history()));
+    form.append("prefix", utter.prefix);
+    form.append("mode", mode);
+    form.append("audio", encodeWav(utter.chunks, ctx.sampleRate), "turn.wav");
+    let res;
+    try {
+      const r = await fetch("/talk/turn", { method: "POST", headers: authHeaders(false), body: form, signal: ac.signal });
+      res = await r.json();
+      if (!r.ok) throw new Error(res.error || r.status);
+    } catch (e) {
+      if (e.name === "AbortError" || !inflight || inflight.seq !== seq) return;
+      inflight = null;
+      showError("Ошибка: " + e.message);
+      setState("listening");
+      return;
+    }
+    if (!inflight || inflight.seq !== seq) return;  // she started talking again meanwhile
+    inflight = null;
+    showError("");
+    addUsage(res.usage);
+    const tm = res.timings || {};
+    diag["последний ход"] = `${res.status}, stt ${tm.stt_ms ?? "—"} / llm ${tm.llm_ms ?? "—"} / tts ${tm.tts_ms ?? "—"} мс, всего ${Math.round(performance.now() - t0)} мс`;
+    renderDiag();
+
+    if (res.status === "empty") {
+      if (utter.entry && !utter.prefix) removeEntry(utter.entry);
+      else if (utter.entry) setText(utter.entry, utter.prefix);
+      utter = newUtter();
+      setState("listening");
+      return;
+    }
+    if (res.status === "wait") {
+      waitingHint = true;
+      if (utter.entry) setText(utter.entry, res.user_text + " …", true);
+      setState("listening");
+      return;
+    }
+    // reply
+    if (utter.entry) setText(utter.entry, res.user_text); else utter.entry = addEntry("user", res.user_text);
+    const botEntry = addEntry("assistant", res.reply);
+    lastTurn = { userText: res.user_text, userEntry: utter.entry, botEntry };
+    utter = newUtter();
+    waitingHint = false;
+    save(false);
+    await play(res.audio);
+  }
+
+  // ---------- audio out ----------
+  async function play(b64) {
+    try {
+      const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+      const buf = await ctx.decodeAudioData(bytes.buffer);
+      addUsage({ tts_seconds: buf.duration });
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ctx.destination);
+      src.onended = () => {
+        if (player !== src) return;
+        player = null;
+        if (state === "speaking") { ignoreUntil = performance.now() + CFG.ECHO_TAIL_MS; voicedRun = 0; setState("listening"); }
+      };
+      player = src;
+      playStartedAt = performance.now();
+      setState("speaking");
+      src.start();
+      diag["аудио"] = `${ctx.state}, ${ctx.sampleRate} Гц`; renderDiag();
+    } catch (e) {
+      diag["аудио"] = "ошибка: " + e.name; renderDiag();
+      setState("listening");
+    }
+  }
+  function stopPlayback() {
+    if (!player) return;
+    const p = player; player = null;
+    try { p.stop(); } catch (e) {}
+  }
+
+  // ---------- timer: silence → check / stuck, ring ----------
+  function tick() {
+    diag["шум / порог"] = `${noise.toFixed(4)} / ${Math.max(noise * 3, 0.01).toFixed(4)}`;
+    let progress = 0;
+    if ((state === "listening" || state === "thinking") && utter.hasSpeech && !voiceActive) {
+      const silence = performance.now() - lastVoicedAt;
+      progress = Math.max(0, Math.min(1, (silence - 400) / (CFG.STUCK_MS - 400)));
+      if (!inflight && silence >= CFG.STUCK_MS && stuckFor !== lastVoicedAt) {
+        stuckFor = lastVoicedAt; sendTurn("stuck");
+      } else if (!inflight && silence >= CFG.PAUSE_CHECK_MS && checkedFor !== lastVoicedAt) {
+        checkedFor = lastVoicedAt; sendTurn("auto");
+      }
+    }
+    if (state === "listening" && utter.hasSpeech && utter.ms > CFG.MAX_UTTER_MS && !inflight) sendTurn("done");
+    ringCircle.style.strokeDashoffset = RING_LEN * (1 - progress);
   }
 
   // ---------- start / pause / end ----------
   async function start() {
     if (!initData && !linkToken) return;
-    running = true; showError(""); setState("connecting");
+    // AudioContext must be created inside the tap on iOS, before any await.
+    ctx = new (window.AudioContext || window.webkitAudioContext)();
+    ctx.resume();
+    setState("starting"); showError("");
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      micStream = await navigator.mediaDevices.getUserMedia({
         audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
-      micTrack = stream.getAudioTracks()[0];
-      diag["микрофон"] = "да (" + (micTrack.label || "без имени") + ")"; renderDiag();
+      const track = micStream.getAudioTracks()[0];
+      diag["микрофон"] = "да (" + (track.label || "без имени") + ")"; renderDiag();
+      await ctx.resume();
+      await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" })));
+      const node = new AudioWorkletNode(ctx, "tap");
+      node.port.onmessage = (e) => onChunk(e.data);
+      const mute = ctx.createGain();
+      mute.gain.value = 0;  // the node has to be pulled by the destination to run, but we don't want to hear the mic
+      ctx.createMediaStreamSource(micStream).connect(node);
+      node.connect(mute).connect(ctx.destination);
+      diag["аудио"] = `${ctx.state}, ${ctx.sampleRate} Гц`; renderDiag();
     } catch (e) {
       diag["микрофон"] = "ошибка: " + e.name; renderDiag();
       showError("Нет доступа к микрофону (" + e.name + "). Попробуй открыть в Safari.");
-      running = false; setState("idle"); return;
+      setState("idle"); return;
     }
     keepAwake();
 
-    pc = new RTCPeerConnection();
-    audioEl = document.createElement("audio");
-    audioEl.autoplay = true; audioEl.playsInline = true;
-    document.body.appendChild(audioEl);
-    pc.ontrack = (e) => {
-      audioEl.srcObject = e.streams[0];
-      audioEl.play().then(
-        () => { diag["звук"] = "играет"; renderDiag(); },
-        (err) => { diag["звук"] = "заблокирован: " + err.name; renderDiag(); hintEl.textContent = "Нажми на шар, чтобы включить звук"; }
-      );
-    };
-    pc.onconnectionstatechange = () => {
-      diag["связь"] = pc.connectionState; renderDiag();
-      if (["failed", "disconnected"].includes(pc.connectionState) && !ended) {
-        showError("Связь прервалась. Разговор сохранён до этого места.");
-        save(false);
-      }
-    };
-    pc.addTrack(micTrack);
-    dc = pc.createDataChannel("oai-events");
-    dc.onmessage = (m) => { try { onEvent(JSON.parse(m.data)); } catch (e) {} };
-    dc.onopen = () => dc.send(JSON.stringify({ type: "response.create" }));  // bot opens the conversation
-
     try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      const r = await fetch("/talk/call", {
-        method: "POST", headers: authHeaders(), body: JSON.stringify({ sdp: offer.sdp }),
-      });
-      const data = await r.json();
-      if (!r.ok) throw new Error(data.error || r.status);
-      sessionId = data.session_id;
-      diag["сессия"] = `#${sessionId}, целевых слов: ${data.target_words.length}`; renderDiag();
-      await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+      const r = await fetch("/talk/start", { method: "POST", headers: authHeaders(true), body: "{}" });
+      const res = await r.json();
+      if (!r.ok) throw new Error(res.error || r.status);
+      sessionId = res.session_id;
+      diag["сессия"] = `#${sessionId}, целевых слов: ${res.target_count}`; renderDiag();
+      addUsage(res.usage);
+      addEntry("assistant", res.reply);
+      pauseBtn.disabled = false; endBtn.disabled = false;
+      if (tg && tg.enableClosingConfirmation) tg.enableClosingConfirmation();
+      tickTimer = setInterval(tick, 100);
+      await play(res.audio);
     } catch (e) {
-      showError("Не получилось подключиться: " + e.message);
-      teardown(); running = false; setState("idle"); return;
+      showError("Не получилось начать: " + e.message);
+      setState("idle");
     }
-    pauseBtn.disabled = false; endBtn.disabled = false;
-    if (tg && tg.enableClosingConfirmation) tg.enableClosingConfirmation();
   }
 
   function togglePause() {
-    if (!running || ended) return;
-    paused = !paused;
-    micTrack.enabled = !paused;
-    if (audioEl) audioEl.muted = paused;
-    pauseBtn.textContent = paused ? "▶" : "❚❚";
-    if (paused) setState("paused"); else setState("ready");
-  }
-
-  function teardown() {
-    try { micTrack && micTrack.stop(); } catch (e) {}
-    try { pc && pc.close(); } catch (e) {}
-    try { wakeLock && wakeLock.release(); } catch (e) {}
+    if (!sessionId || state === "ended") return;
+    if (state === "paused") {
+      pauseBtn.textContent = "❚❚";
+      setState("listening");
+      return;
+    }
+    stopPlayback();
+    if (inflight) { inflight.ac.abort(); inflight = null; }
+    if (utter.entry && utter.entry.pending) removeEntry(utter.entry);
+    utter = newUtter(); waitingHint = false;
+    pauseBtn.textContent = "▶";
+    setState("paused");
   }
 
   async function end() {
-    if (!running || ended) return;
-    ended = true; running = false;
-    teardown();
+    if (!sessionId || state === "ended") return;
+    stopPlayback();
+    if (inflight) { inflight.ac.abort(); inflight = null; }
+    clearInterval(tickTimer);
+    try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+    try { wakeLock && wakeLock.release(); } catch (e) {}
+    if (utter.entry && utter.entry.pending) removeEntry(utter.entry);
     setState("ended");
     pauseBtn.disabled = true; endBtn.disabled = true;
+    ringCircle.style.strokeDashoffset = RING_LEN;
     await save(true);
-    hintEl.textContent = "Итог — в чате с ботом";
+    try { ctx && ctx.close(); } catch (e) {}
     if (tg && tg.disableClosingConfirmation) tg.disableClosingConfirmation();
   }
 
   $("orb").onclick = () => {
-    if (ended) { location.reload(); return; }
-    if (!running) { start(); return; }
-    if (audioEl && audioEl.paused && audioEl.srcObject) { audioEl.play().catch(() => {}); hintEl.textContent = ""; return; }
-    togglePause();
+    if (state === "idle") { start(); return; }
+    if (state === "ended") { location.reload(); return; }
+    if (state === "paused") { togglePause(); return; }
+    if (state === "speaking") {  // skip the rest of the bot's line
+      stopPlayback(); ignoreUntil = performance.now() + CFG.ECHO_TAIL_MS; setState("listening"); return;
+    }
+    if ((state === "listening" || state === "thinking") && utter.hasSpeech) sendTurn("done");  // "I'm done"
   };
   pauseBtn.onclick = togglePause;
   endBtn.onclick = end;
