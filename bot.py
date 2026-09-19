@@ -79,6 +79,7 @@ EVENING_PRACTICE_LOCAL_HOUR = 21
 PRACTICE_MAX_ATTEMPTS = 3  # per word; after that the bot moves on instead of looping (and spending) forever
 
 SESSION_WORD_LIMIT = 30
+SESSION_SUMMARY_MIN_WORDS = 20
 MNEMONIC_RETRY_LIMIT = 3
 
 ACCESS_TEST_MESSAGE = (
@@ -511,6 +512,7 @@ async def delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def review(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.pop("all_queue", None)
     context.user_data["review_shown"] = set()
+    context.user_data["review_grades"] = {}
     db.detect_and_mark_overdue(update.effective_user.id)
     await update.message.reply_text(RECALL_DISCLAIMER)
     await _send_next_due(update.effective_chat.id, update.effective_user.id, context)
@@ -528,6 +530,7 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
 
     if not overdue and not scheduled:
         await context.bot.send_message(chat_id, "Нет слов для повторения сегодня 🎉")
+        await _maybe_send_session_summary(chat_id, context, user_data)
         return
 
     if len(shown) >= SESSION_WORD_LIMIT:
@@ -536,6 +539,7 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
             f"На эту сессию хватит — {SESSION_WORD_LIMIT} слов сделано 👍\n"
             f"Остальное подождёт следующей сессии (10:00 / 14:00 / 18:00 по твоему времени)."
         )
+        await _maybe_send_session_summary(chat_id, context, user_data)
         return
 
     # Overdue first, then scheduled, both ordered by due date.
@@ -545,6 +549,33 @@ async def _send_next_due(chat_id: int, user_id: int, context: ContextTypes.DEFAU
     user_data["review_shown"] = shown
 
     await _send_recall_card(chat_id, row, context, is_overdue)
+
+
+async def _maybe_send_session_summary(chat_id: int, context: ContextTypes.DEFAULT_TYPE, user_data):
+    """After a long /review session (> SESSION_SUMMARY_MIN_WORDS cards), one
+    compact message with the words graded hard / almost — word and translation
+    only, no full cards."""
+    shown = user_data.get("review_shown", set())
+    if len(shown) <= SESSION_SUMMARY_MIN_WORDS:
+        return
+    grades = user_data.get("review_grades", {})
+    hard, almost = [], []
+    for word_id in shown:
+        grade = grades.get(word_id)
+        if grade not in ("hard", "almost"):
+            continue
+        row = db.get_word_by_id(word_id)
+        if row is None:
+            continue
+        (hard if grade == "hard" else almost).append(f"• {row['phrase']} — {row['meaning']}")
+    if not hard and not almost:
+        return
+    blocks = []
+    if hard:
+        blocks.append("🔴 Сложно:\n" + "\n".join(hard))
+    if almost:
+        blocks.append("🟡 Почти помню:\n" + "\n".join(almost))
+    await context.bot.send_message(chat_id, "📋 Итоги сессии\n\n" + "\n\n".join(blocks))
 
 
 async def _send_recall_card(chat_id: int, row, context: ContextTypes.DEFAULT_TYPE, is_overdue: bool = False):
@@ -818,6 +849,8 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row is None or row["user_id"] != query.from_user.id:
             return
         db.mark_review_result(word_id, grade)
+        if "all_queue" not in context.user_data:
+            context.user_data.setdefault("review_grades", {})[word_id] = grade
         row = db.get_word_by_id(word_id)
         marks = {"remember": "Помню 🟢", "almost": "Почти помню 🟡", "hard": "Сложно 🔴"}
         await query.edit_message_text(
@@ -991,6 +1024,7 @@ async def hourly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(user_id, text)
         user_data = context.application.user_data[user_id]
         user_data["review_shown"] = set()
+        user_data["review_grades"] = {}
         db.detect_and_mark_overdue(user_id)
         await _send_next_due(user_id, user_id, context, user_data)
 
