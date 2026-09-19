@@ -33,6 +33,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl
 
 from aiohttp import web
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import ai_helper
 import db
@@ -189,15 +190,25 @@ Answer with JSON:
 - "complete": judge ONLY by how her message ends. It is false only when the last words cannot end a sentence — it stops on a conjunction, preposition, article, possessive or filler ("y", "pero", "que", "de", "con", "la", "mi", "eh…"), or breaks off mid-phrase ("Yo quiero comprar", "Mañana voy a"). Then "reply" must be "" and the page keeps listening. Grammar mistakes, Russian words, very short answers, or not answering your question do NOT make it incomplete. When in doubt, it is complete.
 - "complete": true → "reply" is your next spoken turn: plain Spanish text only (it is read aloud by text-to-speech — no emoji, no markdown, no stage directions, no translations in brackets).
 - If her message ends with [LARGA PAUSA], she got stuck: "complete" must be true. Help gently — offer the word she seems to be looking for, or ask your question again more simply.
-- If her message ends with [TERMINÉ], she tapped "I'm done": "complete" must be true."""
+- If her message ends with [TERMINÉ], she tapped "I'm done": "complete" must be true.
+- "translations": every Russian word or phrase in THIS message of hers that she used because she didn't know it in Spanish, with the Spanish the conversation needed — "ru" exactly as she said it, "es" for a single word in dictionary form (nouns with their article, verbs in the infinitive): [{"ru": "шапка", "es": "el gorro"}]; for a whole Russian phrase, the natural Spanish phrase as she would say it here ("я много работаю" → "trabajo mucho"). Empty list if she used no Russian. These are shown to her on screen and offered for her vocabulary, so the Spanish must be the natural, common A1–A2 word for her meaning."""
 
 TURN_SCHEMA = {
     "type": "object",
     "properties": {
         "complete": {"type": "boolean"},
         "reply": {"type": "string"},
+        "translations": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"ru": {"type": "string"}, "es": {"type": "string"}},
+                "required": ["ru", "es"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["complete", "reply"],
+    "required": ["complete", "reply", "translations"],
     "additionalProperties": False,
 }
 
@@ -255,6 +266,17 @@ def claude_turn(target_words, history, user_text: str | None) -> tuple[dict, dic
         "llm_out": response.usage.output_tokens,
     }
     return data, usage
+
+
+def _clean_translations(raw) -> list[dict]:
+    pairs = []
+    for p in raw or []:
+        if not isinstance(p, dict):
+            continue
+        ru, es = str(p.get("ru", "")).strip(), str(p.get("es", "")).strip()
+        if ru and es and len(es) <= 60:
+            pairs.append({"ru": ru, "es": es})
+    return pairs[:5]
 
 
 async def _speak(reply: str, usage: dict, timings: dict) -> str:
@@ -359,6 +381,9 @@ async def handle_turn(request: web.Request) -> web.Response:
         )
         timings["llm_ms"] = round((time.monotonic() - t) * 1000)
         usage.update(llm_usage)
+        translations = _clean_translations(data.get("translations"))
+        if translations:
+            db.add_voice_found_words(session_id, translations)
         reply = (data.get("reply") or "").strip()
         if mode == "auto" and (not data.get("complete") or not reply):
             return web.json_response({"status": "wait", "user_text": user_text, "usage": usage, "timings": timings})
@@ -372,6 +397,7 @@ async def handle_turn(request: web.Request) -> web.Response:
         "status": "reply",
         "user_text": user_text,
         "reply": reply,
+        "translations": translations,
         "audio": audio_b64,
         "usage": usage,
         "timings": timings,
@@ -403,10 +429,12 @@ async def handle_transcript(request: web.Request) -> web.Response:
 
     if ended and not already_done and _bot is not None:
         try:
+            session = db.get_voice_session(session_id)
             await _bot.send_message(
                 user_id,
-                build_summary(db.get_voice_session(session_id)),
+                build_summary(session),
                 parse_mode="HTML",
+                reply_markup=found_words_keyboard(session),
             )
         except Exception:
             logger.exception("failed to send voice session summary")
@@ -466,10 +494,35 @@ def build_summary(session: dict) -> str:
         "▫️ Не прозвучали: " + (html.escape(", ".join(unused)) if unused else "—"),
         "<i>(точное совпадение формы — спряжённые глаголы пока не ловятся)</i>",
         "",
+    ]
+    found = session.get("found_words") or []
+    if found:
+        lines += [
+            "🔎 <b>Искала по-испански:</b>",
+            *(f"• {html.escape(p['ru'])} → {html.escape(p['es'])}" for p in found),
+            "<i>Нажми на слово внизу, чтобы добавить его в словарь.</i>",
+            "",
+        ]
+    lines += [
         f"💸 ≈ ${stt + llm + tts:.3f}: распознавание ${stt:.3f}, Claude ${llm:.3f}, озвучка ${tts:.3f} "
         "<i>(оценка по прайсу на 2026-09-19)</i>",
     ]
     return "\n".join(lines)
+
+
+FOUND_WORDS_BUTTONS = 8
+
+
+def found_words_keyboard(session: dict):
+    """One "add" button per word she looked for — added only if she taps it (each add is a
+    Claude call and a card; she decides which ones are worth learning)."""
+    found = (session.get("found_words") or [])[:FOUND_WORDS_BUTTONS]
+    if not found:
+        return None
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"➕ {p['es']}", callback_data=f"talkadd:{session['id']}:{i}")]
+        for i, p in enumerate(found)
+    ])
 
 
 def register(api: web.Application, *, bot, bot_token: str, owner_id: int):

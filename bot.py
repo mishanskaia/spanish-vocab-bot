@@ -970,6 +970,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "voice_add":
         await _handle_voice_add_button(query, context, parts)
 
+    # --- word she looked for in Russian during /talk: add to the vocabulary ---
+    elif action == "talkadd":
+        await _handle_talk_add_button(query, parts)
+
     # --- delete word by button ---
     elif action == "del_word":
         word_id = int(parts[1])
@@ -1296,6 +1300,24 @@ async def handle_voice_new_word(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardButton("Отмена", callback_data=f"voice_add:{token}:no"),
         ]]),
     )
+
+
+async def _handle_talk_add_button(query, parts):
+    session = db.get_voice_session(int(parts[1]))
+    index = int(parts[2])
+    if session is None or session["user_id"] != query.from_user.id or index >= len(session["found_words"]):
+        return
+    # drop just the pressed button, keep the rest of the list tappable
+    markup = query.message.reply_markup
+    rows = [
+        row for row in (markup.inline_keyboard if markup else [])
+        if not any(b.callback_data == query.data for b in row)
+    ]
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+    except BadRequest:
+        pass
+    await _add_word(query.message, query.from_user.id, session["found_words"][index]["es"])
 
 
 async def _handle_voice_add_button(query, context: ContextTypes.DEFAULT_TYPE, parts):
