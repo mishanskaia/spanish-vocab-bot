@@ -10,7 +10,8 @@ reply → OpenAI TTS → audio + subtitles back to the page.
 
 Pause handling (the hard part at A1 — she stops mid-sentence to find a word) is split
 between the page (silence timing, merging an early-answered utterance, barge-in) and
-here (looks_unfinished() pre-check, then Claude's "complete" flag). See CLAUDE.md
+here (looks_unfinished() pre-check, then a separate "did she finish?" check run in
+parallel with the reply). See CLAUDE.md
 «Живой разговор голосом».
 
 Two ways to authenticate, both owner-only:
@@ -47,6 +48,12 @@ logger = logging.getLogger(__name__)
 # sentences as unfinished. Sonnet 4.6 got every "finished?" call right, clean grammar,
 # natural recasts, ~1.8 s. Same model ai_helper uses. Override with TALK_LLM_MODEL.
 TALK_LLM_MODEL = os.environ.get("TALK_LLM_MODEL", "claude-sonnet-4-6")
+# "Did she finish?" is a separate small call, run in parallel with the reply. Inside the big
+# conversation prompt Sonnet judged "Mañana voy a la peluquería con mi hermana" unfinished in
+# 2 of 5 runs of a real conversation (third live test, 2026-09-19); the focused prompt below
+# got 0 of 32 wrong on both Sonnet 4.6 and Haiku 4.5. Haiku: it only returns a yes/no, so
+# its Spanish doesn't matter, and at ~0.8 s a "keep listening" answer comes back faster.
+TALK_CHECK_MODEL = os.environ.get("TALK_CHECK_MODEL", "claude-haiku-4-5")
 MAX_TURN_AUDIO_BYTES = 4 * 1024 * 1024  # ~2 min of 16 kHz WAV — the page caps an utterance well below
 TARGET_WORD_COUNT = 10
 LINK_TOKEN_TTL_SECONDS = 12 * 3600
@@ -145,10 +152,12 @@ def build_instructions(target_words) -> str:
     # words first and said "switch word every 2-3 turns" + "recast her idea" — the
     # result was a questionnaire that jumped topics and parroted her back before
     # every question. Conversation flow now outranks the words.
+    # Third live test: "stay on one topic" read as "stick to MY topic" — she asked what a
+    # word meant, got the answer and then "anyway, back to…". She leads now.
     return f"""You are a friendly Spanish-speaking friend chatting with a Russian-speaking learner at level A1–A2. She is a woman.
 
 Priorities, in this order:
-1. A real, coherent conversation — like two people talking, not an interview.
+1. A real, coherent conversation — like two people talking, not an interview. She leads: whatever she brings up or asks about becomes the conversation.
 2. She talks more than you.
 3. Chances for her to use the target words below. Sacrifice this whenever it would break the flow.
 
@@ -159,9 +168,10 @@ How a turn sounds:
 - Simple A1–A2 words, short sentences (up to ~12 words). Keep your turn to 2–3 sentences.
 
 Keeping the thread:
-- Stay on one topic and go deeper with follow-up questions (why, how, with whom, what happened next).
-- Change topic only through a natural bridge from what was just said ("Hablando de viajes…"), never abruptly.
-- At the start, pick an everyday topic that several target words fit into, and open with it.
+- The topic is whatever she is talking about right now. Go deeper into it with follow-up questions (why, how, with whom, what happened next).
+- If she asks you something — what a word means, how to say something, your opinion, anything — answer it first, clearly and simply. Your follow-up question is then about what SHE asked (that word in her life, that thing she's curious about), not a way back to the earlier topic: after "¿Qué es peluquería?" ask "¿Vas mucho a la peluquería?", not "¿Fuiste a la peluquería en Georgia?". Never steer back after she moved on ("bueno, volviendo a…").
+- You change topic only through a natural bridge from what was just said, never abruptly.
+- At the start, pick an everyday topic that several target words fit into, and open with it — it's just an opener, not a plan to stick to.
 
 Target words:
 - Use one only when it fits the current topic naturally: ask something whose natural answer needs it.
@@ -172,7 +182,8 @@ Mistakes:
 - Don't explain grammar and don't stop the conversation to correct.
 - Only when she made a real mistake: slip the correct form into your reaction in passing (e.g. "¡Ah, fuiste al cine! ¿Y qué viste?"). If there was no mistake, don't repeat anything.
 - Never "correct" feminine forms she uses about herself.
-- If she uses a Russian word because she doesn't know the Spanish one, give the Spanish word once, briefly, and continue.
+- If she uses a Russian word because she doesn't know the Spanish one, SAY it out loud at the start of your reply — the Russian word, then the Spanish: "«Шапка» en español es «el gorro»." (write the Russian word in Cyrillic; it is read aloud). Then react to what she said and continue.
+- If she asks what a Spanish word means, you may give the Russian translation in one short phrase — keep the Spanish word in Latin letters: "«Frontera» es «граница»." Then continue in Spanish.
 - If she seems lost or asks (even in Russian) to repeat, say it again more simply.
 
 Start: greet her briefly and open your chosen topic with a question.
@@ -184,19 +195,17 @@ Target words (Spanish — Russian meaning):
 TURN_FORMAT = """
 
 How her messages reach you:
-Each user message is a live speech-to-text transcript of what she just said (verbatim — her mistakes and Russian words are kept on purpose). The page decides she has finished when she goes quiet, but at A1 she often pauses mid-sentence to search for a word.
+Each user message is a live speech-to-text transcript of what she just said (verbatim — her mistakes and Russian words are kept on purpose). She mixes Spanish and Russian, and may ask you things in Russian. Russian usually comes in Cyrillic, but the speech-to-text sometimes writes it in Latin letters ("shapka", "chto znachit") — treat those as Russian too. By the time you get it, she has finished her turn.
 
 Answer with JSON:
-- "complete": judge ONLY by how her message ends. It is false only when the last words cannot end a sentence — it stops on a conjunction, preposition, article, possessive or filler ("y", "pero", "que", "de", "con", "la", "mi", "eh…"), or breaks off mid-phrase ("Yo quiero comprar", "Mañana voy a"). Then "reply" must be "" and the page keeps listening. Grammar mistakes, Russian words, very short answers, or not answering your question do NOT make it incomplete. When in doubt, it is complete.
-- "complete": true → "reply" is your next spoken turn: plain Spanish text only (it is read aloud by text-to-speech — no emoji, no markdown, no stage directions, no translations in brackets).
-- If her message ends with [LARGA PAUSA], she got stuck: "complete" must be true. Help gently — offer the word she seems to be looking for, or ask your question again more simply.
-- If her message ends with [TERMINÉ], she tapped "I'm done": "complete" must be true.
-- "translations": every Russian word or phrase in THIS message of hers that she used because she didn't know it in Spanish, with the Spanish the conversation needed — "ru" exactly as she said it, "es" for a single word in dictionary form (nouns with their article, verbs in the infinitive): [{"ru": "шапка", "es": "el gorro"}]; for a whole Russian phrase, the natural Spanish phrase as she would say it here ("я много работаю" → "trabajo mucho"). Empty list if she used no Russian. These are shown to her on screen and offered for her vocabulary, so the Spanish must be the natural, common A1–A2 word for her meaning."""
+- "reply" is your next spoken turn, read aloud by text-to-speech: Spanish, plus Russian only where the rules above say so (naming the Russian word she used, a short translation she asked for). No emoji, no markdown, no stage directions, no translations in brackets.
+- If her message ends with [LARGA PAUSA], she went quiet for a long time: if it breaks off mid-sentence, she's stuck — help gently, offer the word she seems to be looking for or ask your question again more simply; if it's a finished thought, just reply normally.
+- [TERMINÉ] at the end only means she tapped "I'm done" — reply normally.
+- "translations": every Russian word or phrase in THIS message of hers that she used because she didn't know it in Spanish, with the Spanish the conversation needed — "ru" as she said it but always in Cyrillic (turn a Latin-letter transliteration like "shapka" back into "шапка"), "es" for a single word in dictionary form (nouns with their article, verbs in the infinitive): [{"ru": "шапка", "es": "el gorro"}]; for a whole Russian phrase, the natural Spanish phrase as she would say it here ("я много работаю" → "trabajo mucho"). Empty list if she used no Russian. Russian she used to ask you something ("что значит…", "как сказать…") is not a translation — answer the question instead. These are shown to her on screen and offered for her vocabulary, so the Spanish must be the natural, common A1–A2 word for her meaning."""
 
 TURN_SCHEMA = {
     "type": "object",
     "properties": {
-        "complete": {"type": "boolean"},
         "reply": {"type": "string"},
         "translations": {
             "type": "array",
@@ -208,7 +217,7 @@ TURN_SCHEMA = {
             },
         },
     },
-    "required": ["complete", "reply", "translations"],
+    "required": ["reply", "translations"],
     "additionalProperties": False,
 }
 
@@ -230,6 +239,33 @@ def looks_unfinished(text: str) -> bool:
         return True
     words = _WORD_RE.findall(stripped.lower())
     return bool(words) and words[-1] in _UNFINISHED_ENDINGS
+
+
+CHECK_PROMPT = """You check live speech-to-text from a Spanish learner (A1–A2, Russian speaker) in a voice chat. She went quiet; decide whether she has finished her turn or paused mid-sentence to search for a word.
+
+"complete": false ONLY if her last words cannot end an utterance — it stops right after a conjunction, preposition, article, possessive or filler ("y", "pero", "porque", "que", "de", "con", "a", "la", "un", "mi", "eh…"), or breaks off where more is clearly needed ("Yo quiero comprar", "Mañana voy a", "El sábado yo visité").
+Everything else is complete: full sentences, short answers ("Sí", "No sé", "Bien"), questions, sentences with grammar mistakes, Russian words or Russian questions mixed in, answers that don't answer the question. When in doubt: complete."""
+
+CHECK_SCHEMA = {
+    "type": "object",
+    "properties": {"complete": {"type": "boolean"}},
+    "required": ["complete"],
+    "additionalProperties": False,
+}
+
+
+def classify_complete(last_bot: str, user_text: str) -> tuple[bool, dict]:
+    """Sync (blocking) — call through asyncio.to_thread."""
+    response = ai_helper.client.messages.create(
+        model=TALK_CHECK_MODEL,
+        max_tokens=50,
+        system=CHECK_PROMPT,
+        messages=[{"role": "user", "content": f"The bot last said: {last_bot}\nHer message: {user_text}"}],
+        output_config={"format": {"type": "json_schema", "schema": CHECK_SCHEMA}},
+    )
+    text = next((b.text for b in response.content if b.type == "text"), "{}")
+    complete = json.loads(text).get("complete", True)
+    return complete, {"check_in": response.usage.input_tokens, "check_out": response.usage.output_tokens}
 
 
 def _history_to_messages(history, user_text: str | None) -> list[dict]:
@@ -362,7 +398,7 @@ async def handle_turn(request: web.Request) -> web.Response:
     usage = {"stt_seconds": max(0, len(audio) - 44) / 32000}
     try:
         t = time.monotonic()
-        heard = await asyncio.to_thread(stt_helper.transcribe, audio, "turn.wav")
+        heard = await asyncio.to_thread(stt_helper.transcribe_mixed, audio, "turn.wav")
         timings["stt_ms"] = round((time.monotonic() - t) * 1000)
     except Exception as e:
         return _voice_error(e)
@@ -376,17 +412,29 @@ async def handle_turn(request: web.Request) -> web.Response:
     marker = {"stuck": " [LARGA PAUSA]", "done": " [TERMINÉ]"}.get(mode, "")
     try:
         t = time.monotonic()
-        data, llm_usage = await asyncio.to_thread(
+        reply_task = asyncio.ensure_future(asyncio.to_thread(
             claude_turn, session["target_words"], history, user_text + marker
-        )
+        ))
+        if mode == "auto":
+            last_bot = next((str(h.get("text", "")) for h in reversed(history) if h.get("role") == "assistant"), "")
+            try:
+                complete, check_usage = await asyncio.to_thread(classify_complete, last_bot, user_text)
+                usage.update(check_usage)
+            except Exception:
+                logger.exception("talk: completeness check failed, answering anyway")
+                complete = True
+            timings["check_ms"] = round((time.monotonic() - t) * 1000)
+            if not complete:
+                # the reply is already being written — let it finish unused rather than cancel a thread
+                reply_task.add_done_callback(lambda f: f.exception())
+                return web.json_response({"status": "wait", "user_text": user_text, "usage": usage, "timings": timings})
+        data, llm_usage = await reply_task
         timings["llm_ms"] = round((time.monotonic() - t) * 1000)
         usage.update(llm_usage)
         translations = _clean_translations(data.get("translations"))
         if translations:
             db.add_voice_found_words(session_id, translations)
         reply = (data.get("reply") or "").strip()
-        if mode == "auto" and (not data.get("complete") or not reply):
-            return web.json_response({"status": "wait", "user_text": user_text, "usage": usage, "timings": timings})
         if not reply:
             reply = "Perdona, ¿puedes repetirlo?"
         audio_b64 = await _speak(reply, usage, timings)
@@ -460,6 +508,8 @@ def _word_used(phrase: str, user_text: str) -> bool:
 PRICE_STT_PER_MIN = 0.003    # gpt-4o-mini-transcribe
 PRICE_LLM_IN = 3.0           # claude-sonnet-4-6, $ per 1M input tokens (cache reads 0.1x, writes 1.25x)
 PRICE_LLM_OUT = 15.0
+PRICE_CHECK_IN = 1.0          # claude-haiku-4-5 for the "did she finish?" check
+PRICE_CHECK_OUT = 5.0
 PRICE_TTS_PER_MIN = 0.015
 
 
@@ -484,6 +534,8 @@ def build_summary(session: dict) -> str:
         + usage.get("llm_cache_read", 0) * PRICE_LLM_IN * 0.1
         + usage.get("llm_cache_write", 0) * PRICE_LLM_IN * 1.25
         + usage.get("llm_out", 0) * PRICE_LLM_OUT
+        + usage.get("check_in", 0) * PRICE_CHECK_IN
+        + usage.get("check_out", 0) * PRICE_CHECK_OUT
     ) / 1e6
     tts = usage.get("tts_seconds", 0) / 60 * PRICE_TTS_PER_MIN
 

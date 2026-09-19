@@ -45,6 +45,26 @@ def transcribe_word(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
     return result.text.strip().strip(".,!?¿¡…\"«»").strip()
 
 
+# The /talk conversation: Spanish with Russian words dropped in, and questions asked in
+# Russian. transcribe() pins language="es", which made the model write Russian in Latin
+# letters ("shapka") — found in the third live test (2026-09-19). No `language` here; the
+# prompt keeps it verbatim and asks for Cyrillic, with an example of both in one phrase.
+MIXED_PROMPT = (
+    "Transcripción literal de una estudiante de español de nivel A1 que mezcla español y ruso. "
+    "Escribe exactamente lo que dice, con sus errores, sin corregir ni traducir nada. "
+    "Las palabras rusas escríbelas en cirílico: «Ayer compré un шапка», «¿Что значит peluquería?»."
+)
+
+
+def transcribe_mixed(audio_bytes: bytes, filename: str = "voice.wav") -> str:
+    result = _get_client().audio.transcriptions.create(
+        model=STT_MODEL,
+        file=(filename, audio_bytes),
+        prompt=MIXED_PROMPT,
+    )
+    return result.text.strip()
+
+
 def transcribe(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
     result = _get_client().audio.transcriptions.create(
         model=STT_MODEL,
