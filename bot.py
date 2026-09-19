@@ -21,6 +21,7 @@ from telegram import (
     InlineKeyboardMarkup,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    WebAppInfo,
 )
 from telegram.ext import (
     Application,
@@ -38,6 +39,7 @@ from telegram.helpers import escape_markdown
 import db
 import ai_helper
 import stt_helper
+import voice_talk
 
 logging.basicConfig(level=logging.INFO)
 # httpx logs every request URL at INFO, and Telegram Bot API URLs contain the bot token —
@@ -1409,6 +1411,35 @@ async def canceltopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Живой разговор голосом — owner-only Mini App (спайк), вся логика в voice_talk.py
+# ---------------------------------------------------------------------------
+
+async def talk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not _is_owner(user_id):
+        return
+    if not voice_talk.is_enabled():
+        await update.message.reply_text("Разговор выключен: не задан OPENAI_API_KEY.")
+        return
+    base = voice_talk.public_base_url()
+    if not base:
+        await update.message.reply_text(
+            "Нет публичного адреса: включи домен в Railway (Settings → Networking) "
+            "или задай PUBLIC_BASE_URL."
+        )
+        return
+    safari_url = f"{base}/talk?t={voice_talk.make_link_token(user_id)}"
+    await update.message.reply_text(
+        "🎙 Живой разговор. Если в Telegram не заработает микрофон или экран будет гаснуть — "
+        "открой ту же страницу в Safari (ссылка действует 12 часов).",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Начать разговор", web_app=WebAppInfo(url=f"{base}/talk"))],
+            [InlineKeyboardButton("Открыть в Safari", url=safari_url)],
+        ]),
+    )
+
+
+# ---------------------------------------------------------------------------
 # API — lets another site of yours read your word list, and (with a separate
 # write key) add new words the same way typing to the bot directly would.
 # Runs in the same process/container as the bot, reading/writing the same DB file.
@@ -1575,6 +1606,7 @@ async def start_api_server(app: Application):
     api.router.add_post("/words", handle_api_add_word)
     api.router.add_route("OPTIONS", "/words", handle_api_words_options)
     api.router.add_get("/health", handle_api_health)
+    voice_talk.register(api, bot=app.bot, bot_token=TELEGRAM_TOKEN, owner_id=OWNER_TELEGRAM_ID)
     runner = web.AppRunner(api)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
@@ -1656,6 +1688,7 @@ OWNER_ONLY_COMMANDS = [
     ("topics", "Активные темы Study Coach"),
     ("canceltopic", "Отменить тему Study Coach"),
     ("practice", "Вечерняя практика прямо сейчас"),
+    ("talk", "Живой разговор голосом (тест)"),
 ]
 
 
@@ -1692,6 +1725,7 @@ def main():
     app.add_handler(CommandHandler("topics", topics))
     app.add_handler(CommandHandler("canceltopic", canceltopic))
     app.add_handler(CommandHandler("practice", practice))
+    app.add_handler(CommandHandler("talk", talk))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

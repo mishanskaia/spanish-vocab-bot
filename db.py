@@ -231,6 +231,20 @@ def init_db():
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS voice_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            target_words TEXT NOT NULL,
+            transcript TEXT DEFAULT '[]',
+            usage TEXT DEFAULT '{}',
+            status TEXT DEFAULT 'active',
+            started_at TEXT NOT NULL,
+            ended_at TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -986,3 +1000,69 @@ def is_user_authorized(user_id: int) -> bool:
     ).fetchone()
     conn.close()
     return row is not None
+
+
+# ---------------------------------------------------------------------------
+# Real-time voice conversation (owner-only Mini App, see voice_talk.py)
+# ---------------------------------------------------------------------------
+
+def get_voice_target_words(user_id: int, limit: int = 10):
+    """Words the conversation should steer toward: already met in review
+    (learning+) but not yet mastered — the ones worth pulling into speech.
+    Random each session, read-only (doesn't touch the Study Coach rotation)."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT id, phrase, meaning FROM words
+           WHERE user_id = ? AND status IN ('learning', 'familiar', 'active')
+           ORDER BY RANDOM() LIMIT ?""",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def create_voice_session(user_id: int, target_words) -> int:
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT INTO voice_sessions (user_id, target_words, started_at) VALUES (?, ?, ?)",
+        (user_id, json.dumps(list(target_words), ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+    )
+    session_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return session_id
+
+
+def get_voice_session(session_id: int):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM voice_sessions WHERE id = ?", (session_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    d = dict(row)
+    for key, default in (("target_words", []), ("transcript", []), ("usage", {})):
+        try:
+            d[key] = json.loads(d[key]) if d[key] else default
+        except json.JSONDecodeError:
+            d[key] = default
+    return d
+
+
+def save_voice_transcript(session_id: int, transcript, usage, ended: bool):
+    """The page sends the whole transcript so far after every turn — overwriting
+    is idempotent, and a dropped connection loses at most the last turn."""
+    conn = get_connection()
+    conn.execute(
+        """UPDATE voice_sessions SET transcript = ?, usage = ?,
+               status = CASE WHEN ? THEN 'done' ELSE status END,
+               ended_at = CASE WHEN ? THEN ? ELSE ended_at END
+           WHERE id = ?""",
+        (
+            json.dumps(transcript, ensure_ascii=False),
+            json.dumps(usage, ensure_ascii=False),
+            ended, ended, datetime.now(timezone.utc).isoformat(),
+            session_id,
+        ),
+    )
+    conn.commit()
+    conn.close()
