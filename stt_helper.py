@@ -53,3 +53,25 @@ def transcribe(audio_bytes: bytes, filename: str = "voice.ogg") -> str:
         prompt=VERBATIM_PROMPT,
     )
     return result.text.strip()
+
+
+# Text-to-speech for the hands-free conversation (/talk). gpt-4o-mini-tts takes free-form
+# delivery instructions; "normal pace" is deliberate — the first live test at a slowed-down
+# speed was "painfully slow", and the page shows subtitles for anything too fast.
+TTS_MODEL = "gpt-4o-mini-tts"
+TTS_VOICE = "marin"
+TTS_INSTRUCTIONS = (
+    "Speak natural, clear Spanish at a normal conversational pace, "
+    "warm and friendly, like chatting with a friend."
+)
+
+
+def synthesize(text: str) -> bytes:
+    response = _get_client().audio.speech.create(
+        model=TTS_MODEL,
+        voice=TTS_VOICE,
+        input=text,
+        instructions=TTS_INSTRUCTIONS,
+        response_format="mp3",
+    )
+    return response.content

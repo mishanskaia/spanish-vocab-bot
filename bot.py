@@ -1601,7 +1601,8 @@ async def start_api_server(app: Application):
         logger.warning("API_KEY is not set — the read-only API will reject every request.")
     if not API_WRITE_KEY:
         logger.warning("API_WRITE_KEY is not set — the add-word API will reject every request.")
-    api = web.Application()
+    # 10 MB: /talk/turn uploads a WAV of her whole utterance (aiohttp's default cap is 1 MB)
+    api = web.Application(client_max_size=10 * 1024 * 1024)
     api.router.add_get("/words", handle_api_words)
     api.router.add_post("/words", handle_api_add_word)
     api.router.add_route("OPTIONS", "/words", handle_api_words_options)
