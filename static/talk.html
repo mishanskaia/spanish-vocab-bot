@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b0b10">
+<title>Hablamos</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #0b0b10;
+    --text: #f4f1ec;
+    --muted: #8d8a93;
+    --faint: #4a4852;
+    --warm-1: #ffb36b;
+    --warm-2: #ff6f61;
+    --cool-1: #7fd6ff;
+    --cool-2: #6b7bff;
+    --danger: #ff5d5d;
+    --orb: 168px;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    display: flex; flex-direction: column;
+    padding: env(safe-area-inset-top) 16px env(safe-area-inset-bottom);
+    overflow: hidden;
+    user-select: none; -webkit-user-select: none;
+  }
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 14px 0 0; min-height: 44px;
+  }
+  #status { color: var(--muted); font-size: 15px; }
+  #diagBtn {
+    border: 0; background: none; color: var(--faint); font-size: 20px; padding: 6px;
+  }
+  #diag {
+    display: none; font: 12px/1.5 ui-monospace, Menlo, monospace; color: var(--muted);
+    background: #15151c; border-radius: 12px; padding: 10px 12px; margin-top: 8px;
+    white-space: pre-wrap; user-select: text; -webkit-user-select: text;
+  }
+  #diag.open { display: block; }
+
+  #stage { flex: 0 0 auto; display: grid; place-items: center; padding: 28px 0 20px; }
+  #orb {
+    width: var(--orb); height: var(--orb); border-radius: 50%; border: 0; padding: 0;
+    background: radial-gradient(circle at 35% 30%, #fff8 0 6%, transparent 30%),
+                radial-gradient(circle at 50% 55%, var(--warm-1), var(--warm-2) 70%);
+    box-shadow: 0 0 60px -10px var(--warm-2);
+    transition: filter .4s, box-shadow .4s, transform .4s;
+    animation: breathe 4s ease-in-out infinite;
+    cursor: pointer;
+  }
+  body[data-state="connecting"] #orb { animation: spin 1.2s linear infinite; filter: saturate(.6); }
+  body[data-state="listening"] #orb {
+    background: radial-gradient(circle at 35% 30%, #fff8 0 6%, transparent 30%),
+                radial-gradient(circle at 50% 55%, var(--cool-1), var(--cool-2) 70%);
+    box-shadow: 0 0 70px -6px var(--cool-2);
+    animation: listen .9s ease-in-out infinite;
+  }
+  body[data-state="thinking"] #orb { animation: breathe 1.6s ease-in-out infinite; filter: brightness(.8); }
+  body[data-state="speaking"] #orb { animation: speak .5s ease-in-out infinite alternate; box-shadow: 0 0 90px 0 var(--warm-2); }
+  body[data-state="paused"] #orb { animation: none; filter: grayscale(1) brightness(.6); box-shadow: none; }
+  body[data-state="ended"] #orb { animation: none; filter: grayscale(.7) brightness(.5); box-shadow: none; }
+  @keyframes breathe { 0%,100% { transform: scale(.94); } 50% { transform: scale(1); } }
+  @keyframes listen { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
+  @keyframes speak { from { transform: scale(1); } to { transform: scale(1.1); } }
+  @keyframes spin { from { transform: rotate(0) scale(.9); } to { transform: rotate(360deg) scale(.9); } }
+  #hint { margin-top: 14px; color: var(--muted); font-size: 14px; min-height: 20px; text-align: center; }
+
+  #subs {
+    flex: 1 1 auto; overflow-y: auto; padding: 4px 0 16px;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 36px);
+            mask-image: linear-gradient(to bottom, transparent 0, #000 36px);
+    user-select: text; -webkit-user-select: text;
+  }
+  .line { margin: 0 0 14px; transition: opacity .3s; }
+  .line.assistant { font-size: 23px; line-height: 1.35; font-weight: 500; opacity: .5; }
+  .line.assistant.latest { opacity: 1; }
+  .line.user { font-size: 15px; color: var(--muted); text-align: right; padding-left: 20%; }
+  .line.user::before { content: "ты: "; color: var(--faint); }
+  .line.pending { color: var(--faint); }
+
+  footer { display: flex; justify-content: center; gap: 28px; padding: 10px 0 18px; }
+  .ctl {
+    width: 60px; height: 60px; border-radius: 50%; border: 0; font-size: 22px;
+    background: #1c1c24; color: var(--text); display: grid; place-items: center;
+  }
+  #endBtn { background: color-mix(in srgb, var(--danger) 22%, #1c1c24); color: var(--danger); }
+  .ctl:disabled { opacity: .3; }
+  #error { color: var(--danger); font-size: 14px; text-align: center; min-height: 0; }
+</style>
+</head>
+<body data-state="idle">
+  <header>
+    <div id="status">Нажми на шар, чтобы начать</div>
+    <button id="diagBtn" aria-label="Диагностика">ⓘ</button>
+  </header>
+  <div id="diag"></div>
+
+  <div id="stage">
+    <button id="orb" aria-label="Начать / пауза"></button>
+    <div id="hint"></div>
+  </div>
+
+  <div id="subs" aria-live="polite"></div>
+  <div id="error"></div>
+
+  <footer>
+    <button class="ctl" id="pauseBtn" aria-label="Пауза" disabled>❚❚</button>
+    <button class="ctl" id="endBtn" aria-label="Закончить" disabled>✕</button>
+  </footer>
+
+<script>
+(() => {
+  const tg = window.Telegram && window.Telegram.WebApp;
+  const initData = (tg && tg.initData) || "";
+  const linkToken = new URLSearchParams(location.search).get("t") || "";
+
+  const $ = (id) => document.getElementById(id);
+  const statusEl = $("status"), hintEl = $("hint"), subsEl = $("subs"), errEl = $("error");
+  const pauseBtn = $("pauseBtn"), endBtn = $("endBtn");
+
+  const diag = {
+    "где": initData ? "Telegram" : (linkToken ? "браузер (ссылка)" : "без авторизации"),
+    "микрофон": "—", "экран не гаснет": "—", "звук": "—", "связь": "—", "сессия": "—",
+  };
+  function renderDiag() {
+    $("diag").textContent = Object.entries(diag).map(([k, v]) => `${k}: ${v}`).join("\n");
+  }
+  renderDiag();
+  $("diagBtn").onclick = () => $("diag").classList.toggle("open");
+
+  if (tg) {
+    try {
+      tg.ready(); tg.expand();
+      tg.disableVerticalSwipes && tg.disableVerticalSwipes();
+      tg.setHeaderColor && tg.setHeaderColor("#0b0b10");
+      tg.setBackgroundColor && tg.setBackgroundColor("#0b0b10");
+    } catch (e) {}
+  }
+  if (!initData && !linkToken) {
+    statusEl.textContent = "Открой страницу через /talk в боте";
+  }
+
+  function authHeaders() {
+    const h = { "Content-Type": "application/json" };
+    if (initData) h["X-Tg-Init-Data"] = initData;
+    else if (linkToken) h["X-Talk-Token"] = linkToken;
+    return h;
+  }
+
+  const STATUS = {
+    idle: "Нажми на шар, чтобы начать",
+    connecting: "Подключаюсь…",
+    listening: "Слушаю",
+    thinking: "…",
+    speaking: "Говорит",
+    ready: "Твоя очередь",
+    paused: "Пауза — нажми на шар",
+    ended: "Разговор закончен",
+  };
+  function setState(s) {
+    if (paused && s !== "paused" && s !== "ended") return;
+    document.body.dataset.state = s === "ready" ? "idle" : s;
+    statusEl.textContent = STATUS[s] || "";
+  }
+  function showError(msg) { errEl.textContent = msg; }
+
+  // ---------- state ----------
+  let pc = null, dc = null, micTrack = null, audioEl = null, wakeLock = null;
+  let sessionId = null, running = false, paused = false, ended = false;
+  const entries = [];          // {id, role, text, el} in display order
+  const byId = new Map();
+  const usage = {};
+
+  function addUsage(target, src) {
+    if (!src || typeof src !== "object") return;
+    for (const [k, v] of Object.entries(src)) {
+      if (typeof v === "number") target[k] = (target[k] || 0) + v;
+      else if (v && typeof v === "object") addUsage(target[k] = target[k] || {}, v);
+    }
+  }
+
+  // ---------- subtitles ----------
+  function nearBottom() { return subsEl.scrollHeight - subsEl.scrollTop - subsEl.clientHeight < 80; }
+  function entry(id, role) {
+    let e = byId.get(id);
+    if (e) return e;
+    const el = document.createElement("p");
+    el.className = `line ${role}`;
+    e = { id, role, text: "", el };
+    entries.push(e); byId.set(id, e);
+    const stick = nearBottom();
+    subsEl.appendChild(el);
+    if (role === "assistant") {
+      subsEl.querySelectorAll(".assistant.latest").forEach((n) => n.classList.remove("latest"));
+      el.classList.add("latest");
+    }
+    if (stick) subsEl.scrollTop = subsEl.scrollHeight;
+    return e;
+  }
+  function setText(e, text, pending) {
+    const stick = nearBottom();
+    e.text = text;
+    e.el.textContent = text;
+    e.el.classList.toggle("pending", !!pending);
+    if (stick) subsEl.scrollTop = subsEl.scrollHeight;
+  }
+
+  // ---------- persistence ----------
+  async function save(isEnd) {
+    if (!sessionId) return;
+    const transcript = entries.filter((e) => e.text && e.text !== "…").map((e) => ({ role: e.role, text: e.text }));
+    try {
+      await fetch("/talk/transcript", {
+        method: "POST", headers: authHeaders(), keepalive: true,
+        body: JSON.stringify({ session_id: sessionId, transcript, usage, ended: !!isEnd }),
+      });
+    } catch (e) { if (isEnd) showError("Не удалось сохранить разговор: " + e.message); }
+  }
+
+  // ---------- wake lock ----------
+  async function keepAwake() {
+    if (!("wakeLock" in navigator)) { diag["экран не гаснет"] = "нет API"; renderDiag(); return; }
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+      diag["экран не гаснет"] = "да";
+      wakeLock.addEventListener("release", () => { diag["экран не гаснет"] = "отпущен"; renderDiag(); });
+    } catch (e) { diag["экран не гаснет"] = "ошибка: " + e.name; }
+    renderDiag();
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (!running) return;
+    if (document.visibilityState === "visible") keepAwake();
+    else save(false);
+  });
+
+  // ---------- realtime events ----------
+  function onEvent(ev) {
+    switch (ev.type) {
+      case "input_audio_buffer.speech_started": setState("listening"); break;
+      case "input_audio_buffer.speech_stopped": setState("thinking"); break;
+      case "input_audio_buffer.committed": setText(entry(ev.item_id, "user"), "…", true); break;
+      case "conversation.item.input_audio_transcription.delta": {
+        const e = entry(ev.item_id, "user");
+        setText(e, (e.text === "…" ? "" : e.text) + (ev.delta || ""), true);
+        break;
+      }
+      case "conversation.item.input_audio_transcription.completed":
+        setText(entry(ev.item_id, "user"), (ev.transcript || "").trim() || "(тишина)");
+        addUsage(usage.transcription = usage.transcription || {}, ev.usage);
+        break;
+      case "conversation.item.input_audio_transcription.failed":
+        setText(entry(ev.item_id, "user"), "(не расслышала)");
+        break;
+      case "response.output_audio_transcript.delta": {
+        const e = entry(ev.item_id, "assistant");
+        setText(e, e.text + (ev.delta || ""));
+        setState("speaking");
+        break;
+      }
+      case "response.output_audio_transcript.done":
+        setText(entry(ev.item_id, "assistant"), ev.transcript || byId.get(ev.item_id).text);
+        break;
+      case "output_audio_buffer.started": setState("speaking"); break;
+      case "output_audio_buffer.stopped": setState("ready"); break;
+      case "response.done":
+        addUsage(usage, ev.response && ev.response.usage);
+        save(false);
+        break;
+      case "error":
+        showError((ev.error && ev.error.message) || "Ошибка Realtime");
+        break;
+    }
+  }
+
+  // ---------- start / pause / end ----------
+  async function start() {
+    if (!initData && !linkToken) return;
+    running = true; showError(""); setState("connecting");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
+      micTrack = stream.getAudioTracks()[0];
+      diag["микрофон"] = "да (" + (micTrack.label || "без имени") + ")"; renderDiag();
+    } catch (e) {
+      diag["микрофон"] = "ошибка: " + e.name; renderDiag();
+      showError("Нет доступа к микрофону (" + e.name + "). Попробуй открыть в Safari.");
+      running = false; setState("idle"); return;
+    }
+    keepAwake();
+
+    pc = new RTCPeerConnection();
+    audioEl = document.createElement("audio");
+    audioEl.autoplay = true; audioEl.playsInline = true;
+    document.body.appendChild(audioEl);
+    pc.ontrack = (e) => {
+      audioEl.srcObject = e.streams[0];
+      audioEl.play().then(
+        () => { diag["звук"] = "играет"; renderDiag(); },
+        (err) => { diag["звук"] = "заблокирован: " + err.name; renderDiag(); hintEl.textContent = "Нажми на шар, чтобы включить звук"; }
+      );
+    };
+    pc.onconnectionstatechange = () => {
+      diag["связь"] = pc.connectionState; renderDiag();
+      if (["failed", "disconnected"].includes(pc.connectionState) && !ended) {
+        showError("Связь прервалась. Разговор сохранён до этого места.");
+        save(false);
+      }
+    };
+    pc.addTrack(micTrack);
+    dc = pc.createDataChannel("oai-events");
+    dc.onmessage = (m) => { try { onEvent(JSON.parse(m.data)); } catch (e) {} };
+    dc.onopen = () => dc.send(JSON.stringify({ type: "response.create" }));  // bot opens the conversation
+
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      const r = await fetch("/talk/call", {
+        method: "POST", headers: authHeaders(), body: JSON.stringify({ sdp: offer.sdp }),
+      });
+      const data = await r.json();
+      if (!r.ok) throw new Error(data.error || r.status);
+      sessionId = data.session_id;
+      diag["сессия"] = `#${sessionId}, целевых слов: ${data.target_words.length}`; renderDiag();
+      await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+    } catch (e) {
+      showError("Не получилось подключиться: " + e.message);
+      teardown(); running = false; setState("idle"); return;
+    }
+    pauseBtn.disabled = false; endBtn.disabled = false;
+    if (tg && tg.enableClosingConfirmation) tg.enableClosingConfirmation();
+  }
+
+  function togglePause() {
+    if (!running || ended) return;
+    paused = !paused;
+    micTrack.enabled = !paused;
+    if (audioEl) audioEl.muted = paused;
+    pauseBtn.textContent = paused ? "▶" : "❚❚";
+    if (paused) setState("paused"); else setState("ready");
+  }
+
+  function teardown() {
+    try { micTrack && micTrack.stop(); } catch (e) {}
+    try { pc && pc.close(); } catch (e) {}
+    try { wakeLock && wakeLock.release(); } catch (e) {}
+  }
+
+  async function end() {
+    if (!running || ended) return;
+    ended = true; running = false;
+    teardown();
+    setState("ended");
+    pauseBtn.disabled = true; endBtn.disabled = true;
+    await save(true);
+    hintEl.textContent = "Итог — в чате с ботом";
+    if (tg && tg.disableClosingConfirmation) tg.disableClosingConfirmation();
+  }
+
+  $("orb").onclick = () => {
+    if (ended) { location.reload(); return; }
+    if (!running) { start(); return; }
+    if (audioEl && audioEl.paused && audioEl.srcObject) { audioEl.play().catch(() => {}); hintEl.textContent = ""; return; }
+    togglePause();
+  };
+  pauseBtn.onclick = togglePause;
+  endBtn.onclick = end;
+})();
+</script>
+</body>
+</html>
