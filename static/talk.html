@@ -128,13 +128,23 @@
   // At A1 she stops mid-sentence to find a word, so "silence = done" would cut her off.
   // Starting guesses, meant to be tuned after live use.
   const CFG = {
-    PAUSE_CHECK_MS: 1200,  // silence after speech → ask the server "did she finish?"
+    PAUSE_CHECK_MS: 1500,  // silence after speech → ask the server "did she finish?" (breaths inside speech reach ~1 s)
     STUCK_MS: 7000,        // silence this long → answer anyway and help with the word
     PREROLL_MS: 400,       // audio kept from before the voice was detected
     MIN_SPEECH_MS: 180,    // sustained voice to count as speech, not a click or cough
     VOICE_GAP_MS: 250,     // dips inside a word don't count as silence
-    BARGE_MS: 400,         // sustained voice while the bot talks → she's interrupting
-    BARGE_FACTOR: 2.2,     // stricter threshold while the bot talks (its own voice leaks into the mic)
+    RUN_RESET_MS: 600,     // voice counter only resets after this much quiet — gaps between words don't
+    BARGE_MS: 300,         // this much voice while the bot talks → she's interrupting
+    // Voice detection. v1 averaged the "room level" over every frame not yet marked as speech, so
+    // her own voice crept into it and the threshold climbed above her — the page heard silence
+    // while she was talking and the bot cut in (first live test, 2026-09-19). Now the room level is
+    // the quietest moment of the last 2 s: talking always dips to room level between words, so
+    // speech can't drag it up, while steady background (TV, fan) becomes the new floor within 2 s.
+    NOISE_WINDOW_MS: 2000,
+    START_FACTOR: 3,       // voice starts at 3x the room level…
+    KEEP_FACTOR: 2.2,      // …and once she's mid-utterance, quieter parts at 2.2x still count as voice
+    BARGE_ECHO_FACTOR: 2.5, // while the bot talks: she must be 2.5x louder than its echo in the mic
+    RESUME_GUARD_MS: 600,  // an answer that arrives while she's talking is stale — drop it, keep listening
     EARLY_BARGE_MS: 2500,  // interrupted this early → the bot jumped in too soon; drop its answer, merge her pieces
     ECHO_TAIL_MS: 350,     // ignore the mic right after the bot stops
     MAX_UTTER_MS: 60000,
@@ -155,7 +165,7 @@
 
   const diag = {
     "где": initData ? "Telegram" : (linkToken ? "браузер (ссылка)" : "без авторизации"),
-    "микрофон": "—", "экран не гаснет": "—", "аудио": "—", "шум / порог": "—",
+    "микрофон": "—", "экран не гаснет": "—", "аудио": "—", "уровень / шум / порог": "—", "пик голоса": "—",
     "последний ход": "—", "сессия": "—",
   };
   function renderDiag() {
@@ -188,6 +198,7 @@
   let player = null, playStartedAt = 0;
   let inflight = null, turnSeq = 0;
   let noise = 0.004, voicedRun = 0, voiceActive = false, lastVoicedAt = 0, ignoreUntil = 0;
+  let noiseWin = [], noiseWinMs = 0, echo = 0.006, aboveStreak = 0, level = 0, lastThr = 0, peak = 0, runStartedAt = 0;
   let checkedFor = -1, stuckFor = -1, waitingHint = false;
   let preroll = [], prerollMs = 0;
   let utter = newUtter();
@@ -308,13 +319,36 @@
     let sum = 0;
     for (let i = 0; i < f32.length; i++) sum += f32[i] * f32[i];
     const rms = Math.sqrt(sum / f32.length);
-    if (!voiceActive && state !== "speaking") noise = Math.min(0.05, Math.max(0.001, noise * 0.97 + rms * 0.03));
-    let thr = Math.max(noise * 3, 0.01);
-    if (state === "speaking") thr *= CFG.BARGE_FACTOR;
+    level = rms;
+    // room level = quietest moment of the last NOISE_WINDOW_MS (not while the bot talks — the mic hears it then)
+    if (state !== "speaking") {
+      noiseWin.push(rms); noiseWinMs += dt;
+      while (noiseWinMs > CFG.NOISE_WINDOW_MS && noiseWin.length > 1) { noiseWin.shift(); noiseWinMs -= dt; }
+      let m = Infinity;
+      for (const v of noiseWin) if (v < m) m = v;
+      noise = noise * 0.8 + Math.max(0.001, Math.min(0.03, m)) * 0.2;
+    }
+    const startThr = Math.max(noise * CFG.START_FACTOR, 0.006);
+    let thr;
+    if (state === "speaking") {
+      thr = Math.max(startThr * 1.6, echo * CFG.BARGE_ECHO_FACTOR);
+      if (rms < thr) echo = echo * 0.95 + rms * 0.05;  // track the bot's leak, not her voice
+    } else if (utter.hasSpeech) {
+      thr = Math.max(noise * CFG.KEEP_FACTOR, 0.004);
+    } else {
+      thr = startThr;
+    }
+    lastThr = thr;
 
-    const voiced = rms > thr && now > ignoreUntil;
-    if (voiced) { voicedRun += dt; lastVoicedAt = now; }
-    else if (now - lastVoicedAt > CFG.VOICE_GAP_MS) voicedRun = 0;
+    aboveStreak = rms > thr && now > ignoreUntil ? aboveStreak + 1 : 0;
+    const voiced = aboveStreak >= 2;  // a one-frame spike (a clink, a click) isn't voice
+    if (voiced) {
+      if (voicedRun === 0) runStartedAt = now;
+      voicedRun += dt; lastVoicedAt = now;
+      if (utter.hasSpeech) peak = Math.max(peak, rms);
+    }
+    else if (now - lastVoicedAt > CFG.RUN_RESET_MS) voicedRun = 0;
+    else voicedRun = Math.max(0, voicedRun - dt * 0.5);  // short gaps between words only slow it down
 
     // keep recording while a check is in flight too — if she carries on, that audio is part of the same utterance
     if ((state === "listening" || state === "thinking") && utter.hasSpeech) { utter.chunks.push(f32); utter.ms += dt; }
@@ -342,7 +376,7 @@
   }
 
   function bargeIn() {
-    const played = performance.now() - playStartedAt;
+    const played = runStartedAt - playStartedAt;  // when she started talking over it, not when we noticed
     stopPlayback();
     if (lastTurn && played < CFG.EARLY_BARGE_MS) {
       // The bot answered while she was still mid-thought: drop its answer, keep her words as a prefix.
@@ -436,6 +470,11 @@
       setState("listening");
       return;
     }
+    if (performance.now() - lastVoicedAt < CFG.RESUME_GUARD_MS) {
+      // she's talking right now — the answer is to half a thought; the next pause re-checks everything
+      setState("listening");
+      return;
+    }
     // reply
     if (utter.entry) setText(utter.entry, res.user_text); else utter.entry = addEntry("user", res.user_text);
     const botEntry = addEntry("assistant", res.reply);
@@ -462,6 +501,7 @@
       };
       player = src;
       playStartedAt = performance.now();
+      echo = Math.max(noise * CFG.START_FACTOR, 0.006);
       setState("speaking");
       src.start();
       diag["аудио"] = `${ctx.state}, ${ctx.sampleRate} Гц`; renderDiag();
@@ -478,7 +518,9 @@
 
   // ---------- timer: silence → check / stuck, ring ----------
   function tick() {
-    diag["шум / порог"] = `${noise.toFixed(4)} / ${Math.max(noise * 3, 0.01).toFixed(4)}`;
+    diag["уровень / шум / порог"] = `${level.toFixed(4)} / ${noise.toFixed(4)} / ${lastThr.toFixed(4)}`;
+    diag["пик голоса"] = peak ? peak.toFixed(4) : "—";
+    if (document.getElementById("diag").classList.contains("open")) renderDiag();
     let progress = 0;
     if ((state === "listening" || state === "thinking") && utter.hasSpeech && !voiceActive) {
       const silence = performance.now() - lastVoicedAt;
