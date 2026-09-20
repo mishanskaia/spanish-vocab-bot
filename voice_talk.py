@@ -146,8 +146,10 @@ def _request_owner_id(request: web.Request) -> int | None:
 # Conversation setup
 # ---------------------------------------------------------------------------
 
-def build_instructions(target_words) -> str:
+def build_instructions(target_words, facts=()) -> str:
     word_lines = "\n".join(f"- {w['phrase']} — {w['meaning']}" for w in target_words)
+    facts_block = ("\n".join(f"- {f}" for f in facts) if facts
+                   else "- (todavía no sabes nada de ella — es vuestra primera conversación)")
     # Priorities rewritten after the first live test (2026-09-19): v1 put the target
     # words first and said "switch word every 2-3 turns" + "recast her idea" — the
     # result was a questionnaire that jumped topics and parroted her back before
@@ -175,7 +177,7 @@ Keeping the thread:
 
 Target words:
 - Use one only when it fits the current topic naturally: ask something whose natural answer needs it.
-- Don't say a target word yourself before she has used it, don't list them, don't mention that they are targets.
+- Don't say a target word yourself before she has used it — this includes your opening line, where it is tempting. Ask around the word so she reaches for it. Don't list them, don't mention that they are targets.
 - It's fine if only 2–3 of them come up in the whole conversation.
 
 Mistakes:
@@ -185,6 +187,12 @@ Mistakes:
 - If she uses a Russian word because she doesn't know the Spanish one, SAY it out loud at the start of your reply — the Russian word, then the Spanish: "«Шапка» en español es «el gorro»." (write the Russian word in Cyrillic; it is read aloud). Then react to what she said and continue.
 - If she asks what a Spanish word means, you may give the Russian translation in one short phrase — keep the Spanish word in Latin letters: "«Frontera» es «граница»." Then continue in Spanish.
 - If she seems lost or asks (even in Russian) to repeat, say it again more simply.
+
+What you already know about her (from your earlier conversations — she expects you to remember):
+{facts_block}
+
+- Never ask about something on that list; build on it instead ("¿Cómo están tus gatos?" rather than "¿Tienes gatos?").
+- Don't recite the list back to her and don't say you read it somewhere — you simply remember.
 
 Start: greet her briefly and open your chosen topic with a question.
 
@@ -281,12 +289,12 @@ def _history_to_messages(history, user_text: str | None) -> list[dict]:
     return messages
 
 
-def claude_turn(target_words, history, user_text: str | None) -> tuple[dict, dict]:
+def claude_turn(target_words, history, user_text: str | None, facts=()) -> tuple[dict, dict]:
     """Sync (blocking) — call through asyncio.to_thread."""
     response = ai_helper.client.messages.create(
         model=TALK_LLM_MODEL,
         max_tokens=600,
-        system=build_instructions(target_words) + TURN_FORMAT,
+        system=build_instructions(target_words, facts) + TURN_FORMAT,
         messages=_history_to_messages(history, user_text),
         output_config={"format": {"type": "json_schema", "schema": TURN_SCHEMA}},
         # the system prompt and history repeat on every turn — cache reads are 0.1x
@@ -348,7 +356,7 @@ async def handle_start(request: web.Request) -> web.Response:
     timings, usage = {}, {}
     try:
         t = time.monotonic()
-        data, usage = await asyncio.to_thread(claude_turn, target_words, [], None)
+        data, usage = await asyncio.to_thread(claude_turn, target_words, [], None, db.get_talk_memory(user_id))
         timings["llm_ms"] = round((time.monotonic() - t) * 1000)
         reply = data.get("reply", "").strip() or "¡Hola! ¿Qué tal tu día?"
         audio_b64 = await _speak(reply, usage, timings)
@@ -413,7 +421,7 @@ async def handle_turn(request: web.Request) -> web.Response:
     try:
         t = time.monotonic()
         reply_task = asyncio.ensure_future(asyncio.to_thread(
-            claude_turn, session["target_words"], history, user_text + marker
+            claude_turn, session["target_words"], history, user_text + marker, db.get_talk_memory(user_id)
         ))
         if mode == "auto":
             last_bot = next((str(h.get("text", "")) for h in reversed(history) if h.get("role") == "assistant"), "")
@@ -475,6 +483,12 @@ async def handle_transcript(request: web.Request) -> web.Response:
     already_done = session["status"] == "done"
     db.save_voice_transcript(session_id, transcript, usage, ended)
 
+    if ended and not already_done:
+        try:
+            await asyncio.to_thread(update_memory, user_id, transcript)
+        except Exception:
+            logger.exception("talk: failed to update memory")
+
     if ended and not already_done and _bot is not None:
         try:
             session = db.get_voice_session(session_id)
@@ -487,6 +501,47 @@ async def handle_transcript(request: web.Request) -> web.Response:
         except Exception:
             logger.exception("failed to send voice session summary")
     return web.json_response({"ok": True})
+
+
+MEMORY_MAX_FACTS = 30
+MEMORY_PROMPT = """You keep the memory of a Spanish-speaking friend who chats with a Russian-speaking learner (A1–A2) by voice.
+
+You get what you already remember about her plus the transcript of the conversation that just ended. Return the updated memory.
+
+Rules:
+- Keep durable facts about her life: family, pets (with names), work, city, travel, tastes, habits, plans, notable things that happened to her. One short sentence each, in simple Spanish.
+- Merge, don't duplicate: update a fact if the transcript contradicts or refines it, drop anything that turned out wrong.
+- Do NOT keep: her Spanish mistakes, vocabulary she looked up, what the bot said, one-off small talk, anything about the conversation itself.
+- The transcript is speech-to-text and may be garbled; keep only what is clearly stated.
+- At most {max_facts} facts, most useful first."""
+
+MEMORY_SCHEMA = {
+    "type": "object",
+    "properties": {"facts": {"type": "array", "items": {"type": "string"}}},
+    "required": ["facts"],
+    "additionalProperties": False,
+}
+
+
+def update_memory(user_id: int, transcript) -> list:
+    """Sync (blocking) — call through asyncio.to_thread. Rewrites her memory from the
+    previous one plus this conversation, so the bot stops asking what it already knows."""
+    spoken = "\n".join(f"{'ОНА' if t['role'] == 'user' else 'BOT'}: {t['text']}" for t in transcript if t.get("text"))
+    if not spoken.strip():
+        return db.get_talk_memory(user_id)
+    known = db.get_talk_memory(user_id)
+    response = ai_helper.client.messages.create(
+        model=TALK_LLM_MODEL,
+        max_tokens=1000,
+        system=MEMORY_PROMPT.format(max_facts=MEMORY_MAX_FACTS),
+        messages=[{"role": "user", "content": f"Lo que ya recuerdas:\n" + ("\n".join(f"- {f}" for f in known) or "- (nada)") + f"\n\nConversación:\n{spoken}"}],
+        output_config={"format": {"type": "json_schema", "schema": MEMORY_SCHEMA}},
+    )
+    text = next((b.text for b in response.content if b.type == "text"), "{}")
+    facts = [str(f).strip()[:200] for f in (json.loads(text).get("facts") or []) if str(f).strip()]
+    facts = facts[:MEMORY_MAX_FACTS]
+    db.set_talk_memory(user_id, facts)
+    return facts
 
 
 # ---------------------------------------------------------------------------

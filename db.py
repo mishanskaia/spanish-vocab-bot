@@ -250,6 +250,15 @@ def init_db():
         conn.execute("ALTER TABLE voice_sessions ADD COLUMN found_words TEXT DEFAULT '[]'")
     except sqlite3.OperationalError:
         pass
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS talk_memory (
+            user_id INTEGER PRIMARY KEY,
+            facts TEXT DEFAULT '[]',
+            updated_at TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -1093,3 +1102,28 @@ def add_voice_found_words(session_id: int, pairs) -> list:
     conn.commit()
     conn.close()
     return found
+
+
+def get_talk_memory(user_id: int) -> list:
+    """What the conversation partner already knows about her — one row per user,
+    rewritten after every session (see voice_talk.update_memory)."""
+    conn = get_connection()
+    row = conn.execute("SELECT facts FROM talk_memory WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    if row is None:
+        return []
+    try:
+        return json.loads(row["facts"] or "[]")
+    except json.JSONDecodeError:
+        return []
+
+
+def set_talk_memory(user_id: int, facts):
+    conn = get_connection()
+    conn.execute(
+        """INSERT INTO talk_memory (user_id, facts, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET facts = excluded.facts, updated_at = excluded.updated_at""",
+        (user_id, json.dumps(list(facts), ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
