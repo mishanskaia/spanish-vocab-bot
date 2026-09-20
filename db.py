@@ -250,6 +250,11 @@ def init_db():
         conn.execute("ALTER TABLE voice_sessions ADD COLUMN found_words TEXT DEFAULT '[]'")
     except sqlite3.OperationalError:
         pass
+    try:
+        # per target word: who said it first — {"el gorro": "spontaneous" | "after_hint" | "hinted"}
+        conn.execute("ALTER TABLE voice_sessions ADD COLUMN word_use TEXT DEFAULT '{}'")
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS talk_memory (
@@ -1054,7 +1059,7 @@ def get_voice_session(session_id: int):
     if row is None:
         return None
     d = dict(row)
-    for key, default in (("target_words", []), ("transcript", []), ("usage", {}), ("found_words", [])):
+    for key, default in (("target_words", []), ("transcript", []), ("usage", {}), ("found_words", []), ("word_use", {})):
         try:
             d[key] = json.loads(d[key]) if d[key] else default
         except json.JSONDecodeError:
@@ -1124,6 +1129,16 @@ def set_talk_memory(user_id: int, facts):
         """INSERT INTO talk_memory (user_id, facts, updated_at) VALUES (?, ?, ?)
            ON CONFLICT(user_id) DO UPDATE SET facts = excluded.facts, updated_at = excluded.updated_at""",
         (user_id, json.dumps(list(facts), ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_voice_word_use(session_id: int, word_use: dict):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE voice_sessions SET word_use = ? WHERE id = ?",
+        (json.dumps(word_use, ensure_ascii=False), session_id),
     )
     conn.commit()
     conn.close()
