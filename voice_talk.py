@@ -133,6 +133,12 @@ def _link_token_user_id(token: str) -> int | None:
         return None
 
 
+def request_owner_id(request: web.Request) -> int | None:
+    """Owner-only auth shared with the other Mini App pages (see word_catalog.py):
+    same initData / signed-link check, one implementation."""
+    return _request_owner_id(request)
+
+
 def _request_owner_id(request: web.Request) -> int | None:
     user_id = _init_data_user_id(request.headers.get("X-Tg-Init-Data", "")) or _link_token_user_id(
         request.headers.get("X-Talk-Token", "")
