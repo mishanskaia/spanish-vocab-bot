@@ -1158,3 +1158,29 @@ def set_voice_analysis(session_id: int, analysis: dict):
     )
     conn.commit()
     conn.close()
+
+
+def get_recent_voice_sessions(user_id: int, limit: int = 10) -> list:
+    """Finished conversations, newest first — for the weekly speech report."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT * FROM voice_sessions WHERE user_id = ? AND status = 'done'
+           ORDER BY id DESC LIMIT ?""",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return [get_voice_session(r["id"]) for r in rows]
+
+
+def get_known_words(user_id: int, limit: int = 80) -> list:
+    """Words she has actually met in review (not fresh 'collected' ones) — the pool for
+    "you know this word, it would have fitted here". Most-learned first."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT phrase, meaning FROM words
+           WHERE user_id = ? AND status IN ('learning', 'familiar', 'active', 'mastered')
+           ORDER BY interval_stage DESC, last_reviewed DESC LIMIT ?""",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
