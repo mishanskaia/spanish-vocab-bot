@@ -255,6 +255,11 @@ def init_db():
         conn.execute("ALTER TABLE voice_sessions ADD COLUMN word_use TEXT DEFAULT '{}'")
     except sqlite3.OperationalError:
         pass
+    try:
+        # post-conversation review: {"errors": [...], "upgrades": [...]} — see voice_talk.analyze_conversation
+        conn.execute("ALTER TABLE voice_sessions ADD COLUMN analysis TEXT DEFAULT '{}'")
+    except sqlite3.OperationalError:
+        pass
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS talk_memory (
@@ -1059,7 +1064,8 @@ def get_voice_session(session_id: int):
     if row is None:
         return None
     d = dict(row)
-    for key, default in (("target_words", []), ("transcript", []), ("usage", {}), ("found_words", []), ("word_use", {})):
+    for key, default in (("target_words", []), ("transcript", []), ("usage", {}), ("found_words", []),
+                         ("word_use", {}), ("analysis", {})):
         try:
             d[key] = json.loads(d[key]) if d[key] else default
         except json.JSONDecodeError:
@@ -1139,6 +1145,16 @@ def set_voice_word_use(session_id: int, word_use: dict):
     conn.execute(
         "UPDATE voice_sessions SET word_use = ? WHERE id = ?",
         (json.dumps(word_use, ensure_ascii=False), session_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_voice_analysis(session_id: int, analysis: dict):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE voice_sessions SET analysis = ? WHERE id = ?",
+        (json.dumps(analysis, ensure_ascii=False), session_id),
     )
     conn.commit()
     conn.close()

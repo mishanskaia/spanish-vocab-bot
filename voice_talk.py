@@ -497,22 +497,34 @@ async def handle_transcript(request: web.Request) -> web.Response:
     db.save_voice_transcript(session_id, transcript, usage, ended)
 
     if ended and not already_done:
+        # memory and the review are independent — run them side by side, then report
+        memory_task = asyncio.ensure_future(asyncio.to_thread(update_memory, user_id, transcript))
+        analysis_task = asyncio.ensure_future(asyncio.to_thread(analyze_conversation, transcript))
         try:
-            await asyncio.to_thread(update_memory, user_id, transcript)
+            await memory_task
         except Exception:
             logger.exception("talk: failed to update memory")
-
-    if ended and not already_done and _bot is not None:
+        analysis = {}
         try:
-            session = db.get_voice_session(session_id)
-            await _bot.send_message(
-                user_id,
-                build_summary(session),
-                parse_mode="HTML",
-                reply_markup=found_words_keyboard(session),
-            )
+            analysis = await analysis_task
+            db.set_voice_analysis(session_id, analysis)
         except Exception:
-            logger.exception("failed to send voice session summary")
+            logger.exception("talk: failed to analyse the conversation")
+
+        if _bot is not None:
+            try:
+                session = db.get_voice_session(session_id)
+                await _bot.send_message(
+                    user_id,
+                    build_summary(session),
+                    parse_mode="HTML",
+                    reply_markup=found_words_keyboard(session),
+                )
+                message = build_analysis_message(analysis)
+                if message:
+                    await _bot.send_message(user_id, message, parse_mode="HTML")
+            except Exception:
+                logger.exception("failed to send voice session summary")
     return web.json_response({"ok": True})
 
 
@@ -555,6 +567,103 @@ def update_memory(user_id: int, transcript) -> list:
     facts = facts[:MEMORY_MAX_FACTS]
     db.set_talk_memory(user_id, facts)
     return facts
+
+
+ANALYSIS_MAX_ERRORS = 5
+ANALYSIS_MAX_UPGRADES = 4
+ANALYSIS_PROMPT = """You review a voice conversation that a Russian-speaking learner of Spanish (A1–A2, a woman) has just had with a Spanish-speaking friend. You write two blocks for her: what was wrong, and how it could sound better. Explanations in Russian, Spanish stays in Spanish.
+
+The transcript is speech-to-text of the real conversation. ОНА = her, BOT = the bot. Only her lines are reviewed.
+
+"errors" — real mistakes in her Spanish: wrong word for the meaning, wrong verb form or tense, gender/number agreement, articles, prepositions, ser/estar, word order.
+- "said": her own words, short (quote only the part that is wrong, with just enough around it).
+- "fix": the same thing said correctly.
+- "why": a few words in Russian naming the rule — «прошедшее время ir», «род прилагательного», «предлог с ir».
+- Only real mistakes. Correct but plain phrasing belongs in "upgrades", not here.
+- She is a woman: adjectives about herself are feminine ("estoy cansada"). Never "correct" that.
+- Ignore speech-to-text artifacts: punctuation, missing accent marks, repeated words, «э-э».
+- A Russian word she used is a vocabulary gap, not a mistake — skip it.
+- Both European and Latin American Spanish are correct.
+- At most {max_errors}, most important first: what breaks understanding, or what she repeats.
+
+"upgrades" — the same idea said better, for phrases that were already correct but plain.
+- "said": her phrase from the transcript. "better": the improved version, A2–B1, natural, still sayable by her. "why": a short Russian note — «звучит естественнее», «готовый оборот для причины».
+- Include at least one ready-made chunk she can reuse (es que…, la verdad es que…, me da igual, al final…, o sea…) when it fits something she actually said.
+- Never invent phrases she didn't say.
+- At most {max_upgrades}.
+
+If she barely spoke or there is nothing worth saying, return empty lists."""
+
+ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "errors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"said": {"type": "string"}, "fix": {"type": "string"}, "why": {"type": "string"}},
+                "required": ["said", "fix", "why"],
+                "additionalProperties": False,
+            },
+        },
+        "upgrades": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"said": {"type": "string"}, "better": {"type": "string"}, "why": {"type": "string"}},
+                "required": ["said", "better", "why"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["errors", "upgrades"],
+    "additionalProperties": False,
+}
+
+
+def analyze_conversation(transcript) -> dict:
+    """Sync (blocking) — call through asyncio.to_thread. Two blocks she asked for:
+    mistakes, and how the same thing could sound better."""
+    spoken = "\n".join(f"{'ОНА' if t['role'] == 'user' else 'BOT'}: {t['text']}" for t in transcript if t.get("text"))
+    if sum(1 for t in transcript if t.get("role") == "user" and t.get("text")) < 2:
+        return {"errors": [], "upgrades": []}
+    response = ai_helper.client.messages.create(
+        model=TALK_LLM_MODEL,
+        max_tokens=1500,
+        system=ANALYSIS_PROMPT.format(max_errors=ANALYSIS_MAX_ERRORS, max_upgrades=ANALYSIS_MAX_UPGRADES),
+        messages=[{"role": "user", "content": spoken}],
+        output_config={"format": {"type": "json_schema", "schema": ANALYSIS_SCHEMA}},
+    )
+    text = next((b.text for b in response.content if b.type == "text"), "{}")
+    data = json.loads(text)
+    return {
+        "errors": [e for e in (data.get("errors") or []) if e.get("said") and e.get("fix")][:ANALYSIS_MAX_ERRORS],
+        "upgrades": [u for u in (data.get("upgrades") or []) if u.get("said") and u.get("better")][:ANALYSIS_MAX_UPGRADES],
+    }
+
+
+def build_analysis_message(analysis: dict) -> str | None:
+    errors, upgrades = analysis.get("errors") or [], analysis.get("upgrades") or []
+    if not errors and not upgrades:
+        return None
+    lines = ["📝 <b>Разбор разговора</b>", ""]
+    lines.append("<b>Ошибки</b>")
+    if errors:
+        for e in errors:
+            lines.append(
+                f"• <s>{html.escape(e['said'])}</s> → <b>{html.escape(e['fix'])}</b>"
+                + (f"\n  <i>{html.escape(e['why'])}</i>" if e.get("why") else "")
+            )
+    else:
+        lines.append("• Ошибок не нашла 🎉")
+    if upgrades:
+        lines += ["", "<b>Как сказать лучше</b>"]
+        for u in upgrades:
+            lines.append(
+                f"• {html.escape(u['said'])} → <b>{html.escape(u['better'])}</b>"
+                + (f"\n  <i>{html.escape(u['why'])}</i>" if u.get("why") else "")
+            )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
