@@ -1604,8 +1604,9 @@ async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     safari_url = f"{base}/catalog?t={voice_talk.make_link_token(user_id)}"
     await update.message.reply_text(
-        "📚 Топ-3000 слов испанского. Отмечено то, что уже в твоём словаре; "
-        "любое слово добавляется в одно касание — карточку соберёт Claude, как обычно.",
+        "📚 Словарь: топ-3000 слов и 200+ живых разговорных фраз (отдельная вкладка). "
+        "Отмечено то, что уже у тебя есть; любое добавляется в одно касание — "
+        "карточку соберёт Claude, как обычно.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("Открыть словарь", web_app=WebAppInfo(url=f"{base}/catalog"))],
             [InlineKeyboardButton("Открыть в Safari", url=safari_url)],

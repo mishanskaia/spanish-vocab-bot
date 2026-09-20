@@ -77,7 +77,21 @@ async def main():
     check("артикль отбрасывается", word_catalog.normalize("La Casa") == "casa"
           and word_catalog.normalize("¿cuánto?") == "cuánto")
 
-    print("\n2. Доступ")
+    print("\n2. Фразы")
+    phrases = word_catalog.load_phrases()
+    check("фраз 200–300", 200 <= len(phrases) <= 300)
+    check("у каждой фразы есть перевод и группа",
+          all(p.get("es") and p.get("ru") and p.get("cat") for p in phrases))
+    check("регион помечен только допустимыми значениями",
+          all(p.get("region") in ("", "es", "la") for p in phrases))
+    check("большинство фраз нейтральные",
+          sum(1 for p in phrases if not p["region"]) > len(phrases) * 0.9)
+    pkeys = [word_catalog.normalize(p["es"]) for p in phrases]
+    check("фразы не повторяются", len(pkeys) == len(set(pkeys)))
+    check("есть заполнители, связки и конструкции",
+          {"pues", "o sea", "por cierto", "tengo que", "de vez en cuando"} <= set(pkeys))
+
+    print("\n3. Доступ")
     app = web.Application()
     word_catalog.register(app, add_word=fake_add)
     client = TestClient(TestServer(app))
@@ -94,16 +108,19 @@ async def main():
 
     voice_talk.request_owner_id = lambda request: OWNER_ID  # авторизованный владелец
 
-    print("\n3. Что уже в словаре")
+    print("\n4. Что уже в словаре")
+    db.add_word(OWNER_ID, "por cierto", "кстати", "другое", "A2", ["a — б"])
     state = await (await client.get("/catalog/state")).json()
     known = set(state["known"])
-    check("всего слов в ответе", state["total"] == len(words))
+    check("всего слов и фраз в ответе",
+          state["total"] == len(words) and state["totalPhrases"] == len(phrases))
+    check("добавленная фраза отмечена", "por cierto" in known)
     check("«el agua» из базы найдено как «agua» в списке", "agua" in known)
     check("глагол из базы найден", "hablar" in known)
     check("«playa» есть и там, и там", "playa" in known)
     check("не добавленного слова в известных нет", "casa" not in known)
 
-    print("\n4. Добавление")
+    print("\n5. Добавление")
     res = await client.post("/catalog/add", json={"es": "casa"})
     data = await res.json()
     check("добавление возвращает канонический вид", data == {
@@ -118,10 +135,12 @@ async def main():
     res = await client.post("/catalog/add", json={})
     check("пустой запрос → 400", res.status == 400)
 
-    print("\n5. Данные для страницы")
+    print("\n6. Данные для страницы")
     payload = await (await client.get("/catalog/data")).json()
     check("отдаётся весь список с темами",
           len(payload["words"]) == len(words) and len(payload["categories"]) >= 50)
+    check("фразы приходят тем же запросом",
+          len(payload["phrases"]) == len(phrases) and len(payload["phraseCategories"]) >= 10)
 
     await client.close()
     print()

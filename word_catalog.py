@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 
 PAGE_PATH = Path(__file__).parent / "static" / "catalog.html"
 DATA_PATH = Path(__file__).parent / "static" / "top3000.json"
+PHRASES_PATH = Path(__file__).parent / "static" / "phrases.json"
 
 _ARTICLES = ("el ", "la ", "los ", "las ", "un ", "una ", "unos ", "unas ")
 
@@ -35,19 +36,29 @@ def normalize(phrase: str) -> str:
 
     Two catalog entries can collapse to one key — «¿verdad?» and «verdad» are the only
     such pair in the current list, and adding either just ticks both rows."""
-    text = (phrase or "").strip().lower().strip("¿?¡!.,;:")
+    # The ellipsis matters: chunks are listed as «tengo que…», the bot stores «tengo que».
+    text = (phrase or "").strip().lower().strip("¿?¡!.,;:… ")
     for article in _ARTICLES:
         if text.startswith(article):
             return text[len(article):]
     return text
 
 
-def load_words() -> list[dict]:
+def _load(path: Path, key: str) -> dict:
     try:
-        return json.loads(DATA_PATH.read_text(encoding="utf-8"))["words"]
-    except (OSError, ValueError, KeyError):
-        logger.exception("top3000.json is missing or unreadable")
-        return []
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.exception("%s is missing or unreadable", path.name)
+        return {"categories": [], key: []}
+
+
+def load_words() -> list[dict]:
+    return _load(DATA_PATH, "words").get("words", [])
+
+
+def load_phrases() -> list[dict]:
+    """Conversational chunks (tools/build_phrases.py) — the second tab of the same page."""
+    return _load(PHRASES_PATH, "phrases").get("phrases", [])
 
 
 def known_keys(user_id: int) -> set[str]:
@@ -59,21 +70,30 @@ async def handle_page(request: web.Request) -> web.Response:
 
 
 async def handle_data(request: web.Request) -> web.Response:
+    """Both tabs in one response: the 3000 words and the conversational chunks."""
     if voice_talk.request_owner_id(request) is None:
         return web.json_response({"error": "unauthorized"}, status=401)
-    return web.FileResponse(DATA_PATH, headers={"Cache-Control": "no-store"})
+    words, phrases = _load(DATA_PATH, "words"), _load(PHRASES_PATH, "phrases")
+    return web.json_response({
+        "words": words.get("words", []),
+        "categories": words.get("categories", []),
+        "phrases": phrases.get("phrases", []),
+        "phraseCategories": phrases.get("categories", []),
+    })
 
 
 async def handle_state(request: web.Request) -> web.Response:
-    """Which catalog words the user already has — the page marks them and counts progress."""
+    """Which catalog entries the user already has — the page ticks them and counts progress."""
     user_id = voice_talk.request_owner_id(request)
     if user_id is None:
         return web.json_response({"error": "unauthorized"}, status=401)
     known = known_keys(user_id)
-    catalog = load_words()
+    words, phrases = load_words(), load_phrases()
+    catalog_keys = {normalize(item["es"]) for item in words + phrases}
     return web.json_response({
-        "known": sorted(k for k in {normalize(w["es"]) for w in catalog} if k in known),
-        "total": len(catalog),
+        "known": sorted(k for k in catalog_keys if k in known),
+        "total": len(words),
+        "totalPhrases": len(phrases),
     })
 
 
