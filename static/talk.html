@@ -142,6 +142,16 @@
     // while she was talking and the bot cut in (first live test, 2026-09-19). Now the room level is
     // the quietest moment of the last 2 s: talking always dips to room level between words, so
     // speech can't drag it up, while steady background (TV, fan) becomes the new floor within 2 s.
+    // Loudness alone can't tell her voice from the cat running past or a door: any sound
+    // above the threshold used to reset the pause timer, so the bot kept waiting (fourth
+    // live test). A voice has a pitch — vowels repeat at 70-300 Hz — while steps, rustling
+    // and knocks are noise with no period. Only a periodic sound resets the timer.
+    VOICE_PERIODICITY: 0.4,       // normalized autocorrelation peak, 0..1 — clear voice
+    VOICE_PERIODICITY_WEAK: 0.2,  // inside speech, right after a clear voiced frame: consonants and
+    VOICE_HOLD_MS: 500,           // breathy endings count too, so a phrase doesn't break apart
+    PITCH_MIN_HZ: 70,
+    PITCH_MAX_HZ: 320,
+    PITCH_WINDOW_MS: 64,     // enough for two periods of the lowest pitch
     NOISE_WINDOW_MS: 2000,
     START_FACTOR: 3,       // voice starts at 3x the room level…
     KEEP_FACTOR: 2.2,      // …and once she's mid-utterance, quieter parts at 2.2x still count as voice
@@ -167,7 +177,7 @@
 
   const diag = {
     "где": initData ? "Telegram" : (linkToken ? "браузер (ссылка)" : "без авторизации"),
-    "микрофон": "—", "экран не гаснет": "—", "аудио": "—", "уровень / шум / порог": "—", "пик голоса": "—",
+    "микрофон": "—", "экран не гаснет": "—", "аудио": "—", "уровень / шум / порог": "—", "периодичность": "—", "пик голоса": "—",
     "последний ход": "—", "сессия": "—",
   };
   function renderDiag() {
@@ -201,6 +211,7 @@
   let inflight = null, turnSeq = 0;
   let noise = 0.004, voicedRun = 0, voiceActive = false, lastVoicedAt = 0, ignoreUntil = 0;
   let noiseWin = [], noiseWinMs = 0, echo = 0.006, aboveStreak = 0, level = 0, lastThr = 0, peak = 0, runStartedAt = 0;
+  let pitchBuf = null, dsFactor = 1, lagMin = 0, lagMax = 0, periodicity = 0, lastPitchAt = -1e9;
   let checkedFor = -1, stuckFor = -1, waitingHint = false;
   let preroll = [], prerollMs = 0;
   let utter = newUtter();
@@ -225,6 +236,7 @@
     let h = "";
     if (state === "listening" && waitingHint) h = "Жду — подбирай слово спокойно";
     else if (state === "listening" && utter.hasSpeech) h = "Договорила? Нажми на шар";
+    else if (state === "listening") h = "Говори — или нажми на шар, если не слышит";
     else if (state === "speaking") h = "Нажми на шар, чтобы пропустить";
     else if (state === "paused") h = "Нажми ▶, чтобы продолжить";
     else if (state === "ended") h = "Итог — в чате с ботом";
@@ -309,6 +321,44 @@
   }
   registerProcessor("tap", Tap);`;
 
+  // --- is this sound periodic (a voice) or just noise (the cat, a door, the street)? ---
+  function setupPitch() {
+    dsFactor = Math.max(1, Math.round(ctx.sampleRate / 8000));
+    const rate = ctx.sampleRate / dsFactor;
+    pitchBuf = new Float32Array(Math.round((CFG.PITCH_WINDOW_MS / 1000) * rate));
+    lagMin = Math.floor(rate / CFG.PITCH_MAX_HZ);
+    lagMax = Math.ceil(rate / CFG.PITCH_MIN_HZ);
+  }
+
+  function pushPitchSamples(f32) {
+    const out = Math.floor(f32.length / dsFactor);
+    pitchBuf.copyWithin(0, out);
+    let w = pitchBuf.length - out;
+    for (let i = 0; i + dsFactor <= f32.length; i += dsFactor) {
+      let sum = 0;
+      for (let j = 0; j < dsFactor; j++) sum += f32[i + j];
+      pitchBuf[w++] = sum / dsFactor;
+    }
+  }
+
+  function measurePeriodicity() {
+    const n = pitchBuf.length;
+    let best = 0;
+    for (let lag = lagMin; lag <= lagMax; lag++) {
+      let num = 0, e1 = 0, e2 = 0;
+      for (let i = 0; i + lag < n; i++) {
+        const a = pitchBuf[i], b = pitchBuf[i + lag];
+        num += a * b; e1 += a * a; e2 += b * b;
+      }
+      const denom = Math.sqrt(e1 * e2);
+      if (denom > 1e-9) {
+        const r = num / denom;
+        if (r > best) best = r;
+      }
+    }
+    return best;
+  }
+
   function onChunk(f32) {
     const dt = (f32.length / ctx.sampleRate) * 1000;
     const now = performance.now();
@@ -342,7 +392,14 @@
     }
     lastThr = thr;
 
-    aboveStreak = rms > thr && now > ignoreUntil ? aboveStreak + 1 : 0;
+    pushPitchSamples(f32);
+    const loudEnough = rms > thr && now > ignoreUntil;
+    periodicity = loudEnough ? measurePeriodicity() : 0;
+    // loud AND periodic: the cat, a knock or the street are loud but have no pitch
+    if (periodicity >= CFG.VOICE_PERIODICITY) lastPitchAt = now;
+    const humanSound = periodicity >= CFG.VOICE_PERIODICITY
+      || (periodicity >= CFG.VOICE_PERIODICITY_WEAK && now - lastPitchAt < CFG.VOICE_HOLD_MS);
+    aboveStreak = loudEnough && humanSound ? aboveStreak + 1 : 0;
     const voiced = aboveStreak >= 2;  // a one-frame spike (a clink, a click) isn't voice
     if (voiced) {
       if (voicedRun === 0) runStartedAt = now;
@@ -530,6 +587,7 @@
   // ---------- timer: silence → check / stuck, ring ----------
   function tick() {
     diag["уровень / шум / порог"] = `${level.toFixed(4)} / ${noise.toFixed(4)} / ${lastThr.toFixed(4)}`;
+    diag["периодичность"] = `${periodicity.toFixed(2)} (нужно ${CFG.VOICE_PERIODICITY})`;
     diag["пик голоса"] = peak ? peak.toFixed(4) : "—";
     if (document.getElementById("diag").classList.contains("open")) renderDiag();
     let progress = 0;
@@ -560,6 +618,7 @@
       const track = micStream.getAudioTracks()[0];
       diag["микрофон"] = "да (" + (track.label || "без имени") + ")"; renderDiag();
       await ctx.resume();
+      setupPitch();
       await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([WORKLET], { type: "application/javascript" })));
       const node = new AudioWorkletNode(ctx, "tap");
       node.port.onmessage = (e) => onChunk(e.data);
@@ -631,7 +690,12 @@
     if (state === "speaking") {  // skip the rest of the bot's line
       stopPlayback(); ignoreUntil = performance.now() + CFG.ECHO_TAIL_MS; setState("listening"); return;
     }
-    if ((state === "listening" || state === "thinking") && utter.hasSpeech) sendTurn("done");  // "I'm done"
+    if ((state === "listening" || state === "thinking") && utter.hasSpeech) { sendTurn("done"); return; }  // "I'm done"
+    if (state === "listening") {  // fallback if the mic never hears her: tap to start, tap again to send
+      beginUtterFromPreroll();
+      lastVoicedAt = performance.now();
+      renderHint();
+    }
   };
   pauseBtn.onclick = togglePause;
   endBtn.onclick = end;

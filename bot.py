@@ -1470,6 +1470,30 @@ async def canceltopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Живой разговор голосом — owner-only Mini App (спайк), вся логика в voice_talk.py
 # ---------------------------------------------------------------------------
 
+async def talkmemory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """What the conversation partner remembers about her, so it stops re-asking."""
+    user_id = update.effective_user.id
+    if not _is_owner(user_id):
+        return
+    facts = db.get_talk_memory(user_id)
+    if not facts:
+        await update.message.reply_text("Пока ничего не запомнила — память наполняется после разговоров.")
+        return
+    await update.message.reply_text(
+        "🧠 Что бот помнит о тебе:\n" + "\n".join(f"• {_md(f)}" for f in facts)
+        + "\n\n/talkforget — стереть.",
+        parse_mode="Markdown",
+    )
+
+
+async def talkforget(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not _is_owner(user_id):
+        return
+    db.set_talk_memory(user_id, [])
+    await update.message.reply_text("Память о разговорах стёрта.")
+
+
 async def talk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not _is_owner(user_id):
@@ -1746,6 +1770,8 @@ OWNER_ONLY_COMMANDS = [
     ("canceltopic", "Отменить тему Study Coach"),
     ("practice", "Вечерняя практика прямо сейчас"),
     ("talk", "Живой разговор голосом (тест)"),
+    ("talkmemory", "Что бот помнит о тебе"),
+    ("talkforget", "Стереть память разговоров"),
 ]
 
 
@@ -1783,6 +1809,8 @@ def main():
     app.add_handler(CommandHandler("canceltopic", canceltopic))
     app.add_handler(CommandHandler("practice", practice))
     app.add_handler(CommandHandler("talk", talk))
+    app.add_handler(CommandHandler("talkmemory", talkmemory))
+    app.add_handler(CommandHandler("talkforget", talkforget))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))

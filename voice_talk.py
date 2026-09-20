@@ -146,8 +146,10 @@ def _request_owner_id(request: web.Request) -> int | None:
 # Conversation setup
 # ---------------------------------------------------------------------------
 
-def build_instructions(target_words) -> str:
+def build_instructions(target_words, facts=()) -> str:
     word_lines = "\n".join(f"- {w['phrase']} — {w['meaning']}" for w in target_words)
+    facts_block = ("\n".join(f"- {f}" for f in facts) if facts
+                   else "- (todavía no sabes nada de ella — es vuestra primera conversación)")
     # Priorities rewritten after the first live test (2026-09-19): v1 put the target
     # words first and said "switch word every 2-3 turns" + "recast her idea" — the
     # result was a questionnaire that jumped topics and parroted her back before
@@ -167,6 +169,13 @@ How a turn sounds:
 - Do NOT start by repeating what she said. Never echo her whole sentence back.
 - Simple A1–A2 words, short sentences (up to ~12 words). Keep your turn to 2–3 sentences.
 
+What to ask about — simple words, grown-up content:
+- She is an adult: simple LANGUAGE, but the question itself should be worth answering. Ask about experience, opinion, reasons, comparisons, choices, plans, funny or annoying moments.
+- Good: "¿Qué es lo más difícil de vivir con tres gatos?", "¿Prefieres cocinar sola o con alguien? ¿Por qué?", "¿Qué te sorprendió de Georgia?", "Si tuvieras un mes libre, ¿adónde irías?".
+- Weak, avoid: colours, sizes, counts, yes/no facts and anything answerable in one word — "¿De qué color es tu gorro?", "¿Tienes gatos?", "¿Vas mucho a la peluquería?".
+- Aim for an answer of 2–3 sentences. Never ask two questions at once, and don't chain "¿por qué?" every turn — sometimes react, share your own take, and ask something new.
+- If the answer needs a word she probably doesn't know, put that word in your question, so she can reuse it.
+
 Keeping the thread:
 - The topic is whatever she is talking about right now. Go deeper into it with follow-up questions (why, how, with whom, what happened next).
 - If she asks you something — what a word means, how to say something, your opinion, anything — answer it first, clearly and simply. Your follow-up question is then about what SHE asked (that word in her life, that thing she's curious about), not a way back to the earlier topic: after "¿Qué es peluquería?" ask "¿Vas mucho a la peluquería?", not "¿Fuiste a la peluquería en Georgia?". Never steer back after she moved on ("bueno, volviendo a…").
@@ -175,16 +184,24 @@ Keeping the thread:
 
 Target words:
 - Use one only when it fits the current topic naturally: ask something whose natural answer needs it.
-- Don't say a target word yourself before she has used it, don't list them, don't mention that they are targets.
+- First give her the chance: ask around the word so she reaches for it, and don't say it yourself in that turn — this includes your opening line, where it is tempting.
+- If the chance passed and she didn't produce it (she went around it, said it in Russian, or got stuck), hand it to her right there in a natural sentence and let her use it straight away: "Ah, se dice «el gorro». ¿Y tú, llevas gorro cuando hace frío?" Quote the Russian word only if she actually said it in Russian; if she described it in Spanish, just give the Spanish. Then move on — don't drill the same word again later in the conversation.
+- Never list them, never mention that they are targets.
 - It's fine if only 2–3 of them come up in the whole conversation.
 
 Mistakes:
 - Don't explain grammar and don't stop the conversation to correct.
 - Only when she made a real mistake: slip the correct form into your reaction in passing (e.g. "¡Ah, fuiste al cine! ¿Y qué viste?"). If there was no mistake, don't repeat anything.
 - Never "correct" feminine forms she uses about herself.
-- If she uses a Russian word because she doesn't know the Spanish one, SAY it out loud at the start of your reply — the Russian word, then the Spanish: "«Шапка» en español es «el gorro»." (write the Russian word in Cyrillic; it is read aloud). Then react to what she said and continue.
+- If the Russian word is literally there in her message, SAY it out loud at the start of your reply — the Russian word, then the Spanish: "«Шапка» en español es «el gorro»." (write the Russian word in Cyrillic; it is read aloud). Then react to what she said and continue. If instead she described the thing in Spanish without knowing the word ("una cosa en la cabeza"), don't bring Russian into it at all — just "Ah, se dice «el gorro»" and continue.
 - If she asks what a Spanish word means, you may give the Russian translation in one short phrase — keep the Spanish word in Latin letters: "«Frontera» es «граница»." Then continue in Spanish.
 - If she seems lost or asks (even in Russian) to repeat, say it again more simply.
+
+What you already know about her (from your earlier conversations — she expects you to remember):
+{facts_block}
+
+- Never ask about something on that list; build on it instead ("¿Cómo están tus gatos?" rather than "¿Tienes gatos?").
+- Don't recite the list back to her and don't say you read it somewhere — you simply remember.
 
 Start: greet her briefly and open your chosen topic with a question.
 
@@ -281,12 +298,12 @@ def _history_to_messages(history, user_text: str | None) -> list[dict]:
     return messages
 
 
-def claude_turn(target_words, history, user_text: str | None) -> tuple[dict, dict]:
+def claude_turn(target_words, history, user_text: str | None, facts=()) -> tuple[dict, dict]:
     """Sync (blocking) — call through asyncio.to_thread."""
     response = ai_helper.client.messages.create(
         model=TALK_LLM_MODEL,
         max_tokens=600,
-        system=build_instructions(target_words) + TURN_FORMAT,
+        system=build_instructions(target_words, facts) + TURN_FORMAT,
         messages=_history_to_messages(history, user_text),
         output_config={"format": {"type": "json_schema", "schema": TURN_SCHEMA}},
         # the system prompt and history repeat on every turn — cache reads are 0.1x
@@ -348,7 +365,7 @@ async def handle_start(request: web.Request) -> web.Response:
     timings, usage = {}, {}
     try:
         t = time.monotonic()
-        data, usage = await asyncio.to_thread(claude_turn, target_words, [], None)
+        data, usage = await asyncio.to_thread(claude_turn, target_words, [], None, db.get_talk_memory(user_id))
         timings["llm_ms"] = round((time.monotonic() - t) * 1000)
         reply = data.get("reply", "").strip() or "¡Hola! ¿Qué tal tu día?"
         audio_b64 = await _speak(reply, usage, timings)
@@ -413,7 +430,7 @@ async def handle_turn(request: web.Request) -> web.Response:
     try:
         t = time.monotonic()
         reply_task = asyncio.ensure_future(asyncio.to_thread(
-            claude_turn, session["target_words"], history, user_text + marker
+            claude_turn, session["target_words"], history, user_text + marker, db.get_talk_memory(user_id)
         ))
         if mode == "auto":
             last_bot = next((str(h.get("text", "")) for h in reversed(history) if h.get("role") == "assistant"), "")
@@ -440,6 +457,10 @@ async def handle_turn(request: web.Request) -> web.Response:
         audio_b64 = await _speak(reply, usage, timings)
     except Exception as e:
         return _voice_error(e)
+
+    word_use = track_word_use(session, user_text, reply)
+    if word_use != (session.get("word_use") or {}):
+        db.set_voice_word_use(session_id, word_use)
 
     return web.json_response({
         "status": "reply",
@@ -475,6 +496,12 @@ async def handle_transcript(request: web.Request) -> web.Response:
     already_done = session["status"] == "done"
     db.save_voice_transcript(session_id, transcript, usage, ended)
 
+    if ended and not already_done:
+        try:
+            await asyncio.to_thread(update_memory, user_id, transcript)
+        except Exception:
+            logger.exception("talk: failed to update memory")
+
     if ended and not already_done and _bot is not None:
         try:
             session = db.get_voice_session(session_id)
@@ -489,18 +516,83 @@ async def handle_transcript(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
 
+MEMORY_MAX_FACTS = 30
+MEMORY_PROMPT = """You keep the memory of a Spanish-speaking friend who chats with a Russian-speaking learner (A1–A2) by voice.
+
+You get what you already remember about her plus the transcript of the conversation that just ended. Return the updated memory.
+
+Rules:
+- Keep durable facts about her life: family, pets (with names), work, city, travel, tastes, habits, plans, notable things that happened to her. One short sentence each, in simple Spanish.
+- Merge, don't duplicate: update a fact if the transcript contradicts or refines it, drop anything that turned out wrong.
+- Do NOT keep: her Spanish mistakes, vocabulary she looked up, what the bot said, one-off small talk, anything about the conversation itself.
+- The transcript is speech-to-text and may be garbled; keep only what is clearly stated.
+- At most {max_facts} facts, most useful first."""
+
+MEMORY_SCHEMA = {
+    "type": "object",
+    "properties": {"facts": {"type": "array", "items": {"type": "string"}}},
+    "required": ["facts"],
+    "additionalProperties": False,
+}
+
+
+def update_memory(user_id: int, transcript) -> list:
+    """Sync (blocking) — call through asyncio.to_thread. Rewrites her memory from the
+    previous one plus this conversation, so the bot stops asking what it already knows."""
+    spoken = "\n".join(f"{'ОНА' if t['role'] == 'user' else 'BOT'}: {t['text']}" for t in transcript if t.get("text"))
+    if not spoken.strip():
+        return db.get_talk_memory(user_id)
+    known = db.get_talk_memory(user_id)
+    response = ai_helper.client.messages.create(
+        model=TALK_LLM_MODEL,
+        max_tokens=1000,
+        system=MEMORY_PROMPT.format(max_facts=MEMORY_MAX_FACTS),
+        messages=[{"role": "user", "content": f"Lo que ya recuerdas:\n" + ("\n".join(f"- {f}" for f in known) or "- (nada)") + f"\n\nConversación:\n{spoken}"}],
+        output_config={"format": {"type": "json_schema", "schema": MEMORY_SCHEMA}},
+    )
+    text = next((b.text for b in response.content if b.type == "text"), "{}")
+    facts = [str(f).strip()[:200] for f in (json.loads(text).get("facts") or []) if str(f).strip()]
+    facts = facts[:MEMORY_MAX_FACTS]
+    db.set_talk_memory(user_id, facts)
+    return facts
+
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
 _ARTICLE_RE = re.compile(r"^(el|la|los|las|un|una|unos|unas)\s+", re.IGNORECASE)
+_VERB_END_RE = re.compile(r"^(.{3,})(ar|er|ir)$", re.IGNORECASE)
 
 
-def _word_used(phrase: str, user_text: str) -> bool:
-    """Exact-form match only (like _make_blank for cards) — a conjugated verb won't
-    count. Good enough for the spike; the real review will be Claude over the transcript."""
+def _word_used(phrase: str, text: str) -> bool:
+    """Exact form, plus a crude stem match for single verbs so "hablé"/"hablamos" count
+    for "hablar". Still not morphology: an irregular form ("fui" for "ir") is missed."""
     core = _ARTICLE_RE.sub("", phrase.strip().lower())
-    return bool(core) and re.search(rf"(?<!\w){re.escape(core)}(?!\w)", user_text) is not None
+    if not core:
+        return False
+    text = text.lower()
+    if re.search(rf"(?<!\w){re.escape(core)}(?!\w)", text):
+        return True
+    verb = _VERB_END_RE.match(core) if " " not in core else None
+    return bool(verb) and re.search(rf"(?<!\w){re.escape(verb.group(1))}\w{{0,4}}(?!\w)", text) is not None
+
+
+def track_word_use(session: dict, user_text: str, reply: str) -> dict:
+    """Who said each target word first — she (retrieval) or the bot (a hint she then reused).
+    Retrieval practice is what makes a word stick, but an unsuccessful attempt followed
+    right away by the word works too — this is how we tell the two apart over time."""
+    use = dict(session.get("word_use") or {})
+    for word in session.get("target_words") or []:
+        phrase = word["phrase"]
+        state = use.get(phrase)
+        if state in ("spontaneous", "after_hint"):
+            continue
+        if _word_used(phrase, user_text):
+            use[phrase] = "after_hint" if state == "hinted" else "spontaneous"
+        elif state is None and _word_used(phrase, reply):
+            use[phrase] = "hinted"
+    return use
 
 
 # Prices as of 2026-09-19, for the rough estimate in the summary only. TTS is billed per
@@ -524,8 +616,16 @@ def build_summary(session: dict) -> str:
         minutes = "?"
 
     targets = [w["phrase"] for w in session["target_words"]]
-    used = [p for p in targets if _word_used(p, user_text)]
-    unused = [p for p in targets if p not in used]
+    use = session.get("word_use") or {}
+    # the transcript is the fallback for words whose turn wasn't recorded (e.g. an old session)
+    spontaneous = [p for p in targets if use.get(p) == "spontaneous"]
+    after_hint = [p for p in targets if use.get(p) == "after_hint"]
+    heard = set(spontaneous) | set(after_hint)
+    for p in targets:
+        if p not in heard and _word_used(p, user_text):
+            (after_hint if use.get(p) == "hinted" else spontaneous).append(p)
+            heard.add(p)
+    unused = [p for p in targets if p not in heard]
 
     usage = session["usage"] or {}
     stt = usage.get("stt_seconds", 0) / 60 * PRICE_STT_PER_MIN
@@ -542,9 +642,10 @@ def build_summary(session: dict) -> str:
     lines = [
         f"🎙 <b>Разговор сохранён</b> — {minutes} мин, твоих реплик: {user_turns}.",
         "",
-        "✅ Прозвучали у тебя: " + (html.escape(", ".join(used)) if used else "—"),
+        "💪 Вспомнила сама: " + (html.escape(", ".join(spontaneous)) if spontaneous else "—"),
+        "💡 Сказала после подсказки: " + (html.escape(", ".join(after_hint)) if after_hint else "—"),
         "▫️ Не прозвучали: " + (html.escape(", ".join(unused)) if unused else "—"),
-        "<i>(точное совпадение формы — спряжённые глаголы пока не ловятся)</i>",
+        "<i>(совпадение по форме слова — неправильные глаголы вроде «fui» пока не ловятся)</i>",
         "",
     ]
     found = session.get("found_words") or []
