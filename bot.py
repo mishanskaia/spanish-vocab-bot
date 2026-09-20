@@ -40,6 +40,7 @@ import db
 import ai_helper
 import stt_helper
 import voice_talk
+import word_catalog
 
 logging.basicConfig(level=logging.INFO)
 # httpx logs every request URL at INFO, and Telegram Bot API URLs contain the bot token —
@@ -401,6 +402,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not word or word.startswith("/"):
         return
     await _add_word(update.message, update.effective_user.id, word)
+
+
+async def add_word_headless(user_id: int, word: str) -> dict:
+    """Add a word with no chat message attached — for the top-3000 Mini App (word_catalog.py).
+    Same lock, same dedup-before-Claude and same weekly limit as the chat path; the caller
+    renders the outcome itself. Returns {"status": added|exists|limit|error, "phrase": …}."""
+    async with _get_add_word_lock(user_id):
+        existing = db.find_word_by_phrase(user_id, word)
+        if existing:
+            return {"status": "exists", "phrase": existing["phrase"]}
+
+        if _weekly_limit_reached(user_id):
+            return {"status": "limit", "phrase": word}
+
+        try:
+            info = await asyncio.to_thread(ai_helper.explain_word, word)
+        except Exception:
+            logger.exception("catalog add: explain_word failed for %r", word)
+            return {"status": "error", "phrase": word}
+
+        phrase = info.get("phrase", word)
+        _, is_new = db.add_word(
+            user_id=user_id,
+            phrase=phrase,
+            meaning=info.get("meaning", ""),
+            part_of_speech=info.get("part_of_speech", ""),
+            cefr_level=info.get("cefr_level", ""),
+            examples=info.get("examples", []),
+            conjugation=info.get("conjugation"),
+            collocations=info.get("collocations", []),
+            gerund=info.get("gerund"),
+        )
+    return {
+        "status": "added" if is_new else "exists",
+        "phrase": phrase,
+        "meaning": info.get("meaning", ""),
+    }
 
 
 async def _add_word(message, user_id: int, word: str):
@@ -1552,6 +1590,29 @@ async def talk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Top-3000 word list as a Mini App: see the whole list, add any word in one tap."""
+    user_id = update.effective_user.id
+    if not _is_owner(user_id):
+        return
+    base = voice_talk.public_base_url()
+    if not base:
+        await update.message.reply_text(
+            "Нет публичного адреса: включи домен в Railway (Settings → Networking) "
+            "или задай PUBLIC_BASE_URL."
+        )
+        return
+    safari_url = f"{base}/catalog?t={voice_talk.make_link_token(user_id)}"
+    await update.message.reply_text(
+        "📚 Топ-3000 слов испанского. Отмечено то, что уже в твоём словаре; "
+        "любое слово добавляется в одно касание — карточку соберёт Claude, как обычно.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("Открыть словарь", web_app=WebAppInfo(url=f"{base}/catalog"))],
+            [InlineKeyboardButton("Открыть в Safari", url=safari_url)],
+        ]),
+    )
+
+
 # ---------------------------------------------------------------------------
 # API — lets another site of yours read your word list, and (with a separate
 # write key) add new words the same way typing to the bot directly would.
@@ -1721,6 +1782,7 @@ async def start_api_server(app: Application):
     api.router.add_route("OPTIONS", "/words", handle_api_words_options)
     api.router.add_get("/health", handle_api_health)
     voice_talk.register(api, bot=app.bot, bot_token=TELEGRAM_TOKEN, owner_id=OWNER_TELEGRAM_ID)
+    word_catalog.register(api, add_word=add_word_headless)
     runner = web.AppRunner(api)
     await runner.setup()
     port = int(os.environ.get("PORT", 8080))
@@ -1803,6 +1865,7 @@ OWNER_ONLY_COMMANDS = [
     ("canceltopic", "Отменить тему Study Coach"),
     ("practice", "Вечерняя практика прямо сейчас"),
     ("talk", "Живой разговор голосом (тест)"),
+    ("catalog", "Топ-3000 слов: посмотреть и добавить"),
     ("talkreport", "Отчёт: как звучит твоя речь"),
     ("talkmemory", "Что бот помнит о тебе"),
     ("talkforget", "Стереть память разговоров"),
@@ -1843,6 +1906,7 @@ def main():
     app.add_handler(CommandHandler("canceltopic", canceltopic))
     app.add_handler(CommandHandler("practice", practice))
     app.add_handler(CommandHandler("talk", talk))
+    app.add_handler(CommandHandler("catalog", catalog))
     app.add_handler(CommandHandler("talkreport", talkreport))
     app.add_handler(CommandHandler("talkmemory", talkmemory))
     app.add_handler(CommandHandler("talkforget", talkforget))

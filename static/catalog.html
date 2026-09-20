@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0b0b10">
+<title>Топ-3000</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #0b0b10;
+    --card: #14141c;
+    --card-2: #1b1b25;
+    --line: #23232e;
+    --text: #f4f1ec;
+    --muted: #8d8a93;
+    --faint: #56545f;
+    --accent: #7fd6ff;
+    --accent-2: #6b7bff;
+    --ok: #57d9a3;
+    --danger: #ff5d5d;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; background: var(--bg); }
+  body {
+    color: var(--text);
+    font: 16px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+    padding: env(safe-area-inset-top) 0 calc(env(safe-area-inset-bottom) + 24px);
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { padding: 0 16px; }
+
+  header { padding: 18px 16px 12px; }
+  .title { font-size: 26px; font-weight: 600; letter-spacing: -0.02em; margin: 0; }
+  .sub { color: var(--muted); font-size: 14px; margin: 4px 0 14px; }
+  .bar { height: 6px; border-radius: 99px; background: var(--card-2); overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    transition: width .6s cubic-bezier(.2,.8,.2,1); }
+
+  .sticky {
+    position: sticky; top: 0; z-index: 5;
+    background: linear-gradient(180deg, rgba(11,11,16,.97) 70%, rgba(11,11,16,0));
+    padding: 10px 16px 12px;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  }
+  .search { position: relative; }
+  .search input {
+    width: 100%; height: 44px; border-radius: 14px; border: 1px solid var(--line);
+    background: var(--card); color: var(--text); font-size: 16px;
+    padding: 0 40px 0 40px; outline: none;
+    transition: border-color .2s, background .2s;
+  }
+  .search input:focus { border-color: var(--accent); background: var(--card-2); }
+  .search input::placeholder { color: var(--faint); }
+  .search .icon { position: absolute; left: 14px; top: 12px; color: var(--faint); font-size: 17px; }
+  .search .clear {
+    position: absolute; right: 8px; top: 8px; width: 28px; height: 28px; border: 0; border-radius: 50%;
+    background: var(--card-2); color: var(--muted); font-size: 15px; display: none; cursor: pointer;
+  }
+  .search .clear.on { display: block; }
+
+  .chips { display: flex; gap: 8px; overflow-x: auto; padding: 10px 0 2px; scrollbar-width: none; }
+  .chips::-webkit-scrollbar { display: none; }
+  .chip {
+    flex: 0 0 auto; border: 1px solid var(--line); background: var(--card); color: var(--muted);
+    border-radius: 99px; padding: 7px 14px; font-size: 14px; cursor: pointer; white-space: nowrap;
+    transition: color .2s, border-color .2s, background .2s;
+  }
+  .chip[aria-pressed="true"] { color: #0b0b10; background: var(--accent); border-color: var(--accent); font-weight: 500; }
+  .chips.cats .chip[aria-pressed="true"] { background: var(--card-2); color: var(--text); border-color: var(--accent); }
+
+  .count { color: var(--faint); font-size: 13px; padding: 2px 16px 8px; }
+
+  ul { list-style: none; margin: 0; padding: 0 16px; }
+  li {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--card); border: 1px solid var(--line); border-radius: 14px;
+    padding: 11px 12px 11px 14px; margin-bottom: 8px;
+    animation: rise .25s ease both;
+  }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+  li.have { background: transparent; border-color: transparent; }
+  .n { color: var(--faint); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 34px; }
+  .txt { flex: 1 1 auto; min-width: 0; }
+  .es { font-size: 16px; font-weight: 500; letter-spacing: -0.01em; }
+  li.have .es { color: var(--muted); font-weight: 400; }
+  .ru { color: var(--muted); font-size: 13px; margin-top: 1px;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cat { color: var(--faint); font-size: 11px; margin-top: 2px; }
+
+  .act {
+    flex: 0 0 auto; width: 34px; height: 34px; border-radius: 50%;
+    border: 1px solid var(--line); background: var(--card-2); color: var(--accent);
+    font-size: 19px; line-height: 1; display: grid; place-items: center; cursor: pointer;
+    transition: transform .15s, background .2s, color .2s, border-color .2s;
+  }
+  .act:active { transform: scale(.9); }
+  .act.done { color: var(--ok); border-color: transparent; background: transparent; font-size: 16px; }
+  .act.err { color: var(--danger); }
+  .act[disabled] { cursor: default; }
+  .act .sp {
+    width: 15px; height: 15px; border-radius: 50%;
+    border: 2px solid var(--faint); border-top-color: var(--accent);
+    animation: spin .7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  li.sec {
+    background: none; border: 0; padding: 18px 2px 8px; margin: 0;
+    color: var(--faint); font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+  }
+  li.sec b { color: var(--muted); font-weight: 500; }
+  .empty { color: var(--muted); text-align: center; padding: 40px 24px; font-size: 15px; }
+  #sentinel { height: 1px; }
+
+  .toast {
+    position: fixed; left: 16px; right: 16px; bottom: calc(env(safe-area-inset-bottom) + 16px);
+    background: var(--card-2); border: 1px solid var(--line); border-radius: 14px;
+    padding: 12px 14px; font-size: 14px; color: var(--text);
+    opacity: 0; transform: translateY(12px); transition: opacity .25s, transform .25s;
+    pointer-events: none; z-index: 10;
+  }
+  .toast.on { opacity: 1; transform: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1 class="title">Топ-3000</h1>
+  <p class="sub" id="sub">Загружаю словарь…</p>
+  <div class="bar"><i id="barFill"></i></div>
+</header>
+
+<div class="sticky">
+  <div class="search">
+    <span class="icon">⌕</span>
+    <input id="q" type="search" placeholder="Поиск по слову или переводу" autocomplete="off" enterkeyhint="search">
+    <button class="clear" id="clear" aria-label="Очистить">✕</button>
+  </div>
+  <div class="chips" id="modes">
+    <button class="chip" data-mode="new" aria-pressed="true">Новые</button>
+    <button class="chip" data-mode="have" aria-pressed="false">В словаре</button>
+    <button class="chip" data-mode="all" aria-pressed="false">Все</button>
+  </div>
+  <div class="chips cats" id="cats"></div>
+</div>
+
+<div class="count" id="count"></div>
+<ul id="list"></ul>
+<div id="sentinel"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+const tg = window.Telegram && window.Telegram.WebApp;
+const linkToken = new URLSearchParams(location.search).get('t') || '';
+const PAGE = 60;
+
+let words = [];
+let known = new Set();
+let view = [];
+let shown = 0;
+let mode = 'new';
+let category = '';
+let query = '';
+let lastCat = '';
+
+const $ = (id) => document.getElementById(id);
+
+function headers() {
+  const h = { 'Content-Type': 'application/json' };
+  const initData = tg && tg.initData;
+  if (initData) h['X-Tg-Init-Data'] = initData;
+  else if (linkToken) h['X-Talk-Token'] = linkToken;
+  return h;
+}
+
+function normalize(s) {
+  const t = (s || '').trim().toLowerCase().replace(/^[¿¡]+|[?!.,;:]+$/g, '');
+  const m = t.match(/^(el|la|los|las|un|una|unos|unas)\s+(.*)$/);
+  return m ? m[2] : t;
+}
+
+function haptic(kind) {
+  try { tg && tg.HapticFeedback && tg.HapticFeedback.notificationOccurred(kind); } catch (e) {}
+}
+
+let toastTimer;
+function toast(text) {
+  const el = $('toast');
+  el.textContent = text;
+  el.classList.add('on');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('on'), 2600);
+}
+
+function progress() {
+  const have = words.filter((w) => known.has(normalize(w.es))).length;
+  $('sub').textContent = `${have} из ${words.length} уже в словаре`;
+  $('barFill').style.width = (words.length ? (have / words.length) * 100 : 0) + '%';
+}
+
+function applyFilter() {
+  const q = query.trim().toLowerCase();
+  view = words.filter((w) => {
+    const have = known.has(normalize(w.es));
+    if (mode === 'new' && have) return false;
+    if (mode === 'have' && !have) return false;
+    if (category && w.cat !== category) return false;
+    if (q && !(w.es.toLowerCase().includes(q) || w.ru.toLowerCase().includes(q))) return false;
+    return true;
+  });
+  shown = 0;
+  lastCat = '';
+  $('list').innerHTML = '';
+  $('count').textContent = view.length ? `${view.length} ${plural(view.length)}` : '';
+  if (!view.length) {
+    $('list').innerHTML = '<li class="empty" style="display:block">Ничего не нашлось</li>';
+    return;
+  }
+  renderMore();
+}
+
+function plural(n) {
+  const d10 = n % 10, d100 = n % 100;
+  if (d10 === 1 && d100 !== 11) return 'слово';
+  if (d10 >= 2 && d10 <= 4 && (d100 < 12 || d100 > 14)) return 'слова';
+  return 'слов';
+}
+
+function renderMore() {
+  const slice = view.slice(shown, shown + PAGE);
+  const frag = document.createDocumentFragment();
+  // While browsing everything, the topic headings keep 3000 rows navigable; with a topic
+  // picked or a search running they'd just repeat what the user already chose.
+  const grouped = !category && !query.trim();
+  for (const w of slice) {
+    if (grouped && w.cat && w.cat !== lastCat) {
+      lastCat = w.cat;
+      const sec = document.createElement('li');
+      sec.className = 'sec';
+      sec.innerHTML = '<b></b>';
+      sec.querySelector('b').textContent = w.cat;
+      frag.appendChild(sec);
+    }
+    frag.appendChild(row(w));
+  }
+  $('list').appendChild(frag);
+  shown += slice.length;
+}
+
+function row(w) {
+  const have = known.has(normalize(w.es));
+  const li = document.createElement('li');
+  li.className = have ? 'have' : '';
+  li.innerHTML = `
+    <span class="n">${w.n}</span>
+    <span class="txt">
+      <span class="es"></span>
+      <div class="ru"></div>
+      ${category || query ? '<div class="cat"></div>' : ''}
+    </span>`;
+  li.querySelector('.es').textContent = w.es;
+  li.querySelector('.ru').textContent = w.ru;
+  const catEl = li.querySelector('.cat');
+  if (catEl) catEl.textContent = w.cat || '';
+
+  const btn = document.createElement('button');
+  btn.className = 'act' + (have ? ' done' : '');
+  btn.textContent = have ? '✓' : '+';
+  btn.setAttribute('aria-label', have ? 'Уже в словаре' : 'Добавить ' + w.es);
+  if (have) btn.disabled = true;
+  else btn.addEventListener('click', () => add(w, li, btn));
+  li.appendChild(btn);
+  return li;
+}
+
+async function add(w, li, btn) {
+  btn.disabled = true;
+  btn.textContent = '';
+  btn.appendChild(Object.assign(document.createElement('span'), { className: 'sp' }));
+  try {
+    const res = await fetch('/catalog/add', {
+      method: 'POST', headers: headers(), body: JSON.stringify({ es: w.es }),
+    });
+    const data = await res.json().catch(() => ({}));
+    const status = res.ok ? data.status : 'error';
+    if (status === 'added' || status === 'exists') {
+      known.add(normalize(w.es));
+      if (data.phrase) known.add(normalize(data.phrase));
+      btn.textContent = '✓';
+      btn.className = 'act done';
+      li.classList.add('have');
+      progress();
+      haptic('success');
+      if (status === 'added') toast(`${data.phrase || w.es} — добавлено, карточка готова`);
+      else toast(`${data.phrase || w.es} уже было в словаре`);
+    } else if (status === 'limit') {
+      btn.textContent = '+'; btn.className = 'act'; btn.disabled = false;
+      haptic('warning');
+      toast('Недельный лимит новых слов исчерпан');
+    } else {
+      throw new Error(data.error || 'add failed');
+    }
+  } catch (e) {
+    btn.textContent = '↻'; btn.className = 'act err'; btn.disabled = false;
+    haptic('error');
+    toast('Не получилось добавить — попробуй ещё раз');
+  }
+}
+
+function buildCategories() {
+  const counts = new Map();
+  for (const w of words) if (w.cat) counts.set(w.cat, (counts.get(w.cat) || 0) + 1);
+  const box = $('cats');
+  const all = document.createElement('button');
+  all.className = 'chip'; all.textContent = 'Все темы';
+  all.setAttribute('aria-pressed', 'true'); all.dataset.cat = '';
+  box.appendChild(all);
+  for (const [c, n] of counts) {
+    const b = document.createElement('button');
+    b.className = 'chip'; b.textContent = `${c} · ${n}`;
+    b.setAttribute('aria-pressed', 'false'); b.dataset.cat = c;
+    box.appendChild(b);
+  }
+  box.addEventListener('click', (e) => {
+    const chip = e.target.closest('.chip');
+    if (!chip) return;
+    category = chip.dataset.cat;
+    for (const c of box.children) c.setAttribute('aria-pressed', String(c === chip));
+    applyFilter();
+  });
+}
+
+$('modes').addEventListener('click', (e) => {
+  const chip = e.target.closest('.chip');
+  if (!chip) return;
+  mode = chip.dataset.mode;
+  for (const c of $('modes').children) c.setAttribute('aria-pressed', String(c === chip));
+  applyFilter();
+});
+
+let searchTimer;
+$('q').addEventListener('input', (e) => {
+  query = e.target.value;
+  $('clear').classList.toggle('on', !!query);
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(applyFilter, 120);
+});
+$('clear').addEventListener('click', () => {
+  query = ''; $('q').value = ''; $('clear').classList.remove('on'); applyFilter();
+});
+
+new IntersectionObserver((entries) => {
+  if (entries[0].isIntersecting && shown < view.length) renderMore();
+}, { rootMargin: '600px' }).observe($('sentinel'));
+
+async function boot() {
+  if (tg) { tg.ready(); tg.expand(); try { tg.setHeaderColor('#0b0b10'); } catch (e) {} }
+  try {
+    const [dataRes, stateRes] = await Promise.all([
+      fetch('/catalog/data', { headers: headers() }),
+      fetch('/catalog/state', { headers: headers() }),
+    ]);
+    if (dataRes.status === 401 || stateRes.status === 401) {
+      $('sub').textContent = 'Открой словарь кнопкой из бота — ссылка устарела.';
+      return;
+    }
+    words = (await dataRes.json()).words || [];
+    known = new Set((await stateRes.json()).known || []);
+  } catch (e) {
+    $('sub').textContent = 'Не удалось загрузить список. Попробуй открыть заново.';
+    return;
+  }
+  buildCategories();
+  progress();
+  applyFilter();
+}
+
+boot();
+</script>
+</body>
+</html>
