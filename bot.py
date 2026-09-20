@@ -69,6 +69,9 @@ DEFAULT_UTC_OFFSET = 3  # Moscow — used until a user answers the /start timezo
 STUDY_COACH_UTC = (4, 0)
 # Sunday 06:00 Moscow = 03:00 UTC — weekly DB backup, quiet time before the day's reminders
 BACKUP_WEEKLY_UTC = (3, 0)
+# Sunday 19:00 Moscow = 16:00 UTC — weekly speech report for the owner (/talkreport on demand)
+TALK_REPORT_UTC = (16, 0)
+TALK_REPORT_WEEKDAY = 6
 BACKUP_WEEKDAY = 6  # Monday=0 .. Sunday=6, per job_queue's `days`
 
 # Voice notes (evening practice + dictating new words) need OpenAI for speech-to-text — off without the key
@@ -1470,6 +1473,36 @@ async def canceltopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Живой разговор голосом — owner-only Mini App (спайк), вся логика в voice_talk.py
 # ---------------------------------------------------------------------------
 
+async def talkreport(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Weekly speech report on demand — what she repeats, and which mistakes come back."""
+    user_id = update.effective_user.id
+    if not _is_owner(user_id):
+        return
+    await update.message.reply_text("Смотрю последние разговоры...")
+    try:
+        report = await asyncio.to_thread(voice_talk.build_weekly_report, user_id)
+    except Exception:
+        logger.exception("weekly talk report failed")
+        await update.message.reply_text("Не получилось собрать отчёт — попробуй позже.")
+        return
+    await update.message.reply_text(
+        report or "Пока мало разговоров для отчёта — поговори ещё пару раз.",
+        parse_mode="HTML" if report else None,
+    )
+
+
+async def weekly_talk_report_job(context: ContextTypes.DEFAULT_TYPE):
+    if not (OWNER_TELEGRAM_ID and voice_talk.is_enabled()):
+        return
+    try:
+        report = await asyncio.to_thread(voice_talk.build_weekly_report, OWNER_TELEGRAM_ID)
+    except Exception:
+        logger.exception("weekly talk report job failed")
+        return
+    if report:
+        await context.bot.send_message(OWNER_TELEGRAM_ID, report, parse_mode="HTML")
+
+
 async def talkmemory(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """What the conversation partner remembers about her, so it stops re-asking."""
     user_id = update.effective_user.id
@@ -1770,6 +1803,7 @@ OWNER_ONLY_COMMANDS = [
     ("canceltopic", "Отменить тему Study Coach"),
     ("practice", "Вечерняя практика прямо сейчас"),
     ("talk", "Живой разговор голосом (тест)"),
+    ("talkreport", "Отчёт: как звучит твоя речь"),
     ("talkmemory", "Что бот помнит о тебе"),
     ("talkforget", "Стереть память разговоров"),
 ]
@@ -1809,6 +1843,7 @@ def main():
     app.add_handler(CommandHandler("canceltopic", canceltopic))
     app.add_handler(CommandHandler("practice", practice))
     app.add_handler(CommandHandler("talk", talk))
+    app.add_handler(CommandHandler("talkreport", talkreport))
     app.add_handler(CommandHandler("talkmemory", talkmemory))
     app.add_handler(CommandHandler("talkforget", talkforget))
     app.add_handler(CallbackQueryHandler(on_button))
@@ -1822,6 +1857,11 @@ def main():
         weekly_backup_job,
         time=dtime(hour=BACKUP_WEEKLY_UTC[0], minute=BACKUP_WEEKLY_UTC[1]),
         days=(BACKUP_WEEKDAY,),
+    )
+    app.job_queue.run_daily(
+        weekly_talk_report_job,
+        time=dtime(hour=TALK_REPORT_UTC[0], minute=TALK_REPORT_UTC[1]),
+        days=(TALK_REPORT_WEEKDAY,),
     )
 
     print("Bot started. Stop with Ctrl+C.")

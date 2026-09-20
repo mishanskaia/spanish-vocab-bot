@@ -497,22 +497,36 @@ async def handle_transcript(request: web.Request) -> web.Response:
     db.save_voice_transcript(session_id, transcript, usage, ended)
 
     if ended and not already_done:
+        # memory and the review are independent — run them side by side, then report
+        memory_task = asyncio.ensure_future(asyncio.to_thread(update_memory, user_id, transcript))
+        analysis_task = asyncio.ensure_future(asyncio.to_thread(
+            analyze_conversation, transcript, db.get_known_words(user_id)
+        ))
         try:
-            await asyncio.to_thread(update_memory, user_id, transcript)
+            await memory_task
         except Exception:
             logger.exception("talk: failed to update memory")
-
-    if ended and not already_done and _bot is not None:
+        analysis = {}
         try:
-            session = db.get_voice_session(session_id)
-            await _bot.send_message(
-                user_id,
-                build_summary(session),
-                parse_mode="HTML",
-                reply_markup=found_words_keyboard(session),
-            )
+            analysis = await analysis_task
+            db.set_voice_analysis(session_id, analysis)
         except Exception:
-            logger.exception("failed to send voice session summary")
+            logger.exception("talk: failed to analyse the conversation")
+
+        if _bot is not None:
+            try:
+                session = db.get_voice_session(session_id)
+                await _bot.send_message(
+                    user_id,
+                    build_summary(session),
+                    parse_mode="HTML",
+                    reply_markup=found_words_keyboard(session),
+                )
+                message = build_analysis_message(analysis)
+                if message:
+                    await _bot.send_message(user_id, message, parse_mode="HTML")
+            except Exception:
+                logger.exception("failed to send voice session summary")
     return web.json_response({"ok": True})
 
 
@@ -555,6 +569,306 @@ def update_memory(user_id: int, transcript) -> list:
     facts = facts[:MEMORY_MAX_FACTS]
     db.set_talk_memory(user_id, facts)
     return facts
+
+
+ANALYSIS_MAX_ERRORS = 5
+ANALYSIS_MAX_UPGRADES = 4
+ANALYSIS_MAX_UNUSED = 3
+ANALYSIS_PROMPT = """You review a voice conversation that a Russian-speaking learner of Spanish (A1–A2, a woman) has just had with a Spanish-speaking friend. You write two blocks for her: what was wrong, and how it could sound better. Explanations in Russian, Spanish stays in Spanish.
+
+The transcript is speech-to-text of the real conversation. ОНА = her, BOT = the bot. Only her lines are reviewed.
+
+"errors" — real mistakes in her Spanish: wrong word for the meaning, wrong verb form or tense, gender/number agreement, articles, prepositions, ser/estar, word order.
+- "said": her own words, short (quote only the part that is wrong, with just enough around it).
+- "fix": the same thing said correctly.
+- "why": a few words in Russian naming the rule — «прошедшее время ir», «род прилагательного», «предлог с ir».
+- Only real mistakes. Correct but plain phrasing belongs in "upgrades", not here.
+- She is a woman: adjectives about herself are feminine ("estoy cansada"). Never "correct" that.
+- Ignore speech-to-text artifacts: punctuation, missing accent marks, repeated words, «э-э».
+- A Russian word she used is a vocabulary gap, not a mistake — skip it.
+- Both European and Latin American Spanish are correct.
+- At most {max_errors}, most important first: what breaks understanding, or what she repeats.
+
+"upgrades" — the same idea said better, for phrases that were already correct but plain.
+- "said": her phrase from the transcript. "better": the improved version, A2–B1, natural, still sayable by her. "why": a short Russian note — «звучит естественнее», «готовый оборот для причины».
+- Include at least one ready-made chunk she can reuse (es que…, la verdad es que…, me da igual, al final…, o sea…) when it fits something she actually said.
+- Never invent phrases she didn't say.
+- At most {max_upgrades}.
+
+"unused" — words she already knows (the list comes with the transcript) that would have fitted naturally somewhere in THIS conversation, but she didn't use.
+- "said": her exact phrase from the transcript where the word would have fitted. Never invent a phrase — if you can't quote her, drop the item.
+- "word": the known word, exactly as it appears in her list. "better": her phrase rewritten with it, natural and at her level.
+- Skip words she did use, and skip anything that would sound forced. Fewer is better: at most {max_unused}, none at all is a fine answer.
+
+If she barely spoke or there is nothing worth saying, return empty lists."""
+
+ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "errors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"said": {"type": "string"}, "fix": {"type": "string"}, "why": {"type": "string"}},
+                "required": ["said", "fix", "why"],
+                "additionalProperties": False,
+            },
+        },
+        "upgrades": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"said": {"type": "string"}, "better": {"type": "string"}, "why": {"type": "string"}},
+                "required": ["said", "better", "why"],
+                "additionalProperties": False,
+            },
+        },
+        "unused": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"said": {"type": "string"}, "word": {"type": "string"}, "better": {"type": "string"}},
+                "required": ["said", "word", "better"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["errors", "upgrades", "unused"],
+    "additionalProperties": False,
+}
+
+
+def analyze_conversation(transcript, known_words=()) -> dict:
+    """Sync (blocking) — call through asyncio.to_thread. Three blocks she asked for:
+    mistakes, how the same thing could sound better, and words she already knows that
+    would have fitted. Known words she already used in this talk are filtered out here,
+    in code, so the model isn't tempted to "find" them."""
+    spoken = "\n".join(f"{'ОНА' if t['role'] == 'user' else 'BOT'}: {t['text']}" for t in transcript if t.get("text"))
+    if sum(1 for t in transcript if t.get("role") == "user" and t.get("text")) < 2:
+        return {"errors": [], "upgrades": [], "unused": []}
+    her_text = " ".join(t["text"] for t in transcript if t.get("role") == "user" and t.get("text"))
+    candidates = [w for w in known_words if not _word_used(w["phrase"], her_text)][:80]
+    content = spoken
+    if candidates:
+        content += "\n\nСлова, которые она уже знает:\n" + "\n".join(
+            f"- {w['phrase']} — {w['meaning']}" for w in candidates
+        )
+    response = ai_helper.client.messages.create(
+        model=TALK_LLM_MODEL,
+        max_tokens=2000,
+        system=ANALYSIS_PROMPT.format(
+            max_errors=ANALYSIS_MAX_ERRORS, max_upgrades=ANALYSIS_MAX_UPGRADES, max_unused=ANALYSIS_MAX_UNUSED
+        ),
+        messages=[{"role": "user", "content": content}],
+        output_config={"format": {"type": "json_schema", "schema": ANALYSIS_SCHEMA}},
+    )
+    text = next((b.text for b in response.content if b.type == "text"), "{}")
+    data = json.loads(text)
+    known = {w["phrase"].lower() for w in candidates}
+    said_lower = spoken.lower()
+    return {
+        "errors": [e for e in (data.get("errors") or []) if e.get("said") and e.get("fix")][:ANALYSIS_MAX_ERRORS],
+        "upgrades": [u for u in (data.get("upgrades") or []) if u.get("said") and u.get("better")][:ANALYSIS_MAX_UPGRADES],
+        # the word must be one of hers, and the quote must really be in the transcript
+        "unused": [u for u in (data.get("unused") or [])
+                   if u.get("word", "").lower() in known and u.get("said", "").lower()[:40] in said_lower
+                   ][:ANALYSIS_MAX_UNUSED],
+    }
+
+
+def build_analysis_message(analysis: dict) -> str | None:
+    errors, upgrades = analysis.get("errors") or [], analysis.get("upgrades") or []
+    if not errors and not upgrades and not (analysis.get("unused") or []):
+        return None
+    lines = ["📝 <b>Разбор разговора</b>", ""]
+    lines.append("<b>Ошибки</b>")
+    if errors:
+        for e in errors:
+            lines.append(
+                f"• <s>{html.escape(e['said'])}</s> → <b>{html.escape(e['fix'])}</b>"
+                + (f"\n  <i>{html.escape(e['why'])}</i>" if e.get("why") else "")
+            )
+    else:
+        lines.append("• Ошибок не нашла 🎉")
+    if upgrades:
+        lines += ["", "<b>Как сказать лучше</b>"]
+        for u in upgrades:
+            lines.append(
+                f"• {html.escape(u['said'])} → <b>{html.escape(u['better'])}</b>"
+                + (f"\n  <i>{html.escape(u['why'])}</i>" if u.get("why") else "")
+            )
+    unused = analysis.get("unused") or []
+    if unused:
+        lines += ["", "<b>Знаешь, но не использовала</b>"]
+        for u in unused:
+            lines.append(
+                f"• <b>{html.escape(u['word'])}</b>: {html.escape(u['said'])} → {html.escape(u['better'])}"
+            )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Weekly report — what her speech looks like across conversations
+# ---------------------------------------------------------------------------
+
+REPORT_MIN_TURNS = 12          # below this there's nothing to count
+REPORT_SESSIONS = 10           # how many recent conversations to look at
+REPORT_MAX_PHRASES = 12        # candidates handed to Claude
+_REPORT_MIN_COUNT = {1: 8, 2: 4, 3: 3, 4: 3}
+# Counting is done in code on purpose: asked to spot "what you repeat", a model invents
+# plausible answers. Claude only suggests alternatives for phrases the counter found.
+_REPORT_STOPWORDS = {
+    "que", "de", "la", "el", "y", "a", "en", "un", "una", "es", "no", "sí", "si", "me", "mi", "te", "tu",
+    "se", "lo", "los", "las", "por", "para", "con", "muy", "más", "pero", "como", "ya", "yo", "o", "al",
+    "del", "eh", "este", "esta", "bien", "también", "porque", "cuando", "hay", "son", "soy", "ser", "estar",
+}
+_TOKEN_RE = re.compile(r"[a-záéíóúüñ]+", re.IGNORECASE)
+
+
+def count_phrases(sessions) -> list[dict]:
+    """Her repeated words and phrases across recent conversations: how often, and in how
+    many different conversations (a phrase used a lot in one story isn't a habit)."""
+    counts, in_sessions = {}, {}
+    for session in sessions:
+        seen_here = set()
+        for turn in session.get("transcript") or []:
+            if turn.get("role") != "user":
+                continue
+            tokens = [t.lower() for t in _TOKEN_RE.findall(turn.get("text") or "")]
+            for n in (1, 2, 3, 4):
+                for i in range(len(tokens) - n + 1):
+                    gram = tuple(tokens[i:i + n])
+                    if n == 1 and (gram[0] in _REPORT_STOPWORDS or len(gram[0]) < 4):
+                        continue
+                    if n > 1 and all(t in _REPORT_STOPWORDS for t in gram):
+                        continue
+                    phrase = " ".join(gram)
+                    counts[phrase] = counts.get(phrase, 0) + 1
+                    seen_here.add(phrase)
+        for phrase in seen_here:
+            in_sessions[phrase] = in_sessions.get(phrase, 0) + 1
+
+    candidates = [
+        {"phrase": p, "count": c, "sessions": in_sessions.get(p, 0)}
+        for p, c in counts.items()
+        if c >= _REPORT_MIN_COUNT[len(p.split())] and (len(p.split()) == 1 or in_sessions.get(p, 0) >= 2)
+    ]
+    # a longer phrase beats the shorter one inside it when they're equally frequent
+    by_count = sorted(candidates, key=lambda x: (-x["count"], -len(x["phrase"])))
+    kept = []
+    for cand in by_count:
+        if any(cand["phrase"] in k["phrase"] and cand["count"] <= k["count"] for k in kept):
+            continue
+        kept.append(cand)
+    return kept[:REPORT_MAX_PHRASES]
+
+
+REPORT_PROMPT = """You write a weekly speech report for a Russian-speaking learner of Spanish (A1–A2, a woman) who talks with a Spanish-speaking bot by voice. Explanations in Russian, Spanish stays in Spanish.
+
+You get two things, both taken from her real conversations: phrases she repeats (counted exactly, don't recount or invent) and the mistakes her per-conversation reviews found.
+
+"overused" — the repeated phrases worth diversifying. Keep her phrase exactly as given.
+- Only crutch-like expressions worth varying: openers, fillers, "pienso que", "me gusta", "es bueno", "muy bien". Skip words she simply talks about a lot (her cats, her work, place names) and skip fragments that are just grammar ("de la", "que el").
+- "alternatives": 3–4 ways to say the same thing, A2–B1, natural, different in register or structure — not synonyms of one word only.
+- "note": a few words in Russian on when to use them.
+- At most 4 phrases, most repeated first. If nothing is really a crutch, return an empty list.
+
+"recurring_errors" — patterns that came up in more than one conversation, not one-off slips.
+- "pattern": the rule in Russian («род прилагательных», «ser/estar для места»).
+- "examples": 1–2 of her actual wrong phrases, as given to you.
+- "tip": one short line in Russian on how to remember it.
+- At most 3. Nothing recurring → empty list."""
+
+REPORT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "overused": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "phrase": {"type": "string"},
+                    "alternatives": {"type": "array", "items": {"type": "string"}},
+                    "note": {"type": "string"},
+                },
+                "required": ["phrase", "alternatives", "note"],
+                "additionalProperties": False,
+            },
+        },
+        "recurring_errors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "examples": {"type": "array", "items": {"type": "string"}},
+                    "tip": {"type": "string"},
+                },
+                "required": ["pattern", "examples", "tip"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["overused", "recurring_errors"],
+    "additionalProperties": False,
+}
+
+
+def build_weekly_report(user_id: int) -> str | None:
+    """Sync (blocking) — call through asyncio.to_thread. Returns the message, or None
+    when there's too little speech to say anything honest."""
+    sessions = db.get_recent_voice_sessions(user_id, REPORT_SESSIONS)
+    her_turns = [t for s in sessions for t in (s.get("transcript") or []) if t.get("role") == "user" and t.get("text")]
+    if len(her_turns) < REPORT_MIN_TURNS:
+        return None
+
+    phrases = count_phrases(sessions)
+    errors = [e for s in sessions for e in ((s.get("analysis") or {}).get("errors") or [])]
+    if not phrases and not errors:
+        return None
+
+    lines = ["Повторяющиеся фразы (посчитано точно):"]
+    lines += [f"- «{p['phrase']}» — {p['count']} раз в {p['sessions']} разговорах" for p in phrases] or ["- (нет)"]
+    lines += ["", "Ошибки из разборов:"]
+    lines += [f"- {e['said']} → {e['fix']} ({e.get('why', '')})" for e in errors] or ["- (нет)"]
+
+    response = ai_helper.client.messages.create(
+        model=TALK_LLM_MODEL,
+        max_tokens=2000,
+        system=REPORT_PROMPT,
+        messages=[{"role": "user", "content": "\n".join(lines)}],
+        output_config={"format": {"type": "json_schema", "schema": REPORT_SCHEMA}},
+    )
+    data = json.loads(next((b.text for b in response.content if b.type == "text"), "{}"))
+    counts = {p["phrase"]: p for p in phrases}
+    overused = [o for o in (data.get("overused") or []) if o.get("phrase") in counts][:4]
+    recurring = [r for r in (data.get("recurring_errors") or []) if r.get("pattern")][:3]
+    if not overused and not recurring:
+        return None
+
+    out = [
+        "📊 <b>Как звучит твоя речь</b>",
+        f"<i>По {len(sessions)} последним разговорам, твоих реплик: {len(her_turns)}.</i>",
+    ]
+    if overused:
+        out += ["", "<b>Часто повторяешь</b>"]
+        for o in overused:
+            c = counts[o["phrase"]]
+            out.append(
+                f"• «{html.escape(o['phrase'])}» — {c['count']} раз\n"
+                f"  Вместо: {html.escape(', '.join(o['alternatives']))}\n"
+                f"  <i>{html.escape(o['note'])}</i>"
+            )
+    if recurring:
+        out += ["", "<b>Повторяющиеся ошибки</b>"]
+        for r in recurring:
+            examples = "; ".join(r.get("examples") or [])
+            out.append(
+                f"• <b>{html.escape(r['pattern'])}</b>"
+                + (f"\n  {html.escape(examples)}" if examples else "")
+                + f"\n  <i>{html.escape(r['tip'])}</i>"
+            )
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
