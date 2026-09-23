@@ -269,6 +269,18 @@ def init_db():
         )
         """
     )
+    # Catalog entries she marked «знаю» without adding a card — see word_catalog.py.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS catalog_known (
+            user_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            es TEXT NOT NULL,
+            marked_at TEXT,
+            PRIMARY KEY (user_id, key)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -1184,3 +1196,25 @@ def get_known_words(user_id: int, limit: int = 80) -> list:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_catalog_known(user_id: int) -> set:
+    """Catalog keys (word_catalog.normalize) marked «знаю» — no card, no reviews."""
+    conn = get_connection()
+    rows = conn.execute("SELECT key FROM catalog_known WHERE user_id = ?", (user_id,)).fetchall()
+    conn.close()
+    return {r["key"] for r in rows}
+
+
+def set_catalog_known(user_id: int, key: str, es: str, known: bool):
+    conn = get_connection()
+    if known:
+        conn.execute(
+            """INSERT INTO catalog_known (user_id, key, es, marked_at) VALUES (?, ?, ?, ?)
+               ON CONFLICT(user_id, key) DO NOTHING""",
+            (user_id, key, es, datetime.now(timezone.utc).isoformat()),
+        )
+    else:
+        conn.execute("DELETE FROM catalog_known WHERE user_id = ? AND key = ?", (user_id, key))
+    conn.commit()
+    conn.close()

@@ -6,6 +6,10 @@ card, the weekly limit applies) so a word added here behaves like one typed to t
 
 Source of the list: tools/parse_top3000.py turns Ольга's .docx into static/top3000.json.
 
+A word she already knows but doesn't want to drill can be marked «знаю» instead
+(/catalog/mark): no Claude call, no card, no weekly limit — just a row in catalog_known,
+so it leaves «Новые» and counts towards progress. Tapping again unmarks it.
+
 Auth is voice_talk's — same initData / signed-link check, owner only.
 """
 
@@ -90,8 +94,11 @@ async def handle_state(request: web.Request) -> web.Response:
     known = known_keys(user_id)
     words, phrases = load_words(), load_phrases()
     catalog_keys = {normalize(item["es"]) for item in words + phrases}
+    # A word both marked and later added counts as "in the dictionary" — the card wins.
+    marked = db.get_catalog_known(user_id) - known
     return web.json_response({
         "known": sorted(k for k in catalog_keys if k in known),
+        "marked": sorted(k for k in catalog_keys if k in marked),
         "total": len(words),
         "totalPhrases": len(phrases),
     })
@@ -119,6 +126,25 @@ async def handle_add(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def handle_mark(request: web.Request) -> web.Response:
+    """«Знаю» on a catalog entry: {"es": "casa", "known": true|false}. No Claude, no card."""
+    user_id = voice_talk.request_owner_id(request)
+    if user_id is None:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        payload = await request.json()
+    except ValueError:
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    word = (payload.get("es") or "").strip()
+    key = normalize(word)
+    if not key:
+        return web.json_response({"error": "es is required"}, status=400)
+    known = bool(payload.get("known", True))
+    db.set_catalog_known(user_id, key, word, known)
+    return web.json_response({"status": "marked" if known else "unmarked", "key": key})
+
+
 def register(api: web.Application, *, add_word):
     """add_word: async (user_id, word) -> {"status": added|exists|limit|error, "phrase": …}"""
     global _add_word
@@ -127,3 +153,4 @@ def register(api: web.Application, *, add_word):
     api.router.add_get("/catalog/data", handle_data)
     api.router.add_get("/catalog/state", handle_state)
     api.router.add_post("/catalog/add", handle_add)
+    api.router.add_post("/catalog/mark", handle_mark)

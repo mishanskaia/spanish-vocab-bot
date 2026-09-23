@@ -130,6 +130,15 @@
   .act:active { transform: scale(.9); }
   .act.done { color: var(--ok); border-color: transparent; background: transparent; font-size: 16px; }
   .act.err { color: var(--danger); }
+  /* «знаю»: known without a card — secondary to «+», and a marked row's ✓ undoes it. */
+  .knew {
+    flex: 0 0 auto; height: 30px; padding: 0 10px; border-radius: 99px;
+    border: 1px solid var(--line); background: none; color: var(--muted);
+    font-size: 12px; cursor: pointer; transition: transform .15s, color .2s;
+  }
+  .knew:active { transform: scale(.94); }
+  .act.marked { color: var(--muted); border-color: var(--line); background: transparent; font-size: 16px; }
+  .tag.knew-tag { color: var(--muted); }
   .act[disabled] { cursor: default; }
   .act .sp {
     width: 15px; height: 15px; border-radius: 50%;
@@ -171,7 +180,7 @@
   </div>
   <div class="modes" id="modes">
     <button class="chip" data-mode="new" aria-pressed="true">Новые</button>
-    <button class="chip" data-mode="have" aria-pressed="false">В словаре</button>
+    <button class="chip" data-mode="have" aria-pressed="false">Уже есть</button>
     <button class="chip" data-mode="all" aria-pressed="false">Все</button>
   </div>
   <div class="topics">
@@ -192,7 +201,9 @@ const PAGE = 60;
 const REGION_LABEL = { es: 'Испания', la: 'Лат. Америка' };
 
 const data = { words: [], phrases: [] };
-let known = new Set();
+let known = new Set();   // in the dictionary (has a card)
+let marked = new Set();  // marked «знаю» — no card
+const isHave = (w) => { const k = normalize(w.es); return known.has(k) || marked.has(k); };
 let tab = 'words';
 let view = [];
 let shown = 0;
@@ -242,9 +253,11 @@ function plural(n, forms) {
 
 function progress() {
   const list = items();
-  const have = list.filter((w) => known.has(normalize(w.es))).length;
+  const have = list.filter(isHave).length;
+  const knew = list.filter((w) => { const k = normalize(w.es); return marked.has(k) && !known.has(k); }).length;
   const noun = tab === 'words' ? 'слов' : 'фраз';
-  $('sub').textContent = `${have} из ${list.length} ${noun} уже в словаре`;
+  $('sub').textContent = `${have} из ${list.length} ${noun} уже есть`
+    + (knew ? ` · ${knew} отмечено «знаю»` : '');
   $('barFill').style.width = (list.length ? (have / list.length) * 100 : 0) + '%';
 }
 
@@ -279,7 +292,7 @@ function applyFilter() {
   const q = query.trim().toLowerCase();
   const cat = category();
   view = items().filter((w) => {
-    const have = known.has(normalize(w.es));
+    const have = isHave(w);
     if (mode === 'new' && have) return false;
     if (mode === 'have' && !have) return false;
     if (cat && w.cat !== cat) return false;
@@ -322,7 +335,10 @@ function renderMore() {
 }
 
 function row(w) {
-  const have = known.has(normalize(w.es));
+  const key = normalize(w.es);
+  const inDict = known.has(key);
+  const knew = !inDict && marked.has(key);
+  const have = inDict || knew;
   const li = document.createElement('li');
   li.className = have ? 'have' : '';
   li.innerHTML = `
@@ -342,19 +358,69 @@ function row(w) {
     tag.textContent = REGION_LABEL[w.region];
     li.querySelector('.tagSlot').appendChild(tag);
   }
+  if (knew) {
+    const tag = document.createElement('span');
+    tag.className = 'tag knew-tag';
+    tag.textContent = 'знаю';
+    li.querySelector('.tagSlot').appendChild(tag);
+  }
 
   const btn = document.createElement('button');
-  btn.className = 'act' + (have ? ' done' : '');
-  btn.textContent = have ? '✓' : '+';
-  btn.setAttribute('aria-label', have ? 'Уже в словаре' : 'Добавить ' + w.es);
-  if (have) btn.disabled = true;
-  else btn.addEventListener('click', () => add(w, li, btn));
+  if (inDict) {
+    btn.className = 'act done';
+    btn.textContent = '✓';
+    btn.setAttribute('aria-label', 'Уже в словаре');
+    btn.disabled = true;
+  } else if (knew) {
+    btn.className = 'act marked';
+    btn.textContent = '✓';
+    btn.setAttribute('aria-label', 'Снять отметку «знаю» с ' + w.es);
+    btn.addEventListener('click', () => mark(w, li, false));
+  } else {
+    const k = document.createElement('button');
+    k.className = 'knew';
+    k.textContent = 'знаю';
+    k.setAttribute('aria-label', 'Отметить «знаю»: ' + w.es);
+    k.addEventListener('click', () => mark(w, li, true));
+    li.appendChild(k);
+    btn.className = 'act';
+    btn.textContent = '+';
+    btn.setAttribute('aria-label', 'Добавить ' + w.es);
+    btn.addEventListener('click', () => add(w, li, btn));
+  }
   li.appendChild(btn);
   return li;
 }
 
+// «Знаю» — no Claude call, so it's instant: flip locally, roll back if the server says no.
+async function mark(w, li, on) {
+  const key = normalize(w.es);
+  const apply = (state) => {
+    if (state) marked.add(key); else marked.delete(key);
+    li.replaceWith(row(w));
+    progress();
+  };
+  apply(on);
+  haptic(on ? 'success' : 'warning');
+  toast(on ? `${w.es} — отмечено «знаю», без карточки` : `${w.es} — отметка снята`);
+  try {
+    const res = await fetch('/catalog/mark', {
+      method: 'POST', headers: headers(), body: JSON.stringify({ es: w.es, known: on }),
+    });
+    if (!res.ok) throw new Error('mark failed');
+  } catch (e) {
+    if (on) marked.delete(key); else marked.add(key);
+    progress();
+    applyFilter();
+    haptic('error');
+    toast('Не получилось сохранить отметку — попробуй ещё раз');
+  }
+}
+
 async function add(w, li, btn) {
   btn.disabled = true;
+  const knewBtn = li.querySelector('.knew');
+  if (knewBtn) knewBtn.disabled = true;
   btn.textContent = '';
   btn.appendChild(Object.assign(document.createElement('span'), { className: 'sp' }));
   try {
@@ -368,6 +434,7 @@ async function add(w, li, btn) {
       if (payload.phrase) known.add(normalize(payload.phrase));
       btn.textContent = '✓';
       btn.className = 'act done';
+      if (knewBtn) knewBtn.remove();
       li.classList.add('have');
       progress();
       haptic('success');
@@ -376,6 +443,7 @@ async function add(w, li, btn) {
         : `${payload.phrase || w.es} уже было в словаре`);
     } else if (status === 'limit') {
       btn.textContent = '+'; btn.className = 'act'; btn.disabled = false;
+      if (knewBtn) knewBtn.disabled = false;
       haptic('warning');
       toast('Недельный лимит новых слов исчерпан');
     } else {
@@ -383,6 +451,7 @@ async function add(w, li, btn) {
     }
   } catch (e) {
     btn.textContent = '↻'; btn.className = 'act err'; btn.disabled = false;
+    if (knewBtn) knewBtn.disabled = false;
     haptic('error');
     toast('Не получилось добавить — попробуй ещё раз');
   }
@@ -456,7 +525,9 @@ async function boot() {
     const payload = await dataRes.json();
     data.words = payload.words || [];
     data.phrases = payload.phrases || [];
-    known = new Set((await stateRes.json()).known || []);
+    const state = await stateRes.json();
+    known = new Set(state.known || []);
+    marked = new Set(state.marked || []);
   } catch (e) {
     $('sub').textContent = 'Не удалось загрузить список. Попробуй открыть заново.';
     return;
