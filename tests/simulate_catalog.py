@@ -142,6 +142,32 @@ async def main():
     check("фразы приходят тем же запросом",
           len(payload["phrases"]) == len(phrases) and len(payload["phraseCategories"]) >= 10)
 
+    print("\n7. Отметка «знаю»")
+    res = await client.post("/catalog/mark", json={"es": "El Perro", "known": True})
+    check("отметка сохраняется под нормализованным ключом",
+          (await res.json()) == {"status": "marked", "key": "perro"})
+    calls_before = len(added_calls)
+    await client.post("/catalog/mark", json={"es": "perro", "known": True})
+    check("повторная отметка не падает", db.get_catalog_known(OWNER_ID) == {"perro"})
+    check("Claude при отметке не зовётся", len(added_calls) == calls_before)
+    state = await (await client.get("/catalog/state")).json()
+    check("отмеченное — в marked, не в known",
+          "perro" in state["marked"] and "perro" not in state["known"])
+    check("словарь не тронут", db.find_word_by_phrase(OWNER_ID, "perro") is None
+          and db.find_word_by_phrase(OWNER_ID, "el perro") is None)
+    await client.post("/catalog/mark", json={"es": "hablar", "known": True})
+    state = await (await client.get("/catalog/state")).json()
+    check("слово с карточкой считается «в словаре», а не «знаю»",
+          "hablar" in state["known"] and "hablar" not in state["marked"])
+    await client.post("/catalog/mark", json={"es": "perro", "known": False})
+    state = await (await client.get("/catalog/state")).json()
+    check("отметку можно снять", "perro" not in state["marked"])
+    res = await client.post("/catalog/mark", json={"es": "  "})
+    check("пустое слово → 400", res.status == 400)
+    voice_talk.request_owner_id = lambda request: None
+    res = await client.post("/catalog/mark", json={"es": "perro"})
+    check("/catalog/mark без авторизации → 401", res.status == 401)
+
     await client.close()
     print()
     if failures:
