@@ -260,6 +260,26 @@ def init_db():
         conn.execute("ALTER TABLE voice_sessions ADD COLUMN analysis TEXT DEFAULT '{}'")
     except sqlite3.OperationalError:
         pass
+    try:
+        # a picture-description conversation (/scene → «Описать голосом»): the scene it's about
+        conn.execute("ALTER TABLE voice_sessions ADD COLUMN scene_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+    # /scene pictures — see scene_practice.py. words: [{"es", "ru", "shown"}] after the vision
+    # check; seen: what Claude actually sees in the picture (the conversation works from it).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scenes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            words TEXT NOT NULL,
+            seen TEXT NOT NULL,
+            image BLOB NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS talk_memory (
@@ -1057,11 +1077,12 @@ def get_voice_target_words(user_id: int, limit: int = 10):
     return [dict(r) for r in rows]
 
 
-def create_voice_session(user_id: int, target_words) -> int:
+def create_voice_session(user_id: int, target_words, scene_id: int | None = None) -> int:
     conn = get_connection()
     cur = conn.execute(
-        "INSERT INTO voice_sessions (user_id, target_words, started_at) VALUES (?, ?, ?)",
-        (user_id, json.dumps(list(target_words), ensure_ascii=False), datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO voice_sessions (user_id, target_words, started_at, scene_id) VALUES (?, ?, ?, ?)",
+        (user_id, json.dumps(list(target_words), ensure_ascii=False), datetime.now(timezone.utc).isoformat(),
+         scene_id),
     )
     session_id = cur.lastrowid
     conn.commit()
@@ -1226,3 +1247,38 @@ def set_catalog_known(user_id: int, key: str, es: str, known: bool):
         conn.execute("DELETE FROM catalog_known WHERE user_id = ? AND key = ?", (user_id, key))
     conn.commit()
     conn.close()
+
+
+def create_scene(user_id: int, title: str, words, seen: str, image: bytes) -> int:
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT INTO scenes (user_id, title, words, seen, image, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, title, json.dumps(list(words), ensure_ascii=False), seen, image,
+         datetime.now(timezone.utc).isoformat()),
+    )
+    scene_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return scene_id
+
+
+def get_scene(scene_id: int):
+    """Without the image — see get_scene_image."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT id, user_id, title, words, seen, created_at FROM scenes WHERE id = ?", (scene_id,)
+    ).fetchone()
+    conn.close()
+    if row is None:
+        return None
+    d = dict(row)
+    d["words"] = json.loads(d["words"] or "[]")
+    return d
+
+
+def get_scene_image(scene_id: int):
+    """(user_id, jpeg bytes) or None."""
+    conn = get_connection()
+    row = conn.execute("SELECT user_id, image FROM scenes WHERE id = ?", (scene_id,)).fetchone()
+    conn.close()
+    return (row["user_id"], bytes(row["image"])) if row else None

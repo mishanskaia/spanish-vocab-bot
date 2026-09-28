@@ -1689,24 +1689,40 @@ async def _handle_scene_button(query, context: ContextTypes.DEFAULT_TYPE, action
     await bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
     try:
         image = await asyncio.to_thread(scene_practice.generate_image, chosen)
+        checked = await asyncio.to_thread(scene_practice.check_image, chosen, image)
     except Exception:
-        logger.exception("scene: image generation failed")
+        logger.exception("scene: image generation or check failed")
         await query.message.reply_text(
             "Картинка не получилась.",
             reply_markup=_scene_keyboard(stored["token"], stored["items"]),
         )
         return
-    targets = ", ".join(f"{w['es']} — {w['ru']}" for w in chosen["words"])
+    if len(checked["words"]) < scene_practice.MIN_VISIBLE_WORDS:
+        await query.message.reply_text(
+            "Нарисовалось не то: на картинке почти не узнаются слова этой сцены. Выбери ещё раз.",
+            reply_markup=_scene_keyboard(stored["token"], stored["items"]),
+        )
+        return
+    scene_id = db.create_scene(query.from_user.id, chosen["title"], checked["words"], checked["seen"], image)
+    targets = ", ".join(f"{w['es']} — {w['ru']}" for w in checked["words"])
+    base = voice_talk.public_base_url()
+    markup = None
+    if base:
+        token = voice_talk.make_link_token(query.from_user.id)
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎙 Описать голосом", web_app=WebAppInfo(url=f"{base}/talk?scene={scene_id}"))],
+            [InlineKeyboardButton("Открыть в Safari", url=f"{base}/talk?t={token}&scene={scene_id}")],
+        ])
     await bot.send_photo(
         chat_id,
         photo=image,
         caption=(
             f"<b>{html.escape(chosen['title'])}</b>\n"
-            "Опиши картинку вслух по-испански. Потом открой слова и проверь: "
-            "назвала ли их и узнаются ли они на картинке.\n\n"
-            f"Слова: <tg-spoiler>{html.escape(targets)}</tg-spoiler>"
+            "Опиши картинку голосом — бот будет расспрашивать о деталях, а потом о тебе.\n\n"
+            f"Слова (не подглядывай до разговора): <tg-spoiler>{html.escape(targets)}</tg-spoiler>"
         ),
         parse_mode="HTML",
+        reply_markup=markup,
     )
     # the other scenes of this batch stay one tap away
     await bot.send_message(chat_id, "Другая сцена?", reply_markup=_scene_keyboard(stored["token"], stored["items"]))
@@ -1965,7 +1981,7 @@ OWNER_ONLY_COMMANDS = [
     ("practice", "Вечерняя практика прямо сейчас"),
     ("talk", "Живой разговор голосом (тест)"),
     ("catalog", "Топ-3000 слов: посмотреть и добавить"),
-    ("scene", "Опиши картинку (прототип)"),
+    ("scene", "Опиши картинку голосом"),
     ("talkreport", "Отчёт: как звучит твоя речь"),
     ("talkmemory", "Что бот помнит о тебе"),
     ("talkforget", "Стереть память разговоров"),
