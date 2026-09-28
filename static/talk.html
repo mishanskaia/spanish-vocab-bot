@@ -134,6 +134,7 @@
     STUCK_MS: 7000,        // silence this long → answer anyway and help with the word
     PREROLL_MS: 400,       // audio kept from before the voice was detected
     MIN_SPEECH_MS: 180,    // sustained voice to count as speech, not a click or cough
+    RESUME_SPEECH_MS: 250, // inside a pause the bar is higher: only this much unbroken voice stops the countdown
     VOICE_GAP_MS: 250,     // dips inside a word don't count as silence
     RUN_RESET_MS: 600,     // voice counter only resets after this much quiet — gaps between words don't
     BARGE_MS: 300,         // this much voice while the bot talks → she's interrupting
@@ -149,6 +150,20 @@
     VOICE_PERIODICITY: 0.4,       // normalized autocorrelation peak, 0..1 — clear voice
     VOICE_PERIODICITY_WEAK: 0.2,  // inside speech, right after a clear voiced frame: consonants and
     VOICE_HOLD_MS: 500,           // breathy endings count too, so a phrase doesn't break apart
+    // Once her phrase has ended and the pause countdown runs, only her voice may stop it — a bus
+    // passing or a glass put on the table must not (fifth live test). Three filters on top of the
+    // periodicity check: level and pitch are measured in the speech band only (a bus rumbles below
+    // it, a clink rings above it); a clean ringing tone faster than any voice (glass, dishes, beeps,
+    // birds) is not a voice even though it is periodic; and a new sound in a pause must be unbroken
+    // voice for RESUME_SPEECH_MS before the countdown restarts — a clink never is.
+    BAND_LOW_HZ: 120,
+    BAND_HIGH_HZ: 3400,
+    TONE_PERIODICITY: 0.9,        // a pure tone repeats almost perfectly; a voice doesn't below its pitch period
+    // A glass or a cup is struck: the sound jumps up within one frame and then only fades. A voice
+    // keeps rising and falling from syllable to syllable. So after such a jump nothing counts as her
+    // voice until the sound either stops or grows again well above the lowest point of its fade.
+    IMPACT_JUMP: 4,        // one frame this many times louder than the one before = something was struck
+    IMPACT_REGROW: 2,      // the fade is over when the level climbs back to 2x its lowest point since the hit
     PITCH_MIN_HZ: 70,
     PITCH_MAX_HZ: 320,
     PITCH_WINDOW_MS: 64,     // enough for two periods of the lowest pitch
@@ -212,6 +227,8 @@
   let noise = 0.004, voicedRun = 0, voiceActive = false, lastVoicedAt = 0, ignoreUntil = 0;
   let noiseWin = [], noiseWinMs = 0, echo = 0.006, aboveStreak = 0, level = 0, lastThr = 0, peak = 0, runStartedAt = 0;
   let pitchBuf = null, dsFactor = 1, lagMin = 0, lagMax = 0, periodicity = 0, lastPitchAt = -1e9;
+  let band = null, lastCandidateAt = -1e9, toneRejected = false;
+  let prevRms = 0, ringing = false, ringFloor = 0;
   let checkedFor = -1, stuckFor = -1, waitingHint = false;
   let preroll = [], prerollMs = 0;
   let utter = newUtter();
@@ -328,6 +345,29 @@
     pitchBuf = new Float32Array(Math.round((CFG.PITCH_WINDOW_MS / 1000) * rate));
     lagMin = Math.floor(rate / CFG.PITCH_MAX_HZ);
     lagMax = Math.ceil(rate / CFG.PITCH_MIN_HZ);
+    band = [biquad("highpass", CFG.BAND_LOW_HZ, ctx.sampleRate), biquad("lowpass", CFG.BAND_HIGH_HZ, ctx.sampleRate)];
+  }
+
+  // RBJ cookbook biquad, Q = 0.707. The raw audio still goes to STT — only the voice detector listens through this.
+  function biquad(type, f0, fs) {
+    const w = 2 * Math.PI * f0 / fs, cw = Math.cos(w), alpha = Math.sin(w) / (2 * Math.SQRT1_2);
+    const a0 = 1 + alpha;
+    const b1 = type === "highpass" ? -(1 + cw) : 1 - cw;
+    const b0 = type === "highpass" ? (1 + cw) / 2 : (1 - cw) / 2;
+    return { b0: b0 / a0, b1: b1 / a0, b2: b0 / a0, a1: -2 * cw / a0, a2: (1 - alpha) / a0, x1: 0, x2: 0, y1: 0, y2: 0 };
+  }
+  function speechBand(f32) {
+    const out = new Float32Array(f32.length);
+    out.set(f32);
+    for (const f of band) {
+      for (let i = 0; i < out.length; i++) {
+        const x = out[i];
+        const y = f.b0 * x + f.b1 * f.x1 + f.b2 * f.x2 - f.a1 * f.y1 - f.a2 * f.y2;
+        f.x2 = f.x1; f.x1 = x; f.y2 = f.y1; f.y1 = y;
+        out[i] = y;
+      }
+    }
+    return out;
   }
 
   function pushPitchSamples(f32) {
@@ -343,19 +383,24 @@
 
   function measurePeriodicity() {
     const n = pitchBuf.length;
-    let best = 0;
-    for (let lag = lagMin; lag <= lagMax; lag++) {
+    const r = new Float32Array(lagMax + 2);
+    for (let lag = 2; lag <= lagMax + 1; lag++) {
       let num = 0, e1 = 0, e2 = 0;
       for (let i = 0; i + lag < n; i++) {
         const a = pitchBuf[i], b = pitchBuf[i + lag];
         num += a * b; e1 += a * a; e2 += b * b;
       }
       const denom = Math.sqrt(e1 * e2);
-      if (denom > 1e-9) {
-        const r = num / denom;
-        if (r > best) best = r;
-      }
+      r[lag] = denom > 1e-9 ? num / denom : 0;
     }
+    // A clean peak at a period shorter than any voice (above PITCH_MAX_HZ) = a ringing tone, not her.
+    // A voice never repeats that cleanly inside one pitch period: formants decay within it.
+    toneRejected = false;
+    for (let lag = 3; lag < lagMin; lag++) {
+      if (r[lag] >= CFG.TONE_PERIODICITY && r[lag] > r[lag - 1] && r[lag] >= r[lag + 1]) { toneRejected = true; return 0; }
+    }
+    let best = 0;
+    for (let lag = lagMin; lag <= lagMax; lag++) if (r[lag] > best) best = r[lag];
     return best;
   }
 
@@ -368,9 +413,10 @@
       prerollMs -= (preroll.shift().length / ctx.sampleRate) * 1000;
     }
 
+    const vf = speechBand(f32);
     let sum = 0;
-    for (let i = 0; i < f32.length; i++) sum += f32[i] * f32[i];
-    const rms = Math.sqrt(sum / f32.length);
+    for (let i = 0; i < vf.length; i++) sum += vf[i] * vf[i];
+    const rms = Math.sqrt(sum / vf.length);
     level = rms;
     // room level = quietest moment of the last NOISE_WINDOW_MS (not while the bot talks — the mic hears it then)
     if (state !== "speaking") {
@@ -392,28 +438,43 @@
     }
     lastThr = thr;
 
-    pushPitchSamples(f32);
-    const loudEnough = rms > thr && now > ignoreUntil;
+    pushPitchSamples(vf);
+    // struck and fading (see IMPACT_JUMP) — ends when the sound dies out or grows again, like a voice would
+    if (rms > thr && rms > prevRms * CFG.IMPACT_JUMP) { ringing = true; ringFloor = rms; }
+    else if (ringing) {
+      ringFloor = Math.min(ringFloor, rms);
+      if (rms <= thr || rms > ringFloor * CFG.IMPACT_REGROW) ringing = false;
+    }
+    prevRms = rms;
+    const loudEnough = rms > thr && now > ignoreUntil && !ringing;
     periodicity = loudEnough ? measurePeriodicity() : 0;
     // loud AND periodic: the cat, a knock or the street are loud but have no pitch
     if (periodicity >= CFG.VOICE_PERIODICITY) lastPitchAt = now;
+    // the weaker bar only while she is audibly talking — in a pause it would let noise in
     const humanSound = periodicity >= CFG.VOICE_PERIODICITY
-      || (periodicity >= CFG.VOICE_PERIODICITY_WEAK && now - lastPitchAt < CFG.VOICE_HOLD_MS);
+      || (voiceActive && periodicity >= CFG.VOICE_PERIODICITY_WEAK && now - lastPitchAt < CFG.VOICE_HOLD_MS);
     aboveStreak = loudEnough && humanSound ? aboveStreak + 1 : 0;
     const voiced = aboveStreak >= 2;  // a one-frame spike (a clink, a click) isn't voice
+    // lastVoicedAt (what the pause countdown runs from) moves only once the sound is confirmed as her
+    // voice (voiceActive below); lastCandidateAt tracks every voiced-looking frame while we decide.
     if (voiced) {
       if (voicedRun === 0) runStartedAt = now;
-      voicedRun += dt; lastVoicedAt = now;
-      if (utter.hasSpeech) peak = Math.max(peak, rms);
+      voicedRun += dt; lastCandidateAt = now;
+      if (voiceActive) lastVoicedAt = now;
+      if (voiceActive && utter.hasSpeech) peak = Math.max(peak, rms);
     }
-    else if (now - lastVoicedAt > CFG.RUN_RESET_MS) voicedRun = 0;
-    else voicedRun = Math.max(0, voicedRun - dt * 0.5);  // short gaps between words only slow it down
+    else if (state === "speaking") {
+      // barging in: gaps between her words only slow the counter down, or she'd be noticed ~1.5 s late
+      if (now - lastCandidateAt > CFG.RUN_RESET_MS) voicedRun = 0;
+      else voicedRun = Math.max(0, voicedRun - dt * 0.5);
+    }
+    else if (now - lastCandidateAt > CFG.VOICE_GAP_MS) voicedRun = 0;  // listening: the run must be unbroken
 
     // keep recording while a check is in flight too — if she carries on, that audio is part of the same utterance
     if ((state === "listening" || state === "thinking") && utter.hasSpeech) { utter.chunks.push(f32); utter.ms += dt; }
 
-    const need = state === "speaking" ? CFG.BARGE_MS : CFG.MIN_SPEECH_MS;
-    if (!voiceActive && voicedRun >= need) { voiceActive = true; onVoiceStart(); }
+    const need = state === "speaking" ? CFG.BARGE_MS : utter.hasSpeech ? CFG.RESUME_SPEECH_MS : CFG.MIN_SPEECH_MS;
+    if (!voiceActive && voicedRun >= need) { voiceActive = true; lastVoicedAt = now; onVoiceStart(); }
     if (voiceActive && now - lastVoicedAt > CFG.VOICE_GAP_MS) voiceActive = false;
     document.body.classList.toggle("voice", voiceActive);
   }
@@ -587,14 +648,17 @@
   // ---------- timer: silence → check / stuck, ring ----------
   function tick() {
     diag["уровень / шум / порог"] = `${level.toFixed(4)} / ${noise.toFixed(4)} / ${lastThr.toFixed(4)}`;
-    diag["периодичность"] = `${periodicity.toFixed(2)} (нужно ${CFG.VOICE_PERIODICITY})`;
+    diag["периодичность"] = ringing ? "удар/звон — не голос" : toneRejected ? "звенящий тон — не голос" : `${periodicity.toFixed(2)} (нужно ${CFG.VOICE_PERIODICITY})`;
     diag["пик голоса"] = peak ? peak.toFixed(4) : "—";
     if (document.getElementById("diag").classList.contains("open")) renderDiag();
     let progress = 0;
     if ((state === "listening" || state === "thinking") && utter.hasSpeech && !voiceActive) {
-      const silence = performance.now() - lastVoicedAt;
+      const now = performance.now(), silence = now - lastVoicedAt;
       progress = Math.max(0, Math.min(1, (silence - 400) / (CFG.STUCK_MS - 400)));
-      if (!inflight && silence >= CFG.STUCK_MS && stuckFor !== lastVoicedAt) {
+      // a voice-like sound is being judged right now — hold the check a moment, but don't restart the countdown
+      const judging = voicedRun > 0 && now - lastCandidateAt < CFG.VOICE_GAP_MS;
+      if (judging) { /* wait */ }
+      else if (!inflight && silence >= CFG.STUCK_MS && stuckFor !== lastVoicedAt) {
         stuckFor = lastVoicedAt; sendTurn("stuck");
       } else if (!inflight && silence >= CFG.PAUSE_CHECK_MS && checkedFor !== lastVoicedAt) {
         checkedFor = lastVoicedAt; sendTurn("auto");
