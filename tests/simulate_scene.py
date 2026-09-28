@@ -72,12 +72,14 @@ SCENES_REPLY = {"scenes": [
 class FakeBot:
     def __init__(self):
         self.sent = []
+        self.photo_markups = []
 
     async def send_message(self, chat_id, text, **kw):
         self.sent.append(("text", text, kw.get("reply_markup")))
 
     async def send_photo(self, chat_id, photo, caption=None, **kw):
         self.sent.append(("photo", caption, photo))
+        self.photo_markups.append(kw.get("reply_markup"))
 
     async def send_chat_action(self, *a, **kw):
         pass
@@ -156,17 +158,43 @@ async def main():
 
     def fake_image(scene):
         images.append(scene["title"])
-        return b"PNG"
+        return b"JPEG"
+
+    # the vision check: one of the four words isn't really in the picture
+    def fake_check(scene, image):
+        return {"seen": "A woman under an umbrella at a bus stop, the street is wet.",
+                "words": [{"es": w["es"], "ru": w["ru"], "shown": "clearly"} for w in scene["words"]
+                          if w["es"] != "esperar"]}
 
     scene_practice.generate_image = fake_image
+    scene_practice.check_image = fake_check
+    os.environ["PUBLIC_BASE_URL"] = "https://bot.example"
     await bot.on_button(SimpleNamespace(callback_query=_answerable(FakeQuery(fbot, buttons[0].callback_data))), context)
     photos = [s for s in fbot.sent if s[0] == "photo"]
     check("нарисована выбранная сцена", images == ["Дождь на остановке"])
-    check("слова под спойлером в подписи", photos and "<tg-spoiler>el paraguas — зонт" in photos[-1][1])
+    check("под спойлером только слова, которые видны на картинке",
+          photos and "<tg-spoiler>el paraguas — зонт" in photos[-1][1] and "esperar" not in photos[-1][1])
     check("после картинки снова можно выбрать другую сцену", fbot.sent[-1][2] is not None)
+    scene_row = db.get_scene(1)
+    check("сцена сохранена: что видно и какие слова", scene_row and scene_row["seen"].startswith("A woman")
+          and [w["es"] for w in scene_row["words"]] == ["el paraguas", "la parada", "mojado"])
+    check("картинка лежит в базе", db.get_scene_image(1) == (OWNER_ID, b"JPEG"))
+    photo_markup = fbot.photo_markups[-1]
+    urls = [b.web_app.url if b.web_app else b.url for row in photo_markup.inline_keyboard for b in row]
+    check("кнопка «Описать голосом» открывает разговор по этой сцене",
+          urls[0] == "https://bot.example/talk?scene=1" and "scene=1" in urls[1] and "t=" in urls[1])
+
+    def blind_check(scene, image):
+        return {"seen": "Something else entirely.", "words": [{"es": scene["words"][0]["es"], "ru": "", "shown": ""}]}
+
+    scene_practice.check_image = blind_check
+    await bot.on_button(SimpleNamespace(callback_query=_answerable(FakeQuery(fbot, buttons[1].callback_data))), context)
+    check("видно меньше двух слов — не присылаем, предлагаем выбрать снова",
+          "Нарисовалось не то" in fbot.sent[-1][1] and db.get_scene(2) is None)
+    scene_practice.check_image = fake_check
 
     await bot.on_button(SimpleNamespace(callback_query=_answerable(FakeQuery(fbot, "scene:deadbeef:0"))), context)
-    check("старая кнопка → «устарели», без генерации", "устарели" in fbot.sent[-1][1] and len(images) == 1)
+    check("старая кнопка → «устарели», без генерации", "устарели" in fbot.sent[-1][1] and len(images) == 2)
 
     def broken_image(scene):
         raise RuntimeError("boom")
@@ -183,9 +211,95 @@ async def main():
     await bot.scene(other, context)
     check("не владельцу — тишина", len(fbot.sent) == before)
 
+    await talk_part()
+
     os.remove(DB_FILE)
     print("\n" + ("✅ Все проверки прошли" if not failures else f"❌ Упало: {len(failures)}"))
     sys.exit(1 if failures else 0)
+
+
+async def talk_part():
+    print("\n4. Разговор по картинке (сервер /talk)")
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+    import stt_helper
+    import voice_talk
+
+    systems = []
+    replies = iter([
+        {"reply": "¡Hola! Cuéntame, ¿qué ves?", "translations": [], "used_words": []},
+        # she said "paraguas" without the article — Claude marks the list form
+        {"reply": "¡Sí! ¿Y cómo está la calle?", "translations": [], "used_words": ["el paraguas", "inventada"]},
+        {"reply": "¡Hola! ¿Qué tal tu día?", "translations": [], "used_words": []},
+    ])
+
+    def fake_turn(system, history, user_text):
+        systems.append((system, user_text))
+        return next(replies), {"llm_in": 10, "llm_out": 5}
+
+    voice_talk.claude_turn = fake_turn
+    voice_talk.classify_complete = lambda last, text: (True, {})
+    stt_helper.synthesize = lambda text: b"MP3"
+    stt_helper.transcribe_mixed = lambda audio, name: "Una mujer con paraguas espera el autobús"
+    captured = {}
+    voice_talk.update_memory = lambda uid, transcript, about_picture=False: captured.setdefault("about_picture", about_picture)
+    voice_talk.analyze_conversation = lambda transcript, known=(): {"errors": [], "upgrades": [], "unused": []}
+
+    class Bot:
+        async def send_message(self, chat_id, text, **kw):
+            captured.setdefault("summary", text)
+
+    app = web.Application()
+    voice_talk.register(app, bot=Bot(), bot_token="123:test-token", owner_id=OWNER_ID)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    auth = {"X-Talk-Token": voice_talk.make_link_token(OWNER_ID)}
+    stranger = {"X-Talk-Token": voice_talk.make_link_token(1)}
+
+    res = await client.get("/talk/scene/1/image")
+    check("картинка без авторизации → 401", res.status == 401)
+    res = await client.get("/talk/scene/1/image", headers=stranger)
+    check("чужой токен → 401", res.status == 401)
+    res = await client.get("/talk/scene/1/image", headers=auth)
+    check("владельцу картинка отдаётся", res.status == 200 and await res.read() == b"JPEG")
+    res = await client.get("/talk/scene/99/image", headers=auth)
+    check("несуществующая → 404", res.status == 404)
+
+    res = await client.post("/talk/start", headers=auth, json={"scene_id": 99})
+    check("старт по несуществующей сцене → 404", res.status == 404)
+    res = await client.post("/talk/start", headers=auth, json={"scene_id": 1})
+    body = await res.json()
+    check("старт по сцене", res.status == 200 and body["scene"]["image"] == "/talk/scene/1/image"
+          and body["target_count"] == 3)
+    system = systems[-1][0]
+    check("промпт картинки: что на ней и слова с тем, где они видны",
+          "A woman under an umbrella" in system and "el paraguas — зонт (in the picture: clearly)" in system)
+    check("в промпте три фазы и лестница подсказок", "Her life" in system and "empieza por" in system)
+    check("промпт обычного разговора не подмешан", "pick an everyday topic" not in system)
+    check("ответ просит used_words", '"used_words"' in system)
+
+    session_id = body["session_id"]
+    check("сессия привязана к сцене", db.get_voice_session(session_id)["scene_id"] == 1)
+    form = {"session_id": str(session_id), "history": "[]", "mode": "done", "audio": b"RIFF" + b"\0" * 100}
+    res = await client.post("/talk/turn", headers=auth, data=form)
+    check("ход в режиме картинки", res.status == 200 and (await res.json())["status"] == "reply")
+    check("на ходу тот же промпт картинки", "A woman under an umbrella" in systems[-1][0])
+    use = db.get_voice_session(session_id)["word_use"]
+    check("слово засчитано по отметке Claude; выдуманное имя — нет",
+          use.get("el paraguas") == "spontaneous" and "inventada" not in use)
+
+    res = await client.post("/talk/start", headers=auth, json={})
+    plain = await res.json()
+    check("обычный /talk по-прежнему без сцены", plain["scene"] is None
+          and "pick an everyday topic" in systems[-1][0])
+
+    res = await client.post("/talk/transcript", headers=auth, json={
+        "session_id": session_id, "ended": True,
+        "transcript": [{"role": "assistant", "text": "¿Qué ves?"}, {"role": "user", "text": "Una mujer con paraguas"}],
+    })
+    check("память знает, что первая часть — про картинку", captured.get("about_picture") is True)
+    check("в итоге название сцены", "Дождь на остановке" in captured.get("summary", ""))
+    await client.close()
 
 
 def _answerable(query):

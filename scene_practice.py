@@ -1,13 +1,14 @@
-"""/scene — describe-a-picture prototype (owner only, 2026-09-28).
+"""/scene — describe a picture built from words she knows (owner only, 2026-09-28).
 
 The problem it goes after: in /talk she steers the conversation to comfortable topics, so
 words she recognises but doesn't use never come up (avoidance). A picture takes the topic
 out of her hands — what's drawn has to be described.
 
-Prototype scope is deliberately narrow: check the two unknowns before building a voice mode
-around it — do her words group into sensible scenes, and are they recognisable in the
-generated picture. So: pool → Claude proposes 3 themed scenes → she picks → one picture.
-No conversation, no scoring yet.
+Flow: pool → Claude proposes 3 themed scenes → she picks → OpenAI draws one → Claude looks
+at the actual picture (check_image): what's really drawn and which words can be seen → the
+scene is saved (db.scenes) → «Описать голосом» opens the /talk page in picture mode
+(voice_talk.build_scene_instructions): her description → questions about what she hasn't
+named, with a hint ladder → her own life with the same words.
 
 Pool = words she knows or almost knows: cards at stage 1+ (status learning and above) plus
 catalog words marked «знаю». Scenes are built theme-first — 3-4 words that plausibly meet
@@ -15,6 +16,7 @@ in one everyday situation, not a collage of random objects.
 """
 
 import base64
+import json
 import os
 import random
 
@@ -125,11 +127,85 @@ def image_prompt(scene: dict) -> str:
 
 
 def generate_image(scene: dict) -> bytes:
-    """PNG bytes. Same OpenAI client (and key) as speech — no separate setup."""
+    """JPEG bytes (a few hundred KB instead of a ~2 MB PNG — it's stored in the DB for the
+    voice mode). Same OpenAI client (and key) as speech — no separate setup."""
     result = stt_helper._get_client().images.generate(
         model=IMAGE_MODEL,
         prompt=image_prompt(scene),
         size="1024x1024",
         quality=IMAGE_QUALITY,
+        output_format="jpeg",
+        output_compression=85,
     )
     return base64.b64decode(result.data[0].b64_json)
+
+
+# ---------------------------------------------------------------------------
+# Vision check — the picture is drawn from a description, and the generator doesn't
+# always draw everything (first live test: 3 of 4 words guessable, the 4th "non-trivial").
+# Claude looks at the actual picture once: what's really there becomes the conversation's
+# ground truth, and a word that can't be seen is dropped instead of asked about.
+# ---------------------------------------------------------------------------
+
+MIN_VISIBLE_WORDS = 2
+
+CHECK_SYSTEM = (
+    "You check pictures for a Spanish picture-description exercise. A learner (A1-A2) will describe "
+    "the picture aloud; a conversation partner who can't see it will ask her about it from your notes."
+)
+
+CHECK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "seen": {"type": "string"},
+        "words": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "es": {"type": "string"},
+                    "visible": {"type": "boolean"},
+                    "how": {"type": "string"},
+                },
+                "required": ["es", "visible", "how"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["seen", "words"],
+    "additionalProperties": False,
+}
+
+
+def check_image(scene: dict, image: bytes) -> dict:
+    """Sync (blocking) — call through asyncio.to_thread. Returns {"seen", "words"}: words
+    are the scene's words that really are recognisable, each with "shown" — where/how."""
+    listing = "\n".join(f"- {w['es']} — {w['ru']}" for w in scene["words"])
+    response = ai_helper.client.messages.create(
+        model=ai_helper.MODEL,
+        max_tokens=1500,
+        system=CHECK_SYSTEM,
+        messages=[{"role": "user", "content": [
+            {"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg", "data": base64.b64encode(image).decode(),
+            }},
+            {"type": "text", "text": f"""Target words:
+{listing}
+
+1. "seen": describe what is actually in the picture, in English, 3-6 plain sentences: the setting, the people
+   and what they are doing, the objects that stand out and where they are. Only what is really drawn.
+2. "words": for each target word (copy "es" exactly), "visible": true only if a learner looking at this
+   picture would naturally name that thing/action/state with this word — not if it's tiny, ambiguous or
+   better named by a different word. "how": where and how it appears (English, a few words), or why not."""},
+        ]}],
+        output_config={"format": {"type": "json_schema", "schema": CHECK_SCHEMA}},
+    )
+    text = next((b.text for b in response.content if b.type == "text"), "{}")
+    data = json.loads(text)
+    verdicts = {str(v.get("es", "")).strip().lower(): v for v in data.get("words") or []}
+    words = []
+    for w in scene["words"]:
+        v = verdicts.get(w["es"].lower())
+        if v and v.get("visible"):
+            words.append({"es": w["es"], "ru": w["ru"], "shown": str(v.get("how") or "").strip()})
+    return {"seen": str(data.get("seen") or "").strip(), "words": words}

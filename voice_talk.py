@@ -152,10 +152,33 @@ def _request_owner_id(request: web.Request) -> int | None:
 # Conversation setup
 # ---------------------------------------------------------------------------
 
+# Shared by the free conversation and the picture mode (scene) — same rules, one copy.
+MISTAKES_RULES = """Mistakes:
+- Don't explain grammar and don't stop the conversation to correct.
+- Only when she made a real mistake: slip the correct form into your reaction in passing (e.g. "¡Ah, fuiste al cine! ¿Y qué viste?"). If there was no mistake, don't repeat anything.
+- Never "correct" feminine forms she uses about herself.
+- If the Russian word is literally there in her message, SAY it out loud at the start of your reply — the Russian word, then the Spanish: "«Шапка» en español es «el gorro»." (write the Russian word in Cyrillic; it is read aloud). Then react to what she said and continue. If instead she described the thing in Spanish without knowing the word ("una cosa en la cabeza"), don't bring Russian into it at all — just "Ah, se dice «el gorro»" and continue.
+- If she asks what a Spanish word means, you may give the Russian translation in one short phrase — keep the Spanish word in Latin letters: "«Frontera» es «граница»." Then continue in Spanish.
+- If she seems lost or asks (even in Russian) to repeat, say it again more simply.
+
+"""
+
+
+def _facts_rules(facts) -> str:
+    block = ("\n".join(f"- {f}" for f in facts) if facts
+             else "- (todavía no sabes nada de ella — es vuestra primera conversación)")
+    return f"""What you already know about her (from your earlier conversations — she expects you to remember):
+{block}
+
+- Never ask about something on that list; build on it instead ("¿Cómo están tus gatos?" rather than "¿Tienes gatos?").
+- Don't recite the list back to her and don't say you read it somewhere — you simply remember.
+
+"""
+
+
 def build_instructions(target_words, facts=()) -> str:
     word_lines = "\n".join(f"- {w['phrase']} — {w['meaning']}" for w in target_words)
-    facts_block = ("\n".join(f"- {f}" for f in facts) if facts
-                   else "- (todavía no sabes nada de ella — es vuestra primera conversación)")
+    facts_rules = _facts_rules(facts)
     # Priorities rewritten after the first live test (2026-09-19): v1 put the target
     # words first and said "switch word every 2-3 turns" + "recast her idea" — the
     # result was a questionnaire that jumped topics and parroted her back before
@@ -195,24 +218,46 @@ Target words:
 - Never list them, never mention that they are targets.
 - It's fine if only 2–3 of them come up in the whole conversation.
 
-Mistakes:
-- Don't explain grammar and don't stop the conversation to correct.
-- Only when she made a real mistake: slip the correct form into your reaction in passing (e.g. "¡Ah, fuiste al cine! ¿Y qué viste?"). If there was no mistake, don't repeat anything.
-- Never "correct" feminine forms she uses about herself.
-- If the Russian word is literally there in her message, SAY it out loud at the start of your reply — the Russian word, then the Spanish: "«Шапка» en español es «el gorro»." (write the Russian word in Cyrillic; it is read aloud). Then react to what she said and continue. If instead she described the thing in Spanish without knowing the word ("una cosa en la cabeza"), don't bring Russian into it at all — just "Ah, se dice «el gorro»" and continue.
-- If she asks what a Spanish word means, you may give the Russian translation in one short phrase — keep the Spanish word in Latin letters: "«Frontera» es «граница»." Then continue in Spanish.
-- If she seems lost or asks (even in Russian) to repeat, say it again more simply.
-
-What you already know about her (from your earlier conversations — she expects you to remember):
-{facts_block}
-
-- Never ask about something on that list; build on it instead ("¿Cómo están tus gatos?" rather than "¿Tienes gatos?").
-- Don't recite the list back to her and don't say you read it somewhere — you simply remember.
-
-Start: greet her briefly and open your chosen topic with a question.
+{MISTAKES_RULES}{facts_rules}Start: greet her briefly and open your chosen topic with a question.
 
 Target words (Spanish — Russian meaning):
 {word_lines or "- (no words yet — just have a simple everyday conversation)"}"""
+
+
+def build_scene_instructions(scene: dict, facts=()) -> str:
+    """Picture mode (/scene → «Описать голосом», 2026-09-28). Unlike the free conversation,
+    here the words come first: the picture takes the choice of topic away from her, which is
+    the point — in free talk she steers to comfortable topics and her passive words never
+    come up. Three phases: her description → questions about what she hasn't named, with a
+    hint ladder per word → her own life, where she reuses the same words unprompted (the
+    second, independent retrieval is what makes them stick)."""
+    word_lines = "\n".join(
+        f"- {w['es']} — {w['ru']}" + (f" (in the picture: {w['shown']})" if w.get("shown") else "")
+        for w in scene["words"]
+    )
+    return f"""You are a friendly Spanish-speaking friend. You and a Russian-speaking learner (A1–A2, a woman) are looking at the same picture on her phone. She describes it aloud and you talk about it. You can't see it yourself — this is what is in it:
+{scene["seen"]}
+
+Target words — each can be seen in the picture:
+{word_lines}
+
+The conversation has three phases. Move on when a phase is done; never announce or name the phases.
+
+1. Her description. Open with one short greeting and ask her to describe the picture. Let her talk; react briefly and warmly.
+2. Details. Ask about parts of the picture she hasn't mentioned, where the natural answer is a target word she hasn't said yet. One word at a time, one question per turn. Questions here may be concrete ("¿Qué tiene en la mano?", "¿Qué tiempo hace?").
+   - Don't say a target word yourself before she has had her chance.
+   - Up to two questions around a word. If she still doesn't produce it: a hint — what it's for, where it is, or how it starts ("empieza por «pa…»"). If that doesn't work either: give the word in a natural sentence and ask her to say something with it — "Es «el paraguas». ¿Qué hace la mujer con el paraguas?"
+   - A correct synonym is fine: accept it ("¡Sí!"), mention the target in passing ("también se dice «…»"), and let her use it.
+   - A word she has already said, in any form, is done — don't come back to it in this phase.
+3. Her life. When every target word has been said — by her or handed to her — bridge from the picture to her own life and have a real conversation: she leads, you react and ask one follow-up question. Ask grown-up questions (experience, opinion, reasons, choices, plans) whose natural answers reuse the target words in her own situation: "¿Y a ti? ¿Qué haces cuando llueve y no tienes paraguas?". Don't hand her the words again here — let her find them herself.
+
+How a turn sounds:
+- Simple A1–A2 words, short sentences (up to ~12 words). Keep your turn to 1–3 sentences; she talks more than you.
+- Never describe the picture for her, never list the target words, never mention that they are targets.
+- If she asks what something in the picture is called, tell her — then ask her to use it.
+- Do NOT start by repeating what she said.
+
+{MISTAKES_RULES}{_facts_rules(facts)}Start: greet her in one short sentence and ask her to describe the picture."""
 
 
 TURN_FORMAT = """
@@ -224,7 +269,8 @@ Answer with JSON:
 - "reply" is your next spoken turn, read aloud by text-to-speech: Spanish, plus Russian only where the rules above say so (naming the Russian word she used, a short translation she asked for). No emoji, no markdown, no stage directions, no translations in brackets.
 - If her message ends with [LARGA PAUSA], she went quiet for a long time: if it breaks off mid-sentence, she's stuck — help gently, offer the word she seems to be looking for or ask your question again more simply; if it's a finished thought, just reply normally.
 - [TERMINÉ] at the end only means she tapped "I'm done" — reply normally.
-- "translations": every Russian word or phrase in THIS message of hers that she used because she didn't know it in Spanish, with the Spanish the conversation needed — "ru" as she said it but always in Cyrillic (turn a Latin-letter transliteration like "shapka" back into "шапка"), "es" for a single word in dictionary form (nouns with their article, verbs in the infinitive): [{"ru": "шапка", "es": "el gorro"}]; for a whole Russian phrase, the natural Spanish phrase as she would say it here ("я много работаю" → "trabajo mucho"). Empty list if she used no Russian. Russian she used to ask you something ("что значит…", "как сказать…") is not a translation — answer the question instead. These are shown to her on screen and offered for her vocabulary, so the Spanish must be the natural, common A1–A2 word for her meaning."""
+- "translations": every Russian word or phrase in THIS message of hers that she used because she didn't know it in Spanish, with the Spanish the conversation needed — "ru" as she said it but always in Cyrillic (turn a Latin-letter transliteration like "shapka" back into "шапка"), "es" for a single word in dictionary form (nouns with their article, verbs in the infinitive): [{"ru": "шапка", "es": "el gorro"}]; for a whole Russian phrase, the natural Spanish phrase as she would say it here ("я много работаю" → "trabajo mucho"). Empty list if she used no Russian. Russian she used to ask you something ("что значит…", "как сказать…") is not a translation — answer the question instead. These are shown to her on screen and offered for her vocabulary, so the Spanish must be the natural, common A1–A2 word for her meaning.
+- "used_words": the target words she herself used in THIS message, in any grammatical form ("fui" counts for "ir", "paraguas" for "el paraguas") — copied exactly as they appear in the target list. Only her message, not your reply. Empty list if none."""
 
 TURN_SCHEMA = {
     "type": "object",
@@ -239,8 +285,9 @@ TURN_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "used_words": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["reply", "translations"],
+    "required": ["reply", "translations", "used_words"],
     "additionalProperties": False,
 }
 
@@ -304,12 +351,22 @@ def _history_to_messages(history, user_text: str | None) -> list[dict]:
     return messages
 
 
-def claude_turn(target_words, history, user_text: str | None, facts=()) -> tuple[dict, dict]:
+def session_instructions(target_words, facts=(), scene: dict | None = None) -> str:
+    base = build_scene_instructions(scene, facts) if scene else build_instructions(target_words, facts)
+    return base + TURN_FORMAT
+
+
+def scene_target_words(scene: dict) -> list[dict]:
+    """Scene words in the shape the rest of the session code uses."""
+    return [{"phrase": w["es"], "meaning": w["ru"]} for w in scene["words"]]
+
+
+def claude_turn(system: str, history, user_text: str | None) -> tuple[dict, dict]:
     """Sync (blocking) — call through asyncio.to_thread."""
     response = ai_helper.client.messages.create(
         model=TALK_LLM_MODEL,
         max_tokens=600,
-        system=build_instructions(target_words, facts) + TURN_FORMAT,
+        system=system,
         messages=_history_to_messages(history, user_text),
         output_config={"format": {"type": "json_schema", "schema": TURN_SCHEMA}},
         # the system prompt and history repeat on every turn — cache reads are 0.1x
@@ -367,21 +424,37 @@ async def handle_start(request: web.Request) -> web.Response:
     if not is_enabled():
         return web.json_response({"error": "OPENAI_API_KEY не задан"}, status=503)
 
-    target_words = db.get_voice_target_words(user_id, TARGET_WORD_COUNT)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    scene = None
+    if isinstance(body, dict) and body.get("scene_id"):
+        try:
+            scene = db.get_scene(int(body["scene_id"]))
+        except (TypeError, ValueError):
+            scene = None
+        if scene is None or scene["user_id"] != user_id:
+            return web.json_response({"error": "картинка не найдена"}, status=404)
+
+    target_words = scene_target_words(scene) if scene else db.get_voice_target_words(user_id, TARGET_WORD_COUNT)
+    system = session_instructions(target_words, db.get_talk_memory(user_id), scene)
     timings, usage = {}, {}
     try:
         t = time.monotonic()
-        data, usage = await asyncio.to_thread(claude_turn, target_words, [], None, db.get_talk_memory(user_id))
+        data, usage = await asyncio.to_thread(claude_turn, system, [], None)
         timings["llm_ms"] = round((time.monotonic() - t) * 1000)
-        reply = data.get("reply", "").strip() or "¡Hola! ¿Qué tal tu día?"
+        fallback = "¡Hola! ¿Qué ves en la imagen?" if scene else "¡Hola! ¿Qué tal tu día?"
+        reply = data.get("reply", "").strip() or fallback
         audio_b64 = await _speak(reply, usage, timings)
     except Exception as e:
         return _voice_error(e)
 
-    session_id = db.create_voice_session(user_id, target_words)
+    session_id = db.create_voice_session(user_id, target_words, scene["id"] if scene else None)
     return web.json_response({
         "session_id": session_id,
         "target_count": len(target_words),
+        "scene": {"title": scene["title"], "image": f"/talk/scene/{scene['id']}/image"} if scene else None,
         "reply": reply,
         "audio": audio_b64,
         "usage": usage,
@@ -435,9 +508,9 @@ async def handle_turn(request: web.Request) -> web.Response:
     marker = {"stuck": " [LARGA PAUSA]", "done": " [TERMINÉ]"}.get(mode, "")
     try:
         t = time.monotonic()
-        reply_task = asyncio.ensure_future(asyncio.to_thread(
-            claude_turn, session["target_words"], history, user_text + marker, db.get_talk_memory(user_id)
-        ))
+        scene = db.get_scene(session["scene_id"]) if session.get("scene_id") else None
+        system = session_instructions(session["target_words"], db.get_talk_memory(user_id), scene)
+        reply_task = asyncio.ensure_future(asyncio.to_thread(claude_turn, system, history, user_text + marker))
         if mode == "auto":
             last_bot = next((str(h.get("text", "")) for h in reversed(history) if h.get("role") == "assistant"), "")
             try:
@@ -464,7 +537,7 @@ async def handle_turn(request: web.Request) -> web.Response:
     except Exception as e:
         return _voice_error(e)
 
-    word_use = track_word_use(session, user_text, reply)
+    word_use = track_word_use(session, user_text, reply, data.get("used_words"))
     if word_use != (session.get("word_use") or {}):
         db.set_voice_word_use(session_id, word_use)
 
@@ -477,6 +550,21 @@ async def handle_turn(request: web.Request) -> web.Response:
         "usage": usage,
         "timings": timings,
     })
+
+
+async def handle_scene_image(request: web.Request) -> web.Response:
+    """The picture for the page. Fetched with the same auth headers as the API calls (an
+    <img src> can't send them), so it's owner-only like everything else here."""
+    user_id = _request_owner_id(request)
+    if user_id is None:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    try:
+        found = db.get_scene_image(int(request.match_info["scene_id"]))
+    except ValueError:
+        found = None
+    if found is None or found[0] != user_id:
+        return web.json_response({"error": "not found"}, status=404)
+    return web.Response(body=found[1], content_type="image/jpeg", headers={"Cache-Control": "private, max-age=86400"})
 
 
 async def handle_transcript(request: web.Request) -> web.Response:
@@ -504,7 +592,9 @@ async def handle_transcript(request: web.Request) -> web.Response:
 
     if ended and not already_done:
         # memory and the review are independent — run them side by side, then report
-        memory_task = asyncio.ensure_future(asyncio.to_thread(update_memory, user_id, transcript))
+        memory_task = asyncio.ensure_future(asyncio.to_thread(
+            update_memory, user_id, transcript, bool(session.get("scene_id"))
+        ))
         analysis_task = asyncio.ensure_future(asyncio.to_thread(
             analyze_conversation, transcript, db.get_known_words(user_id)
         ))
@@ -556,9 +646,16 @@ MEMORY_SCHEMA = {
 }
 
 
-def update_memory(user_id: int, transcript) -> list:
+SCENE_MEMORY_NOTE = (
+    "Ojo: la primera parte de esta conversación describe una imagen inventada (personas, objetos, "
+    "lo que pasa en ella). Eso NO es su vida — no guardes nada de la imagen, solo lo que cuenta de sí misma.\n\n"
+)
+
+
+def update_memory(user_id: int, transcript, about_picture: bool = False) -> list:
     """Sync (blocking) — call through asyncio.to_thread. Rewrites her memory from the
-    previous one plus this conversation, so the bot stops asking what it already knows."""
+    previous one plus this conversation, so the bot stops asking what it already knows.
+    about_picture: a /scene conversation — the picture's people aren't her."""
     spoken = "\n".join(f"{'ОНА' if t['role'] == 'user' else 'BOT'}: {t['text']}" for t in transcript if t.get("text"))
     if not spoken.strip():
         return db.get_talk_memory(user_id)
@@ -567,7 +664,7 @@ def update_memory(user_id: int, transcript) -> list:
         model=TALK_LLM_MODEL,
         max_tokens=1000,
         system=MEMORY_PROMPT.format(max_facts=MEMORY_MAX_FACTS),
-        messages=[{"role": "user", "content": f"Lo que ya recuerdas:\n" + ("\n".join(f"- {f}" for f in known) or "- (nada)") + f"\n\nConversación:\n{spoken}"}],
+        messages=[{"role": "user", "content": (SCENE_MEMORY_NOTE if about_picture else "") + f"Lo que ya recuerdas:\n" + ("\n".join(f"- {f}" for f in known) or "- (nada)") + f"\n\nConversación:\n{spoken}"}],
         output_config={"format": {"type": "json_schema", "schema": MEMORY_SCHEMA}},
     )
     text = next((b.text for b in response.content if b.type == "text"), "{}")
@@ -898,17 +995,22 @@ def _word_used(phrase: str, text: str) -> bool:
     return bool(verb) and re.search(rf"(?<!\w){re.escape(verb.group(1))}\w{{0,4}}(?!\w)", text) is not None
 
 
-def track_word_use(session: dict, user_text: str, reply: str) -> dict:
+def track_word_use(session: dict, user_text: str, reply: str, used_words=()) -> dict:
     """Who said each target word first — she (retrieval) or the bot (a hint she then reused).
     Retrieval practice is what makes a word stick, but an unsuccessful attempt followed
-    right away by the word works too — this is how we tell the two apart over time."""
+    right away by the word works too — this is how we tell the two apart over time.
+
+    used_words: Claude's own list of target words she used this turn, in any form — it
+    catches what the form match below can't ("fui" for "ir"). Only names from the target
+    list count; the form match stays as a fallback."""
     use = dict(session.get("word_use") or {})
+    claimed = {str(w).strip().lower() for w in used_words or ()}
     for word in session.get("target_words") or []:
         phrase = word["phrase"]
         state = use.get(phrase)
         if state in ("spontaneous", "after_hint"):
             continue
-        if _word_used(phrase, user_text):
+        if phrase.lower() in claimed or _word_used(phrase, user_text):
             use[phrase] = "after_hint" if state == "hinted" else "spontaneous"
         elif state is None and _word_used(phrase, reply):
             use[phrase] = "hinted"
@@ -959,13 +1061,14 @@ def build_summary(session: dict) -> str:
     ) / 1e6
     tts = usage.get("tts_seconds", 0) / 60 * PRICE_TTS_PER_MIN
 
+    scene = db.get_scene(session["scene_id"]) if session.get("scene_id") else None
+    title = f"🖼 <b>«{html.escape(scene['title'])}»</b>" if scene else "🎙 <b>Разговор сохранён</b>"
     lines = [
-        f"🎙 <b>Разговор сохранён</b> — {minutes} мин, твоих реплик: {user_turns}.",
+        f"{title} — {minutes} мин, твоих реплик: {user_turns}.",
         "",
         "💪 Вспомнила сама: " + (html.escape(", ".join(spontaneous)) if spontaneous else "—"),
         "💡 Сказала после подсказки: " + (html.escape(", ".join(after_hint)) if after_hint else "—"),
         "▫️ Не прозвучали: " + (html.escape(", ".join(unused)) if unused else "—"),
-        "<i>(совпадение по форме слова — неправильные глаголы вроде «fui» пока не ловятся)</i>",
         "",
     ]
     found = session.get("found_words") or []
@@ -1005,3 +1108,4 @@ def register(api: web.Application, *, bot, bot_token: str, owner_id: int):
     api.router.add_post("/talk/start", handle_start)
     api.router.add_post("/talk/turn", handle_turn)
     api.router.add_post("/talk/transcript", handle_transcript)
+    api.router.add_get("/talk/scene/{scene_id}/image", handle_scene_image)

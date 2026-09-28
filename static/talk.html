@@ -99,6 +99,12 @@
   #endBtn { background: color-mix(in srgb, var(--danger) 22%, #1c1c24); color: var(--danger); }
   .ctl:disabled { opacity: .3; }
   #error { color: var(--danger); font-size: 14px; text-align: center; }
+
+  /* picture mode (/scene → «Описать голосом»): the picture on top, a smaller orb under it */
+  #scenePic { display: none; max-width: 100%; max-height: 38vh; border-radius: 16px; margin: 8px auto 0; }
+  body.scene #scenePic { display: block; }
+  body.scene { --orb: 84px; }
+  body.scene #stage { padding: 10px 0 6px; }
 </style>
 </head>
 <body data-state="idle">
@@ -107,6 +113,7 @@
     <button id="diagBtn" aria-label="Диагностика">ⓘ</button>
   </header>
   <div id="diag"></div>
+  <img id="scenePic" alt="Картинка для описания">
 
   <div id="stage">
     <div id="orbWrap">
@@ -181,6 +188,7 @@
   const tg = window.Telegram && window.Telegram.WebApp;
   const initData = (tg && tg.initData) || "";
   const linkToken = new URLSearchParams(location.search).get("t") || "";
+  const sceneId = new URLSearchParams(location.search).get("scene") || "";
 
   const $ = (id) => document.getElementById(id);
   const statusEl = $("status"), hintEl = $("hint"), subsEl = $("subs"), errEl = $("error");
@@ -216,6 +224,17 @@
     if (initData) h["X-Tg-Init-Data"] = initData;
     else if (linkToken) h["X-Talk-Token"] = linkToken;
     return h;
+  }
+
+  // Picture mode: show the picture right away, before the first tap. Fetched with the auth
+  // headers — an <img src> can't send them.
+  if (sceneId && (initData || linkToken)) {
+    document.body.classList.add("scene");
+    statusEl.textContent = "Нажми на шар и опиши картинку";
+    fetch(`/talk/scene/${encodeURIComponent(sceneId)}/image`, { headers: authHeaders(false) })
+      .then((r) => { if (!r.ok) throw new Error(r.status); return r.blob(); })
+      .then((b) => { $("scenePic").src = URL.createObjectURL(b); })
+      .catch((e) => showError("Картинка не загрузилась (" + e.message + ")"));
   }
 
   // ---------- state ----------
@@ -699,11 +718,13 @@
     keepAwake();
 
     try {
-      const r = await fetch("/talk/start", { method: "POST", headers: authHeaders(true), body: "{}" });
+      const r = await fetch("/talk/start", {
+        method: "POST", headers: authHeaders(true), body: JSON.stringify(sceneId ? { scene_id: sceneId } : {}),
+      });
       const res = await r.json();
       if (!r.ok) throw new Error(res.error || r.status);
       sessionId = res.session_id;
-      diag["сессия"] = `#${sessionId}, целевых слов: ${res.target_count}`; renderDiag();
+      diag["сессия"] = `#${sessionId}, целевых слов: ${res.target_count}` + (res.scene ? `, картинка «${res.scene.title}»` : ""); renderDiag();
       addUsage(res.usage);
       addEntry("assistant", res.reply);
       pauseBtn.disabled = false; endBtn.disabled = false;
