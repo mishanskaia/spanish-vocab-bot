@@ -1206,6 +1206,14 @@ def get_catalog_known(user_id: int) -> set:
     return {r["key"] for r in rows}
 
 
+def get_catalog_known_entries(user_id: int) -> list:
+    """The same marks as get_catalog_known, with the Spanish as shown in the catalog."""
+    conn = get_connection()
+    rows = conn.execute("SELECT key, es FROM catalog_known WHERE user_id = ?", (user_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 def set_catalog_known(user_id: int, key: str, es: str, known: bool):
     conn = get_connection()
     if known:

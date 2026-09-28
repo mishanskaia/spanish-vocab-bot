@@ -41,6 +41,7 @@ import ai_helper
 import stt_helper
 import voice_talk
 import word_catalog
+import scene_practice
 
 logging.basicConfig(level=logging.INFO)
 # httpx logs every request URL at INFO, and Telegram Bot API URLs contain the bot token —
@@ -1007,6 +1008,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action in ("practice_next", "practice_stop"):
         await _handle_practice_button(query, action, parts)
 
+    # --- /scene: pick a scene / propose others ---
+    elif action in ("scene", "scene_more"):
+        await _handle_scene_button(query, context, action, parts)
+
     # --- dictated word: confirm / cancel ---
     elif action == "voice_add":
         await _handle_voice_add_button(query, context, parts)
@@ -1615,6 +1620,99 @@ async def catalog(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# /scene — describe-a-picture prototype (owner only), see scene_practice.py.
+# Scenes wait in user_data under a token, like pending_voice_word: ephemeral is fine for a
+# prototype, a restart just means «/scene ещё раз».
+# ---------------------------------------------------------------------------
+
+def _scene_keyboard(token: str, scenes: list[dict]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(s["title"], callback_data=f"scene:{token}:{i}")] for i, s in enumerate(scenes)]
+    rows.append([InlineKeyboardButton("🔄 Другие сцены", callback_data=f"scene_more:{token}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _propose_scenes(bot, chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
+    pool = scene_practice.build_pool(user_id)
+    if len(pool) < scene_practice.MIN_POOL:
+        await bot.send_message(
+            chat_id,
+            "Пока мало слов для сцен: нужны карточки, которые ты уже повторяла, "
+            "или слова, отмеченные «знаю» в /catalog.",
+        )
+        return
+    await bot.send_chat_action(chat_id, ChatAction.TYPING)
+    try:
+        scenes = await asyncio.to_thread(scene_practice.propose_scenes, pool)
+    except Exception:
+        logger.exception("scene: proposing failed")
+        scenes = []
+    if not scenes:
+        await bot.send_message(chat_id, "Не получилось собрать сцены, попробуй /scene ещё раз.")
+        return
+    token = secrets.token_hex(4)
+    context.user_data["scenes"] = {"token": token, "items": scenes}
+    await bot.send_message(
+        chat_id,
+        "🖼 Выбери сцену — нарисую картинку, а ты её опишешь.",
+        reply_markup=_scene_keyboard(token, scenes),
+    )
+
+
+async def scene(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not _is_owner(user_id):
+        return
+    if not voice_talk.is_enabled():
+        await update.message.reply_text("Картинки выключены: не задан OPENAI_API_KEY.")
+        return
+    await _propose_scenes(context.bot, update.effective_chat.id, user_id, context)
+
+
+async def _handle_scene_button(query, context: ContextTypes.DEFAULT_TYPE, action: str, parts):
+    stored = context.user_data.get("scenes")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)  # also stops a double tap
+    except BadRequest:
+        pass
+    if not stored or stored["token"] != parts[1]:
+        await query.message.reply_text("Сцены устарели — набери /scene ещё раз.")
+        return
+    bot, chat_id = query.get_bot(), query.message.chat_id
+    if action == "scene_more":
+        await _propose_scenes(bot, chat_id, query.from_user.id, context)
+        return
+    index = int(parts[2])
+    if index >= len(stored["items"]):
+        return
+    chosen = stored["items"][index]
+    await query.message.reply_text(f"🎨 Рисую «{chosen['title']}»… это до минуты.")
+    await bot.send_chat_action(chat_id, ChatAction.UPLOAD_PHOTO)
+    try:
+        image = await asyncio.to_thread(scene_practice.generate_image, chosen)
+    except Exception:
+        logger.exception("scene: image generation failed")
+        await query.message.reply_text(
+            "Картинка не получилась.",
+            reply_markup=_scene_keyboard(stored["token"], stored["items"]),
+        )
+        return
+    targets = ", ".join(f"{w['es']} — {w['ru']}" for w in chosen["words"])
+    await bot.send_photo(
+        chat_id,
+        photo=image,
+        caption=(
+            f"<b>{html.escape(chosen['title'])}</b>\n"
+            "Опиши картинку вслух по-испански. Потом открой слова и проверь: "
+            "назвала ли их и узнаются ли они на картинке.\n\n"
+            f"Слова: <tg-spoiler>{html.escape(targets)}</tg-spoiler>"
+        ),
+        parse_mode="HTML",
+    )
+    # the other scenes of this batch stay one tap away
+    await bot.send_message(chat_id, "Другая сцена?", reply_markup=_scene_keyboard(stored["token"], stored["items"]))
+
+
+# ---------------------------------------------------------------------------
 # API — lets another site of yours read your word list, and (with a separate
 # write key) add new words the same way typing to the bot directly would.
 # Runs in the same process/container as the bot, reading/writing the same DB file.
@@ -1867,6 +1965,7 @@ OWNER_ONLY_COMMANDS = [
     ("practice", "Вечерняя практика прямо сейчас"),
     ("talk", "Живой разговор голосом (тест)"),
     ("catalog", "Топ-3000 слов: посмотреть и добавить"),
+    ("scene", "Опиши картинку (прототип)"),
     ("talkreport", "Отчёт: как звучит твоя речь"),
     ("talkmemory", "Что бот помнит о тебе"),
     ("talkforget", "Стереть память разговоров"),
@@ -1908,6 +2007,7 @@ def main():
     app.add_handler(CommandHandler("practice", practice))
     app.add_handler(CommandHandler("talk", talk))
     app.add_handler(CommandHandler("catalog", catalog))
+    app.add_handler(CommandHandler("scene", scene))
     app.add_handler(CommandHandler("talkreport", talkreport))
     app.add_handler(CommandHandler("talkmemory", talkmemory))
     app.add_handler(CommandHandler("talkforget", talkforget))
