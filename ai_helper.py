@@ -12,11 +12,11 @@ SYSTEM_PROMPT = (
 )
 
 
-def _ask_claude(prompt: str, max_tokens: int = 2500):
+def _ask_claude(prompt: str, max_tokens: int = 2500, system: str = SYSTEM_PROMPT):
     response = client.messages.create(
         model=MODEL,
         max_tokens=max_tokens,
-        system=SYSTEM_PROMPT,
+        system=system,
         messages=[{"role": "user", "content": prompt}],
     )
     text = response.content[0].text.strip()
