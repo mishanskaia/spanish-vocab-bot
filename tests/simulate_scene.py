@@ -211,6 +211,36 @@ async def main():
     await bot.scene(other, context)
     check("не владельцу — тишина", len(fbot.sent) == before)
 
+    print("\n4. Ротация: сначала слова, которых ещё не было на картинках")
+    pool = scene_practice.build_pool(OWNER_ID)
+    used = {w["es"] for w in pool if w["last_scene"]}
+    check("слова нарисованной сцены помечены", used == {"el paraguas", "la parada", "mojado"})
+    check("слово, выброшенное проверкой картинки, считается неописанным",
+          next(w for w in pool if w["es"] == "esperar")["last_scene"] is None)
+    order = [w["es"] for w in scene_practice.rotation_slice(pool)]
+    first_used = min(order.index(e) for e in used)
+    check("неописанные — раньше описанных", all(order.index(w["es"]) < first_used
+                                                 for w in pool if not w["last_scene"]))
+    prompt = scene_practice._scenes_prompt(scene_practice.rotation_slice(pool))
+    check("описанные помечены в промпте", "el paraguas — зонт (already described)" in prompt
+          and "cocinar — готовить (already described)" not in prompt)
+    # a big pool: only never-described words reach Claude
+    big = [{"es": f"palabra{i}", "ru": "x", "last_scene": None} for i in range(80)]
+    big += [{"es": f"vieja{i}", "ru": "x", "last_scene": "2026-09-01"} for i in range(20)]
+    slice_ = scene_practice.rotation_slice(big)
+    check("в большом пуле уходит 60 слов, и все неописанные",
+          len(slice_) == 60 and all(w["last_scene"] is None for w in slice_))
+    check("перемешивание: два вызова дают разный набор",
+          {w["es"] for w in slice_} != {w["es"] for w in scene_practice.rotation_slice(big)})
+    mixed = big[:10] + [
+        {"es": "reciente", "ru": "x", "last_scene": "2026-09-28"},
+        {"es": "antigua", "ru": "x", "last_scene": "2026-09-01"},
+        {"es": "media", "ru": "x", "last_scene": "2026-09-15"},
+    ]
+    order = [w["es"] for w in scene_practice.rotation_slice(mixed)]
+    check("неописанных мало — добираем описанными, самые давние первыми",
+          all(e.startswith("palabra") for e in order[:10]) and order[10:] == ["antigua", "media", "reciente"])
+
     await talk_part()
 
     os.remove(DB_FILE)
@@ -219,7 +249,7 @@ async def main():
 
 
 async def talk_part():
-    print("\n4. Разговор по картинке (сервер /talk)")
+    print("\n5. Разговор по картинке (сервер /talk)")
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
     import stt_helper
