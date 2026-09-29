@@ -25,7 +25,10 @@ import db
 import stt_helper
 import word_catalog
 
-POOL_PROMPT_LIMIT = 150  # words sent to Claude per request; shuffled so each /scene differs
+# Rotation (2026-09-29): words that were never on a picture go to Claude first, then the ones
+# described longest ago — however old the card itself is. Without it Claude got the whole pool
+# every time and kept picking the same easy-to-draw words.
+POOL_PROMPT_LIMIT = 60
 MIN_POOL = 6
 SCENE_COUNT = 3
 MIN_SCENE_WORDS = 3
@@ -36,7 +39,16 @@ IMAGE_QUALITY = os.environ.get("SCENE_IMAGE_QUALITY", "medium")
 
 
 def build_pool(user_id: int) -> list[dict]:
-    """[{es, ru}] — cards she has met in review plus catalog words marked «знаю»."""
+    """[{es, ru, last_scene}] — cards she has met in review plus catalog words marked «знаю».
+    last_scene: when the word was last on a picture she got (ISO string), None if never.
+    Only words that survived the vision check are stored with a scene, so a word that
+    wasn't recognisable on its picture still counts as never described."""
+    last_scene = {}
+    for words, created_at in db.get_scene_words_history(user_id):
+        for w in words:
+            key = word_catalog.normalize(w.get("es", ""))
+            if created_at > last_scene.get(key, ""):
+                last_scene[key] = created_at
     pool = {}
     for row in db.get_known_words(user_id, limit=1000):
         pool[word_catalog.normalize(row["phrase"])] = {"es": row["phrase"], "ru": row["meaning"]}
@@ -45,7 +57,17 @@ def build_pool(user_id: int) -> list[dict]:
         ru = catalog_ru.get(entry["key"])
         if ru and entry["key"] not in pool:  # a card wins over a bare mark
             pool[entry["key"]] = {"es": entry["es"], "ru": ru}
+    for key, word in pool.items():
+        word["last_scene"] = last_scene.get(key)
     return list(pool.values())
+
+
+def rotation_slice(pool: list[dict]) -> list[dict]:
+    """Never-described words first (shuffled, so «Другие сцены» gives a different set), then
+    the ones described longest ago; the first POOL_PROMPT_LIMIT go to Claude."""
+    shuffled = random.sample(pool, len(pool))
+    shuffled.sort(key=lambda w: w.get("last_scene") or "")  # stable: ties keep the shuffle
+    return shuffled[:POOL_PROMPT_LIMIT]
 
 
 SCENES_SYSTEM = (
@@ -55,9 +77,13 @@ SCENES_SYSTEM = (
 
 
 def _scenes_prompt(words: list[dict]) -> str:
-    listing = "\n".join(f"- {w['es']} — {w['ru']}" for w in words)
+    listing = "\n".join(f"- {w['es']} — {w['ru']}" + (" (already described)" if w.get("last_scene") else "")
+                        for w in words)
     return f"""Here are Spanish words she already knows (passively) but rarely uses when speaking:
 {listing}
+
+Words marked "(already described)" were in one of her earlier pictures — use them only when a scene
+really needs them; build the scenes from the unmarked words first.
 
 Propose {SCENE_COUNT} scenes. Each scene is ONE everyday situation that will be drawn as a single
 picture, and she will describe the picture aloud in Spanish. The goal: describing the picture
@@ -84,10 +110,10 @@ JSON: {{"scenes": [{{"title": "...", "words": ["..."], "picture": "...", "must_s
 
 
 def propose_scenes(pool: list[dict]) -> list[dict]:
-    """Claude groups a shuffled slice of the pool into themed scenes. Every word it returns
+    """Claude groups the rotation slice of the pool into themed scenes. Every word it returns
     is checked against the pool (models do invent or re-spell words); a scene left with
     fewer than MIN_SCENE_WORDS real words is dropped."""
-    sample = random.sample(pool, min(len(pool), POOL_PROMPT_LIMIT))
+    sample = rotation_slice(pool)
     data = ai_helper._ask_claude(_scenes_prompt(sample), max_tokens=3000, system=SCENES_SYSTEM)
     by_es = {w["es"].lower(): w for w in sample}
     scenes = []
