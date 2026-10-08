@@ -1276,6 +1276,14 @@ def get_scene(scene_id: int):
     return d
 
 
+def get_scene_words_history(user_id: int) -> list:
+    """[(words, created_at)] of every picture she got — for the /scene rotation."""
+    conn = get_connection()
+    rows = conn.execute("SELECT words, created_at FROM scenes WHERE user_id = ?", (user_id,)).fetchall()
+    conn.close()
+    return [(json.loads(r["words"] or "[]"), r["created_at"]) for r in rows]
+
+
 def get_scene_image(scene_id: int):
     """(user_id, jpeg bytes) or None."""
     conn = get_connection()
