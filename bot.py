@@ -33,7 +33,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.constants import ChatAction
-from telegram.error import BadRequest, NetworkError
+from telegram.error import BadRequest, Conflict, NetworkError
 from telegram.helpers import escape_markdown
 
 import db
@@ -1915,9 +1915,18 @@ async def start_api_server(app: Application):
 ERROR_NOTIFY_THROTTLE_SECONDS = 60
 _last_owner_error_notify_at = 0.0
 
+# A getUpdates Conflict means two processes are polling with the same token.
+# During a Railway deploy the old and new containers overlap for a few
+# seconds, so a short burst is normal. Only a conflict that keeps going this
+# long (e.g. a local `python bot.py` with the production token) pages the owner.
+CONFLICT_NOTIFY_AFTER_SECONDS = 180
+CONFLICT_STREAK_GAP_SECONDS = 60
+_conflict_streak_started_at = 0.0
+_last_conflict_at = 0.0
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    global _last_owner_error_notify_at
+    global _last_owner_error_notify_at, _conflict_streak_started_at, _last_conflict_at
 
     logger.error("Unhandled exception while processing update: %s", update, exc_info=context.error)
 
@@ -1937,10 +1946,17 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     if isinstance(context.error, NetworkError):
         return
 
+    now = time.monotonic()
+    if isinstance(context.error, Conflict):
+        if now - _last_conflict_at > CONFLICT_STREAK_GAP_SECONDS:
+            _conflict_streak_started_at = now
+        _last_conflict_at = now
+        if now - _conflict_streak_started_at < CONFLICT_NOTIFY_AFTER_SECONDS:
+            return
+
     if not OWNER_TELEGRAM_ID:
         return
 
-    now = time.monotonic()
     if now - _last_owner_error_notify_at < ERROR_NOTIFY_THROTTLE_SECONDS:
         return
     _last_owner_error_notify_at = now
