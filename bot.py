@@ -1517,7 +1517,7 @@ async def canceltopic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def talkreport(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Weekly speech report on demand — what she repeats, and which mistakes come back."""
+    """Weekly speech report on demand — foci closed and in progress, phrases she leans on."""
     user_id = update.effective_user.id
     if not _is_owner(user_id):
         return

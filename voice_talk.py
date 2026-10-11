@@ -30,7 +30,7 @@ import os
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
 
@@ -165,6 +165,38 @@ MISTAKES_RULES = """Mistakes:
 """
 
 
+# Focus loop (2026-10-11): the mistake she is working on and the phrase from the last review go
+# into the next conversations, so the correction comes back as a chance to say it — not as text to
+# remember. The bot provokes the form with a question; if she goes around it, it says the form
+# itself and invites her to use it. Whether she managed is judged by the review afterwards.
+def _focus_rules(focus, phrase: str | None, scene: bool = False) -> str:
+    if not focus and not phrase:
+        return ""
+    out = []
+    if focus:
+        when = ("in the her-life part (phase 3)" if scene else "by your third turn at the latest")
+        example = f' — e.g. "{focus["trigger"]}"' if focus.get("trigger") else ""
+        out.append(f"""Her current focus (a mistake from earlier conversations): {focus["rule"]} — the right form is "{focus["right_form"]}" (she tends to say "{focus["wrong"]}").
+- {when[0].upper() + when[1:]}, ask one natural question whose answer needs this form{example}. Fit it to what you're talking about; never announce it — it's a conversation, not a test.
+- If she uses the right form, just react to what she said (no grammar praise).
+- If she goes around it or uses the wrong form: say exactly the right form ("{focus["right_form"]}" — the same person and tense, not a related form like "fuiste" for "fui") in a natural sentence of your own, then invite her to say something with it ("Yo también fui a un café el sábado. ¿Y tú, adónde fuiste después?"). For this one mistake this replaces the general "slip the correct form in passing" rule above — echoing her with "¡Ah, fuiste…!" doesn't show her own form.
+- Once or twice in the conversation is enough — don't drill.""")
+    if phrase:
+        out.append(f"""A phrase worth hearing: "{phrase}". Use it yourself once or twice where it fits naturally. Don't ask her to repeat it and don't point it out.""")
+    return "\n".join(out) + "\n\n"
+
+
+def current_practice(user_id: int) -> tuple:
+    """(active focus or None, the phrase from the most recent review or None)."""
+    phrase = None
+    for s in db.get_recent_voice_sessions(user_id, 3):
+        up = (s.get("analysis") or {}).get("upgrade") or {}
+        if up.get("better"):
+            phrase = up["better"]
+            break
+    return db.get_active_focus(user_id), phrase
+
+
 # Memory is background, not a source of topics (2026-10-11). The old rule "build on it" made the
 # most vivid fact a hook: she mentioned a trip to South Africa once, and every conversation after
 # that drifted back to it — which fed more trip facts into the memory, which made the hook stronger.
@@ -218,7 +250,8 @@ def pick_opener(user_id: int) -> str:
     return random.choice(fresh)
 
 
-def build_instructions(target_words, facts=(), opener: str | None = None, avoid_facts=()) -> str:
+def build_instructions(target_words, facts=(), opener: str | None = None, avoid_facts=(),
+                       focus=None, phrase: str | None = None) -> str:
     word_lines = "\n".join(f"- {w['phrase']} — {w['meaning']}" for w in target_words)
     facts_rules = _facts_rules(facts, avoid_facts)
     opener_line = (f"Today's opener topic: {opener}. Open with a question on it — one where a target word might fit if "
@@ -265,13 +298,13 @@ Target words:
 - Never list them, never mention that they are targets.
 - It's fine if only 2–3 of them come up in the whole conversation.
 
-{MISTAKES_RULES}{facts_rules}Start: greet her briefly and open the opener topic with a question.
+{MISTAKES_RULES}{_focus_rules(focus, phrase)}{facts_rules}Start: greet her briefly and open the opener topic with a question.
 
 Target words (Spanish — Russian meaning):
 {word_lines or "- (no words yet — just have a simple everyday conversation)"}"""
 
 
-def build_scene_instructions(scene: dict, facts=(), avoid_facts=()) -> str:
+def build_scene_instructions(scene: dict, facts=(), avoid_facts=(), focus=None, phrase: str | None = None) -> str:
     """Picture mode (/scene → «Описать голосом», 2026-09-28). Unlike the free conversation,
     here the words come first: the picture takes the choice of topic away from her, which is
     the point — in free talk she steers to comfortable topics and her passive words never
@@ -304,7 +337,7 @@ How a turn sounds:
 - If she asks what something in the picture is called, tell her — then ask her to use it.
 - Do NOT start by repeating what she said.
 
-{MISTAKES_RULES}{_facts_rules(facts, avoid_facts)}Start: greet her in one short sentence and ask her to describe the picture."""
+{MISTAKES_RULES}{_focus_rules(focus, phrase, scene=True)}{_facts_rules(facts, avoid_facts)}Start: greet her in one short sentence and ask her to describe the picture."""
 
 
 TURN_FORMAT = """
@@ -401,9 +434,9 @@ def _history_to_messages(history, user_text: str | None) -> list[dict]:
 
 
 def session_instructions(target_words, facts=(), scene: dict | None = None,
-                         opener: str | None = None, avoid_facts=()) -> str:
-    base = (build_scene_instructions(scene, facts, avoid_facts) if scene
-            else build_instructions(target_words, facts, opener, avoid_facts))
+                         opener: str | None = None, avoid_facts=(), focus=None, phrase: str | None = None) -> str:
+    base = (build_scene_instructions(scene, facts, avoid_facts, focus, phrase) if scene
+            else build_instructions(target_words, facts, opener, avoid_facts, focus, phrase))
     return base + TURN_FORMAT
 
 
@@ -533,7 +566,8 @@ async def handle_start(request: web.Request) -> web.Response:
     target_words = scene_target_words(scene) if scene else db.get_voice_target_words(user_id, TARGET_WORD_COUNT)
     opener = None if scene else pick_opener(user_id)
     facts = db.get_talk_memory(user_id)
-    system = session_instructions(target_words, facts, scene, opener, db.get_last_raised_facts(user_id))
+    system = session_instructions(target_words, facts, scene, opener, db.get_last_raised_facts(user_id),
+                                  *current_practice(user_id))
     timings, usage = {}, {}
     try:
         t = time.monotonic()
@@ -607,7 +641,8 @@ async def handle_turn(request: web.Request) -> web.Response:
         scene = db.get_scene(session["scene_id"]) if session.get("scene_id") else None
         facts = db.get_talk_memory(user_id)
         system = session_instructions(session["target_words"], facts, scene, session.get("opener"),
-                                      db.get_last_raised_facts(user_id, before_id=session_id))
+                                      db.get_last_raised_facts(user_id, before_id=session_id),
+                                      *current_practice(user_id))
         reply_task = asyncio.ensure_future(asyncio.to_thread(claude_turn, system, history, user_text + marker))
         if mode == "auto":
             last_bot = next((str(h.get("text", "")) for h in reversed(history) if h.get("role") == "assistant"), "")
@@ -694,17 +729,19 @@ async def handle_transcript(request: web.Request) -> web.Response:
         memory_task = asyncio.ensure_future(asyncio.to_thread(
             update_memory, user_id, transcript, bool(session.get("scene_id"))
         ))
+        ctx = review_context(user_id)
         analysis_task = asyncio.ensure_future(asyncio.to_thread(
-            analyze_conversation, transcript, db.get_known_words(user_id)
+            analyze_conversation, transcript, ctx["focus"], ctx["past_errors"], ctx["past_upgrades"]
         ))
         try:
             await memory_task
         except Exception:
             logger.exception("talk: failed to update memory")
-        analysis = {}
+        analysis, focus_state = {}, {}
         try:
             analysis = await analysis_task
             db.set_voice_analysis(session_id, analysis)
+            focus_state = apply_focus(user_id, analysis)
         except Exception:
             logger.exception("talk: failed to analyse the conversation")
 
@@ -717,7 +754,7 @@ async def handle_transcript(request: web.Request) -> web.Response:
                     parse_mode="HTML",
                     reply_markup=found_words_keyboard(session),
                 )
-                message = build_analysis_message(analysis)
+                message = build_analysis_message(analysis, focus_state)
                 if message:
                     await _bot.send_message(user_id, message, parse_mode="HTML")
             except Exception:
@@ -773,10 +810,19 @@ def update_memory(user_id: int, transcript, about_picture: bool = False) -> list
     return facts
 
 
+# Post-conversation review, rebuilt 2026-10-11. The old review listed up to 12 items (5 mistakes,
+# 4 upgrades, 3 «known but unused» words); she read it and forgot it by the next conversation,
+# and it kept naming the same mistakes because it had no idea they were old news. Now she sees
+# two things — one mistake (the «focus») and one phrase — and the focus goes INTO the next
+# conversations: the bot gives her chances to use the right form until she has done it twice in a
+# row. The full list of mistakes is still found and stored: it is what tells a repeated mistake
+# from a one-off slip. «Known but unused» was dropped entirely (she found it irrelevant).
 ANALYSIS_MAX_ERRORS = 5
-ANALYSIS_MAX_UPGRADES = 4
-ANALYSIS_MAX_UNUSED = 3
-ANALYSIS_PROMPT = """You review a voice conversation that a Russian-speaking learner of Spanish (A1–A2, a woman) has just had with a Spanish-speaking friend. You write two blocks for her: what was wrong, and how it could sound better. Explanations in Russian, Spanish stays in Spanish.
+FOCUS_DONE_STREAK = 2          # correct in this many conversations in a row → the focus is done
+PAST_ERRORS_SESSIONS = 10      # how far back the review looks for repeated mistakes
+PAST_UPGRADES = 8              # recent phrases not to suggest again
+
+ANALYSIS_PROMPT = """You review a voice conversation that a Russian-speaking learner of Spanish (A1–A2, a woman) has just had with a Spanish-speaking friend. Explanations in Russian, Spanish stays in Spanish.
 
 The transcript is speech-to-text of the real conversation. ОНА = her, BOT = the bot. Only her lines are reviewed.
 
@@ -784,129 +830,184 @@ The transcript is speech-to-text of the real conversation. ОНА = her, BOT = t
 - "said": her own words, short (quote only the part that is wrong, with just enough around it).
 - "fix": the same thing said correctly.
 - "why": a few words in Russian naming the rule — «прошедшее время ir», «род прилагательного», «предлог с ir».
-- Only real mistakes. Correct but plain phrasing belongs in "upgrades", not here.
+- Only real mistakes. Correct but plain phrasing is not a mistake.
 - She is a woman: adjectives about herself are feminine ("estoy cansada"). Never "correct" that.
+- The present tense about how she is or feels NOW is correct, even inside a story about the past ("El sábado fui a la playa. Estoy cansada" — she is tired now). Don't turn it into a past tense.
 - Ignore speech-to-text artifacts: punctuation, missing accent marks, repeated words, «э-э».
 - A Russian word she used is a vocabulary gap, not a mistake — skip it.
 - Both European and Latin American Spanish are correct.
-- At most {max_errors}, most important first: what breaks understanding, or what she repeats.
+- If "fix" would be the same as "said", it isn't a mistake — leave it out.
+- At most {max_errors}.
 
-"upgrades" — the same idea said better, for phrases that were already correct but plain.
-- "said": her phrase from the transcript. "better": the improved version, A2–B1, natural, still sayable by her. "why": a short Russian note — «звучит естественнее», «готовый оборот для причины».
-- Include at least one ready-made chunk she can reuse (es que…, la verdad es que…, me da igual, al final…, o sea…) when it fits something she actually said.
-- Never invent phrases she didn't say.
-- At most {max_upgrades}.
+"focus" — ONE of those errors that she will work on next. She sees only this one, so choose carefully. Priority:
+1. It gets in the way of understanding (wrong tense that changes when it happened, a wrong word).
+2. It repeats — the same rule is in her past mistakes (listed with the transcript, if any).
+3. A frequent basic form (past tense of common verbs, ser/estar, gender, basic prepositions) beats a rare construction.
+It must be easy to provoke with a question in a conversation: a verb tense — yes ("¿Qué hiciste el sábado?"); a preposition inside one rare construction — no, choose another.
+- "rule": the rule in Russian, short — «ir в прошедшем: fui».
+- "said", "fix", "why": as in errors.
+- "trigger": one natural Spanish question whose natural answer needs the right form ("¿Adónde fuiste el fin de semana?").
+- If there is a current focus (given with the transcript), still choose the best NEW candidate — the code decides whether it is used. If no error is suitable, all fields empty.
 
-"unused" — words she already knows (the list comes with the transcript) that would have fitted naturally somewhere in THIS conversation, but she didn't use.
-- "said": her exact phrase from the transcript where the word would have fitted. Never invent a phrase — if you can't quote her, drop the item.
-- "word": the known word, exactly as it appears in her list. "better": her phrase rewritten with it, natural and at her level.
-- Skip words she did use, and skip anything that would sound forced. Fewer is better: at most {max_unused}, none at all is a fine answer.
+"focus_result" — only if a current focus is given: did she use that right form in THIS conversation?
+- "correct": she used the right form at least once and never the wrong one after the bot showed it;
+- "wrong": she made that same mistake again;
+- "not_used": the form didn't come up (or the bot said it and she didn't).
+No current focus → "not_used".
 
-If she barely spoke or there is nothing worth saying, return empty lists."""
+"upgrade" — ONE phrase of hers that was correct but plain, and how to say it better.
+- "said": her phrase from the transcript. "better": the improved version, A2–B1, natural, still sayable by her. "chunk": the reusable chunk itself, as it appears in "better" ("la verdad es que", "lo bueno es que"). "why": a short Russian note.
+- Prefer a phrase she leans on — one she said more than once in this conversation ("pienso que es bueno…") is the best candidate.
+- "better" should hinge on a ready-made chunk she can reuse in many conversations (es que…, la verdad es que…, me da igual, al final…, o sea…, sobre todo…, lo bueno es que…), not just extra details or a one-off fancy word.
+- The chunk must do the same job as what she said: for an opinion ("pienso que es bueno") — "me parece que", "para mí", "lo bueno es que", not a filler like "o sea".
+- The chunks listed with the transcript as already suggested are taken: pick a different chunk. Never invent phrases she didn't say.
+- Nothing worth it → all fields empty.
 
+If she barely spoke, return empty lists and empty fields."""
+
+_PAIR = {"said": {"type": "string"}, "fix": {"type": "string"}, "why": {"type": "string"}}
 ANALYSIS_SCHEMA = {
     "type": "object",
     "properties": {
         "errors": {
             "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {"said": {"type": "string"}, "fix": {"type": "string"}, "why": {"type": "string"}},
-                "required": ["said", "fix", "why"],
-                "additionalProperties": False,
-            },
+            "items": {"type": "object", "properties": _PAIR, "required": ["said", "fix", "why"],
+                      "additionalProperties": False},
         },
-        "upgrades": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {"said": {"type": "string"}, "better": {"type": "string"}, "why": {"type": "string"}},
-                "required": ["said", "better", "why"],
-                "additionalProperties": False,
-            },
+        "focus": {
+            "type": "object",
+            "properties": {**_PAIR, "rule": {"type": "string"}, "trigger": {"type": "string"}},
+            "required": ["rule", "said", "fix", "why", "trigger"],
+            "additionalProperties": False,
         },
-        "unused": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {"said": {"type": "string"}, "word": {"type": "string"}, "better": {"type": "string"}},
-                "required": ["said", "word", "better"],
-                "additionalProperties": False,
-            },
+        "focus_result": {"type": "string", "enum": ["correct", "wrong", "not_used"]},
+        "upgrade": {
+            "type": "object",
+            "properties": {"said": {"type": "string"}, "better": {"type": "string"}, "chunk": {"type": "string"},
+                           "why": {"type": "string"}},
+            "required": ["said", "better", "chunk", "why"],
+            "additionalProperties": False,
         },
     },
-    "required": ["errors", "upgrades", "unused"],
+    "required": ["errors", "focus", "focus_result", "upgrade"],
     "additionalProperties": False,
 }
 
+_EMPTY_ANALYSIS = {"errors": [], "focus": {}, "focus_result": "not_used", "upgrade": {}}
 
-def analyze_conversation(transcript, known_words=()) -> dict:
-    """Sync (blocking) — call through asyncio.to_thread. Three blocks she asked for:
-    mistakes, how the same thing could sound better, and words she already knows that
-    would have fitted. Known words she already used in this talk are filtered out here,
-    in code, so the model isn't tempted to "find" them."""
+
+def review_context(user_id: int) -> dict:
+    """What the review needs to know beyond the transcript: the current focus, her past
+    mistakes (to spot a repeated one) and the phrases already suggested (not to repeat them)."""
+    sessions = db.get_recent_voice_sessions(user_id, PAST_ERRORS_SESSIONS)
+    past_errors = [e for s in sessions for e in ((s.get("analysis") or {}).get("errors") or [])]
+    past_upgrades = []
+    for s in sessions:
+        a = s.get("analysis") or {}
+        ups = ([a["upgrade"]] if (a.get("upgrade") or {}).get("better") else []) + list(a.get("upgrades") or [])
+        past_upgrades += [u.get("chunk") or u["better"] for u in ups if u.get("better")]
+    return {"focus": db.get_active_focus(user_id), "past_errors": past_errors,
+            "past_upgrades": past_upgrades[:PAST_UPGRADES]}
+
+
+def _norm(text: str) -> str:
+    return " ".join(_TOKEN_RE.findall(text.lower()))
+
+
+def _reused_chunk(upgrade: dict, past) -> bool:
+    chunk, better = _norm(upgrade.get("chunk", "")), _norm(upgrade.get("better", ""))
+    for p in past:
+        p = _norm(p)
+        if p and (p in better or (chunk and (chunk in p or p in chunk))):
+            return True
+    return False
+
+
+def analyze_conversation(transcript, focus=None, past_errors=(), past_upgrades=()) -> dict:
+    """Sync (blocking) — call through asyncio.to_thread. All the mistakes (stored), one focus
+    candidate, whether the current focus was used right, and one phrase."""
     spoken = "\n".join(f"{'ОНА' if t['role'] == 'user' else 'BOT'}: {t['text']}" for t in transcript if t.get("text"))
     if sum(1 for t in transcript if t.get("role") == "user" and t.get("text")) < 2:
-        return {"errors": [], "upgrades": [], "unused": []}
-    her_text = " ".join(t["text"] for t in transcript if t.get("role") == "user" and t.get("text"))
-    candidates = [w for w in known_words if not _word_used(w["phrase"], her_text)][:80]
+        return dict(_EMPTY_ANALYSIS)
     content = spoken
-    if candidates:
-        content += "\n\nСлова, которые она уже знает:\n" + "\n".join(
-            f"- {w['phrase']} — {w['meaning']}" for w in candidates
-        )
+    if focus:
+        content += (f"\n\nТекущий фокус: {focus['rule']} — правильно «{focus['right_form']}», "
+                    f"она говорила «{focus['wrong']}».")
+    if past_errors:
+        content += "\n\nЕё ошибки в прошлых разговорах:\n" + "\n".join(
+            f"- {e.get('said')} → {e.get('fix')} ({e.get('why', '')})" for e in past_errors[:30])
+    if past_upgrades:
+        content += "\n\nУже предлагали эти обороты (выбери другой):\n" + "\n".join(f"- {u}" for u in past_upgrades)
     response = ai_helper.client.messages.create(
         model=TALK_LLM_MODEL,
         max_tokens=2000,
-        system=ANALYSIS_PROMPT.format(
-            max_errors=ANALYSIS_MAX_ERRORS, max_upgrades=ANALYSIS_MAX_UPGRADES, max_unused=ANALYSIS_MAX_UNUSED
-        ),
+        system=ANALYSIS_PROMPT.format(max_errors=ANALYSIS_MAX_ERRORS),
         messages=[{"role": "user", "content": content}],
         output_config={"format": {"type": "json_schema", "schema": ANALYSIS_SCHEMA}},
     )
-    text = next((b.text for b in response.content if b.type == "text"), "{}")
-    data = json.loads(text)
-    known = {w["phrase"].lower() for w in candidates}
-    said_lower = spoken.lower()
+    data = json.loads(next((b.text for b in response.content if b.type == "text"), "{}"))
+    focus_c = data.get("focus") or {}
+    upgrade = data.get("upgrade") or {}
+    result = data.get("focus_result") if focus else "not_used"
     return {
-        "errors": [e for e in (data.get("errors") or []) if e.get("said") and e.get("fix")][:ANALYSIS_MAX_ERRORS],
-        "upgrades": [u for u in (data.get("upgrades") or []) if u.get("said") and u.get("better")][:ANALYSIS_MAX_UPGRADES],
-        # the word must be one of hers, and the quote must really be in the transcript
-        "unused": [u for u in (data.get("unused") or [])
-                   if u.get("word", "").lower() in known and u.get("said", "").lower()[:40] in said_lower
-                   ][:ANALYSIS_MAX_UNUSED],
+        "errors": [e for e in (data.get("errors") or [])
+                   if e.get("said") and e.get("fix") and _norm(e["said"]) != _norm(e["fix"])][:ANALYSIS_MAX_ERRORS],
+        "focus": focus_c if (focus_c.get("fix") and focus_c.get("said") and focus_c.get("rule")
+                             and _norm(focus_c["said"]) != _norm(focus_c["fix"])) else {},
+        "focus_result": result if result in ("correct", "wrong", "not_used") else "not_used",
+        # a chunk she was already given is dropped in code too — the model reused it 6 times of 6
+        "upgrade": upgrade if upgrade.get("said") and upgrade.get("better") and not _reused_chunk(upgrade, past_upgrades) else {},
     }
 
 
-def build_analysis_message(analysis: dict) -> str | None:
-    errors, upgrades = analysis.get("errors") or [], analysis.get("upgrades") or []
-    if not errors and not upgrades and not (analysis.get("unused") or []):
+def apply_focus(user_id: int, analysis: dict) -> dict:
+    """Moves the focus loop one conversation forward. Correct → streak+1 (FOCUS_DONE_STREAK →
+    done), wrong → streak back to 0, not used → unchanged. A new focus only replaces a done one
+    (or none): one thing at a time. Returns what the message needs."""
+    active = db.get_active_focus(user_id)
+    out = {"active": active, "result": None, "streak": 0, "done": False, "new": None}
+    if active:
+        result = analysis.get("focus_result") or "not_used"
+        streak = active["streak"] + 1 if result == "correct" else 0 if result == "wrong" else active["streak"]
+        done = streak >= FOCUS_DONE_STREAK
+        db.set_focus_streak(active["id"], streak, done)
+        out.update(result=result, streak=streak, done=done)
+    cand = analysis.get("focus") or {}
+    if (not active or out["done"]) and cand.get("fix"):
+        db.create_focus(user_id, cand["rule"], cand["said"], cand["fix"], cand.get("why", ""), cand.get("trigger", ""))
+        out["new"] = cand
+    return out
+
+
+def build_analysis_message(analysis: dict, focus_state: dict | None = None) -> str | None:
+    """Two things at most: the focus (its progress, or a new one) and one phrase."""
+    focus_state = focus_state or {}
+    lines = []
+    active = focus_state.get("active")
+    if active:
+        right = html.escape(active["right_form"])
+        result = focus_state.get("result")
+        if result == "correct" and focus_state.get("done"):
+            lines.append(f"✅ <b>Фокус снят:</b> «{right}» — правильно {FOCUS_DONE_STREAK} раза подряд.")
+        elif result == "correct":
+            lines.append(f"✅ <b>Фокус:</b> «{right}» — сказала правильно "
+                         f"({focus_state['streak']} из {FOCUS_DONE_STREAK}).")
+        elif result == "wrong":
+            lines.append(f"🎯 <b>Фокус пока в работе:</b> <s>{html.escape(active['wrong'])}</s> → <b>{right}</b>"
+                         + (f"\n<i>{html.escape(active['why'])}</i>" if active.get("why") else ""))
+        else:
+            lines.append(f"🎯 <b>Фокус:</b> «{right}» — в этот раз не прозвучало, вернёмся к нему.")
+    new = focus_state.get("new")
+    if new:
+        lines.append(f"🎯 <b>Новый фокус:</b> <s>{html.escape(new['said'])}</s> → <b>{html.escape(new['fix'])}</b>"
+                     + (f"\n<i>{html.escape(new['why'])}</i>" if new.get("why") else ""))
+    upgrade = analysis.get("upgrade") or {}
+    if upgrade.get("better"):
+        lines.append(f"💬 <b>Оборот:</b> {html.escape(upgrade['said'])} → <b>{html.escape(upgrade['better'])}</b>"
+                     + (f"\n<i>{html.escape(upgrade['why'])}</i>" if upgrade.get("why") else ""))
+    if not lines:
         return None
-    lines = ["📝 <b>Разбор разговора</b>", ""]
-    lines.append("<b>Ошибки</b>")
-    if errors:
-        for e in errors:
-            lines.append(
-                f"• <s>{html.escape(e['said'])}</s> → <b>{html.escape(e['fix'])}</b>"
-                + (f"\n  <i>{html.escape(e['why'])}</i>" if e.get("why") else "")
-            )
-    else:
-        lines.append("• Ошибок не нашла 🎉")
-    if upgrades:
-        lines += ["", "<b>Как сказать лучше</b>"]
-        for u in upgrades:
-            lines.append(
-                f"• {html.escape(u['said'])} → <b>{html.escape(u['better'])}</b>"
-                + (f"\n  <i>{html.escape(u['why'])}</i>" if u.get("why") else "")
-            )
-    unused = analysis.get("unused") or []
-    if unused:
-        lines += ["", "<b>Знаешь, но не использовала</b>"]
-        for u in unused:
-            lines.append(
-                f"• <b>{html.escape(u['word'])}</b>: {html.escape(u['said'])} → {html.escape(u['better'])}"
-            )
-    return "\n".join(lines)
+    return "📝 <b>После разговора</b>\n\n" + "\n\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -965,21 +1066,15 @@ def count_phrases(sessions) -> list[dict]:
     return kept[:REPORT_MAX_PHRASES]
 
 
-REPORT_PROMPT = """You write a weekly speech report for a Russian-speaking learner of Spanish (A1–A2, a woman) who talks with a Spanish-speaking bot by voice. Explanations in Russian, Spanish stays in Spanish.
+REPORT_PROMPT = """You write part of a weekly speech report for a Russian-speaking learner of Spanish (A1–A2, a woman) who talks with a Spanish-speaking bot by voice. Explanations in Russian, Spanish stays in Spanish.
 
-You get two things, both taken from her real conversations: phrases she repeats (counted exactly, don't recount or invent) and the mistakes her per-conversation reviews found.
+You get phrases she repeats, counted exactly from her real conversations (don't recount or invent).
 
 "overused" — the repeated phrases worth diversifying. Keep her phrase exactly as given.
 - Only crutch-like expressions worth varying: openers, fillers, "pienso que", "me gusta", "es bueno", "muy bien". Skip words she simply talks about a lot (her cats, her work, place names) and skip fragments that are just grammar ("de la", "que el").
-- "alternatives": 3–4 ways to say the same thing, A2–B1, natural, different in register or structure — not synonyms of one word only.
+- "alternatives": 2–3 ways to say the same thing, A2–B1, natural, different in structure — not synonyms of one word only.
 - "note": a few words in Russian on when to use them.
-- At most 4 phrases, most repeated first. If nothing is really a crutch, return an empty list.
-
-"recurring_errors" — patterns that came up in more than one conversation, not one-off slips.
-- "pattern": the rule in Russian («род прилагательных», «ser/estar для места»).
-- "examples": 1–2 of her actual wrong phrases, as given to you.
-- "tip": one short line in Russian on how to remember it.
-- At most 3. Nothing recurring → empty list."""
+- At most 2 phrases, most repeated first. If nothing is really a crutch, return an empty list."""
 
 REPORT_SCHEMA = {
     "type": "object",
@@ -997,78 +1092,57 @@ REPORT_SCHEMA = {
                 "additionalProperties": False,
             },
         },
-        "recurring_errors": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string"},
-                    "examples": {"type": "array", "items": {"type": "string"}},
-                    "tip": {"type": "string"},
-                },
-                "required": ["pattern", "examples", "tip"],
-                "additionalProperties": False,
-            },
-        },
     },
-    "required": ["overused", "recurring_errors"],
+    "required": ["overused"],
     "additionalProperties": False,
 }
+REPORT_MAX_OVERUSED = 2
 
 
 def build_weekly_report(user_id: int) -> str | None:
-    """Sync (blocking) — call through asyncio.to_thread. Returns the message, or None
-    when there's too little speech to say anything honest."""
+    """Sync (blocking) — call through asyncio.to_thread. Rebuilt 2026-10-11 around the focus
+    loop: foci closed this week, the current one, and 1–2 phrases she leans on. The old «recurring
+    mistakes» block is gone — a repeated mistake now becomes the focus by itself. None when
+    there's nothing honest to say."""
+    week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    done = db.get_focus_done_since(user_id, week_ago)
+    active = db.get_active_focus(user_id)
+
+    overused, counts = [], {}
     sessions = db.get_recent_voice_sessions(user_id, REPORT_SESSIONS)
     her_turns = [t for s in sessions for t in (s.get("transcript") or []) if t.get("role") == "user" and t.get("text")]
-    if len(her_turns) < REPORT_MIN_TURNS:
+    phrases = count_phrases(sessions) if len(her_turns) >= REPORT_MIN_TURNS else []
+    if phrases:
+        lines = [f"- «{p['phrase']}» — {p['count']} раз в {p['sessions']} разговорах" for p in phrases]
+        response = ai_helper.client.messages.create(
+            model=TALK_LLM_MODEL,
+            max_tokens=1200,
+            system=REPORT_PROMPT,
+            messages=[{"role": "user", "content": "Повторяющиеся фразы (посчитано точно):\n" + "\n".join(lines)}],
+            output_config={"format": {"type": "json_schema", "schema": REPORT_SCHEMA}},
+        )
+        data = json.loads(next((b.text for b in response.content if b.type == "text"), "{}"))
+        counts = {p["phrase"]: p for p in phrases}
+        overused = [o for o in (data.get("overused") or []) if o.get("phrase") in counts][:REPORT_MAX_OVERUSED]
+
+    if not done and not active and not overused:
         return None
-
-    phrases = count_phrases(sessions)
-    errors = [e for s in sessions for e in ((s.get("analysis") or {}).get("errors") or [])]
-    if not phrases and not errors:
-        return None
-
-    lines = ["Повторяющиеся фразы (посчитано точно):"]
-    lines += [f"- «{p['phrase']}» — {p['count']} раз в {p['sessions']} разговорах" for p in phrases] or ["- (нет)"]
-    lines += ["", "Ошибки из разборов:"]
-    lines += [f"- {e['said']} → {e['fix']} ({e.get('why', '')})" for e in errors] or ["- (нет)"]
-
-    response = ai_helper.client.messages.create(
-        model=TALK_LLM_MODEL,
-        max_tokens=2000,
-        system=REPORT_PROMPT,
-        messages=[{"role": "user", "content": "\n".join(lines)}],
-        output_config={"format": {"type": "json_schema", "schema": REPORT_SCHEMA}},
-    )
-    data = json.loads(next((b.text for b in response.content if b.type == "text"), "{}"))
-    counts = {p["phrase"]: p for p in phrases}
-    overused = [o for o in (data.get("overused") or []) if o.get("phrase") in counts][:4]
-    recurring = [r for r in (data.get("recurring_errors") or []) if r.get("pattern")][:3]
-    if not overused and not recurring:
-        return None
-
-    out = [
-        "📊 <b>Как звучит твоя речь</b>",
-        f"<i>По {len(sessions)} последним разговорам, твоих реплик: {len(her_turns)}.</i>",
-    ]
+    out = ["📊 <b>Неделя разговоров</b>"]
+    if done:
+        out += ["", "✅ <b>Фокусы сняты</b>"]
+        out += [f"• {html.escape(f['rule'])}: «{html.escape(f['right_form'])}»" for f in done]
+    if active:
+        out += ["", "🎯 <b>Сейчас в работе</b>",
+                f"• {html.escape(active['rule'])}: <s>{html.escape(active['wrong'])}</s> → "
+                f"<b>{html.escape(active['right_form'])}</b> ({active['streak']} из {FOCUS_DONE_STREAK})"]
     if overused:
-        out += ["", "<b>Часто повторяешь</b>"]
+        out += ["", "🔁 <b>Часто повторяешь</b>"]
         for o in overused:
             c = counts[o["phrase"]]
             out.append(
                 f"• «{html.escape(o['phrase'])}» — {c['count']} раз\n"
                 f"  Вместо: {html.escape(', '.join(o['alternatives']))}\n"
                 f"  <i>{html.escape(o['note'])}</i>"
-            )
-    if recurring:
-        out += ["", "<b>Повторяющиеся ошибки</b>"]
-        for r in recurring:
-            examples = "; ".join(r.get("examples") or [])
-            out.append(
-                f"• <b>{html.escape(r['pattern'])}</b>"
-                + (f"\n  {html.escape(examples)}" if examples else "")
-                + f"\n  <i>{html.escape(r['tip'])}</i>"
             )
     return "\n".join(out)
 
