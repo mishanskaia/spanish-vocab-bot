@@ -1642,13 +1642,14 @@ async def _propose_scenes(bot, chat_id: int, user_id: int, context: ContextTypes
         return
     await bot.send_chat_action(chat_id, ChatAction.TYPING)
     try:
-        scenes = await asyncio.to_thread(scene_practice.propose_scenes, pool)
+        scenes = await asyncio.to_thread(scene_practice.propose_scenes, pool, scene_practice.recent_titles(user_id))
     except Exception:
         logger.exception("scene: proposing failed")
         scenes = []
     if not scenes:
         await bot.send_message(chat_id, "Не получилось собрать сцены, попробуй /scene ещё раз.")
         return
+    db.add_scene_proposals(user_id, scenes)
     token = secrets.token_hex(4)
     context.user_data["scenes"] = {"token": token, "items": scenes}
     await bot.send_message(

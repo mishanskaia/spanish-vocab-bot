@@ -241,6 +241,27 @@ async def main():
     check("неописанных мало — добираем описанными, самые давние первыми",
           all(e.startswith("palabra") for e in order[:10]) and order[10:] == ["antigua", "media", "reciente"])
 
+    print("\n5. Предложенные сцены тоже считаются — чтобы тема не возвращалась")
+    titles = scene_practice.recent_titles(OWNER_ID)
+    check("предложенные сцены сохранены (и выбранная, и нет)", {"Дождь на остановке", "Ужин дома"} <= set(titles))
+    pool = scene_practice.build_pool(OWNER_ID)
+    by_es = {w["es"]: w for w in pool}
+    check("слово невыбранной сцены помечено как предложенное, не как описанное",
+          by_es["cocinar"]["last_offered"] and not by_es["cocinar"]["last_scene"])
+    check("слово, выброшенное проверкой картинки, — тоже предложенное",
+          by_es["esperar"]["last_offered"] and not by_es["esperar"]["last_scene"])
+    staged = [
+        {"es": "describida", "ru": "x", "last_scene": "2026-09-01", "last_offered": "2026-09-01"},
+        {"es": "ofrecida", "ru": "x", "last_scene": None, "last_offered": "2026-10-01"},
+        {"es": "nueva", "ru": "x", "last_scene": None, "last_offered": None},
+    ]
+    order = [w["es"] for w in scene_practice.rotation_slice(staged)]
+    check("порядок: не предлагались → предлагались → описаны", order == ["nueva", "ofrecida", "describida"])
+    prompt = scene_practice._scenes_prompt(scene_practice.rotation_slice(pool), titles)
+    check("в промпте пометка «offered before»", "cocinar — готовить (offered before)" in prompt)
+    check("в промпте — недавние темы с запретом повторять", "Дождь на остановке" in prompt and "do NOT propose" in prompt)
+    check("без истории — блока про недавние темы нет", "do NOT propose" not in scene_practice._scenes_prompt(pool))
+
     await talk_part()
 
     os.remove(DB_FILE)
@@ -249,7 +270,7 @@ async def main():
 
 
 async def talk_part():
-    print("\n5. Разговор по картинке (сервер /talk)")
+    print("\n6. Разговор по картинке (сервер /talk)")
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
     import stt_helper

@@ -280,6 +280,20 @@ def init_db():
         )
         """
     )
+    # Every scene /scene ever offered, chosen or not (2026-10-11). Without it a scene she
+    # skipped left no trace, its words stayed "never described" and came straight back — and
+    # Claude, not knowing what it had offered, rebuilt «Собираю чемодан» day after day.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scene_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            words TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS talk_memory (
@@ -1274,6 +1288,28 @@ def get_scene(scene_id: int):
     d = dict(row)
     d["words"] = json.loads(d["words"] or "[]")
     return d
+
+
+def add_scene_proposals(user_id: int, scenes) -> None:
+    """scenes: [{"title", "words": [{"es", ...}]}] — the batch just offered to her."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_connection()
+    conn.executemany(
+        "INSERT INTO scene_proposals (user_id, title, words, created_at) VALUES (?, ?, ?, ?)",
+        [(user_id, s["title"], json.dumps([w["es"] for w in s["words"]], ensure_ascii=False), now) for s in scenes],
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_scene_proposals(user_id: int) -> list:
+    """[(title, [es...], created_at)], newest first."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT title, words, created_at FROM scene_proposals WHERE user_id = ? ORDER BY id DESC", (user_id,)
+    ).fetchall()
+    conn.close()
+    return [(r["title"], json.loads(r["words"] or "[]"), r["created_at"]) for r in rows]
 
 
 def get_scene_words_history(user_id: int) -> list:

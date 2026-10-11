@@ -28,7 +28,12 @@ import word_catalog
 # Rotation (2026-09-29): words that were never on a picture go to Claude first, then the ones
 # described longest ago — however old the card itself is. Without it Claude got the whole pool
 # every time and kept picking the same easy-to-draw words.
+#
+# Offered scenes count too (2026-10-11): a word that was offered but not drawn — the scene
+# wasn't chosen, or the picture didn't show it — goes after the never-offered ones, so the
+# same theme doesn't come straight back. And Claude sees the titles of the recent scenes.
 POOL_PROMPT_LIMIT = 60
+RECENT_TITLES = 15
 MIN_POOL = 6
 SCENE_COUNT = 3
 MIN_SCENE_WORDS = 3
@@ -39,16 +44,23 @@ IMAGE_QUALITY = os.environ.get("SCENE_IMAGE_QUALITY", "medium")
 
 
 def build_pool(user_id: int) -> list[dict]:
-    """[{es, ru, last_scene}] — cards she has met in review plus catalog words marked «знаю».
-    last_scene: when the word was last on a picture she got (ISO string), None if never.
-    Only words that survived the vision check are stored with a scene, so a word that
-    wasn't recognisable on its picture still counts as never described."""
+    """[{es, ru, last_scene, last_offered}] — cards she has met in review plus catalog words
+    marked «знаю». last_scene: when the word was last on a picture she got (ISO string), None
+    if never. Only words that survived the vision check are stored with a scene, so a word
+    that wasn't recognisable on its picture still counts as never described — but it does
+    have last_offered (when it was last in any offered scene)."""
     last_scene = {}
     for words, created_at in db.get_scene_words_history(user_id):
         for w in words:
             key = word_catalog.normalize(w.get("es", ""))
             if created_at > last_scene.get(key, ""):
                 last_scene[key] = created_at
+    last_offered = {}
+    for _title, words, created_at in db.get_scene_proposals(user_id):
+        for es in words:
+            key = word_catalog.normalize(es)
+            if created_at > last_offered.get(key, ""):
+                last_offered[key] = created_at
     pool = {}
     for row in db.get_known_words(user_id, limit=1000):
         pool[word_catalog.normalize(row["phrase"])] = {"es": row["phrase"], "ru": row["meaning"]}
@@ -59,15 +71,36 @@ def build_pool(user_id: int) -> list[dict]:
             pool[entry["key"]] = {"es": entry["es"], "ru": ru}
     for key, word in pool.items():
         word["last_scene"] = last_scene.get(key)
+        word["last_offered"] = last_offered.get(key)
     return list(pool.values())
 
 
+def _rotation_key(w: dict) -> tuple:
+    if w.get("last_scene"):
+        return (2, w["last_scene"])            # described — longest ago first
+    if w.get("last_offered"):
+        return (1, w["last_offered"])          # offered, never drawn — offered longest ago first
+    return (0, "")                             # never offered
+
+
 def rotation_slice(pool: list[dict]) -> list[dict]:
-    """Never-described words first (shuffled, so «Другие сцены» gives a different set), then
-    the ones described longest ago; the first POOL_PROMPT_LIMIT go to Claude."""
+    """Never-offered words first (shuffled, so «Другие сцены» gives a different set), then
+    offered-but-never-drawn ones, then the ones described longest ago; the first
+    POOL_PROMPT_LIMIT go to Claude."""
     shuffled = random.sample(pool, len(pool))
-    shuffled.sort(key=lambda w: w.get("last_scene") or "")  # stable: ties keep the shuffle
+    shuffled.sort(key=_rotation_key)  # stable: ties keep the shuffle
     return shuffled[:POOL_PROMPT_LIMIT]
+
+
+def recent_titles(user_id: int) -> list[str]:
+    """Titles of the last scenes offered to her, newest first, without repeats."""
+    titles = []
+    for title, _words, _at in db.get_scene_proposals(user_id):
+        if title not in titles:
+            titles.append(title)
+        if len(titles) >= RECENT_TITLES:
+            break
+    return titles
 
 
 SCENES_SYSTEM = (
@@ -76,15 +109,28 @@ SCENES_SYSTEM = (
 )
 
 
-def _scenes_prompt(words: list[dict]) -> str:
-    listing = "\n".join(f"- {w['es']} — {w['ru']}" + (" (already described)" if w.get("last_scene") else "")
-                        for w in words)
+def _mark(w: dict) -> str:
+    if w.get("last_scene"):
+        return " (already described)"
+    if w.get("last_offered"):
+        return " (offered before)"
+    return ""
+
+
+def _scenes_prompt(words: list[dict], recent=()) -> str:
+    listing = "\n".join(f"- {w['es']} — {w['ru']}{_mark(w)}" for w in words)
+    avoid = ""
+    if recent:
+        avoid = ("\nScenes she was offered recently — do NOT propose these situations again, not even "
+                 "with other words or a reworded title (another trip-packing scene is still a repeat):\n"
+                 + "\n".join(f"- {t}" for t in recent) + "\n")
     return f"""Here are Spanish words she already knows (passively) but rarely uses when speaking:
 {listing}
 
-Words marked "(already described)" were in one of her earlier pictures — use them only when a scene
-really needs them; build the scenes from the unmarked words first.
-
+Words marked "(already described)" were in one of her earlier pictures, words marked "(offered before)"
+were in a scene she was already offered — use marked words only when a scene really needs them;
+build the scenes from the unmarked words first.
+{avoid}
 Propose {SCENE_COUNT} scenes. Each scene is ONE everyday situation that will be drawn as a single
 picture, and she will describe the picture aloud in Spanish. The goal: describing the picture
 naturally requires the scene's target words.
@@ -109,12 +155,13 @@ For each scene give:
 JSON: {{"scenes": [{{"title": "...", "words": ["..."], "picture": "...", "must_show": ["..."]}}]}}"""
 
 
-def propose_scenes(pool: list[dict]) -> list[dict]:
+def propose_scenes(pool: list[dict], recent=()) -> list[dict]:
     """Claude groups the rotation slice of the pool into themed scenes. Every word it returns
     is checked against the pool (models do invent or re-spell words); a scene left with
-    fewer than MIN_SCENE_WORDS real words is dropped."""
+    fewer than MIN_SCENE_WORDS real words is dropped. recent: titles of the last offered
+    scenes, which Claude must not repeat."""
     sample = rotation_slice(pool)
-    data = ai_helper._ask_claude(_scenes_prompt(sample), max_tokens=3000, system=SCENES_SYSTEM)
+    data = ai_helper._ask_claude(_scenes_prompt(sample, recent), max_tokens=3000, system=SCENES_SYSTEM)
     by_es = {w["es"].lower(): w for w in sample}
     scenes = []
     for raw in data.get("scenes") or []:
