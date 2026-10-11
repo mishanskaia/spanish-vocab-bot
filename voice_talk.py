@@ -27,6 +27,7 @@ import html
 import json
 import logging
 import os
+import random
 import re
 import time
 from datetime import datetime, timezone
@@ -164,21 +165,66 @@ MISTAKES_RULES = """Mistakes:
 """
 
 
-def _facts_rules(facts) -> str:
+# Memory is background, not a source of topics (2026-10-11). The old rule "build on it" made the
+# most vivid fact a hook: she mentioned a trip to South Africa once, and every conversation after
+# that drifted back to it — which fed more trip facts into the memory, which made the hook stronger.
+def _facts_rules(facts, avoid=()) -> str:
     block = ("\n".join(f"- {f}" for f in facts) if facts
              else "- (todavía no sabes nada de ella — es vuestra primera conversación)")
+    avoid_line = ""
+    if avoid:
+        avoid_line = ("- Last time you brought these up yourself — don't raise them yourself this time: "
+                      + "; ".join(avoid) + ".\n")
     return f"""What you already know about her (from your earlier conversations — she expects you to remember):
 {block}
 
-- Never ask about something on that list; build on it instead ("¿Cómo están tus gatos?" rather than "¿Tienes gatos?").
-- Don't recite the list back to her and don't say you read it somewhere — you simply remember.
+This is background, not a list of topics:
+- Use it so you never ask what you already know ("¿Cómo están tus gatos?" rather than "¿Tienes gatos?"), and so you react like a friend who remembers when SHE brings something up.
+- Don't steer the conversation toward these facts. A big event in her life (a trip, a move, a new job) is exactly the hook to resist: she wants to talk about many different things, not the same one every time.
+- At most once in the whole conversation you may bring up one of them yourself, briefly, and only where it fits what she is saying.
+{avoid_line}- Don't recite the list back to her and don't say you read it somewhere — you simply remember.
 
 """
 
 
-def build_instructions(target_words, facts=()) -> str:
+# Opener topics, rotated by code so consecutive conversations start in different places — the
+# model, left to choose, kept opening with the same comfortable topic. Only an opener: she leads after.
+OPENER_TOPICS = [
+    "food: something she cooked or ate recently, a dish she misses, cooking vs eating out",
+    "childhood: a memory, a game, a place, what she was like as a child",
+    "work or study: a usual day, what she likes or finds hard about it",
+    "her city: a favourite place, what she would change, what a visitor should see",
+    "a hypothetical: what she would do with a free month, a lot of money, or a different job",
+    "films, series or books: something she watched or read recently and her opinion",
+    "habits: mornings, evenings, weekends — what her routine looks like and why",
+    "people around her: a friend, a neighbour, a family member and a story about them",
+    "a small everyday problem: something annoying lately and how she dealt with it",
+    "weather and seasons: her favourite season, what she does when it rains",
+    "shopping: something she bought recently, shops vs online, a thing she wants",
+    "health and sport: walking, sleep, a sport she likes or hates",
+    "music: what she listens to, a concert, a song from her past",
+    "the home: her favourite corner, what she would change, a chore she hates",
+    "a small opinion question: cats or dogs, city or countryside, morning or night — and why",
+    "learning: something new she learned or wants to learn, apart from Spanish",
+    "celebrations: a holiday or birthday she remembers, how she likes to celebrate",
+    "transport: how she gets around, a funny or bad trip on public transport",
+]
+OPENER_NO_REPEAT = 7
+
+
+def pick_opener(user_id: int) -> str:
+    recent = set(db.get_recent_openers(user_id, OPENER_NO_REPEAT))
+    fresh = [t for t in OPENER_TOPICS if t not in recent] or OPENER_TOPICS
+    return random.choice(fresh)
+
+
+def build_instructions(target_words, facts=(), opener: str | None = None, avoid_facts=()) -> str:
     word_lines = "\n".join(f"- {w['phrase']} — {w['meaning']}" for w in target_words)
-    facts_rules = _facts_rules(facts)
+    facts_rules = _facts_rules(facts, avoid_facts)
+    opener_line = (f"Today's opener topic: {opener}. Open with a question on it — one where a target word might fit if "
+                   "possible. It is only an opener, not a plan to stick to; and it is NOT a cue to talk about "
+                   "a fact you remember about her."
+                   if opener else "Pick an everyday topic that several target words fit into, and open with it.")
     # Priorities rewritten after the first live test (2026-09-19): v1 put the target
     # words first and said "switch word every 2-3 turns" + "recast her idea" — the
     # result was a questionnaire that jumped topics and parroted her back before
@@ -209,7 +255,8 @@ Keeping the thread:
 - The topic is whatever she is talking about right now. Go deeper into it with follow-up questions (why, how, with whom, what happened next).
 - If she asks you something — what a word means, how to say something, your opinion, anything — answer it first, clearly and simply. Your follow-up question is then about what SHE asked (that word in her life, that thing she's curious about), not a way back to the earlier topic: after "¿Qué es peluquería?" ask "¿Vas mucho a la peluquería?", not "¿Fuiste a la peluquería en Georgia?". Never steer back after she moved on ("bueno, volviendo a…").
 - You change topic only through a natural bridge from what was just said, never abruptly.
-- At the start, pick an everyday topic that several target words fit into, and open with it — it's just an opener, not a plan to stick to.
+- When a topic runs dry, bridge somewhere NEW — not back to a topic you already know she has (a trip, her job, her pets). Look wide: everyday life has many corners.
+- {opener_line}
 
 Target words:
 - Use one only when it fits the current topic naturally: ask something whose natural answer needs it.
@@ -218,13 +265,13 @@ Target words:
 - Never list them, never mention that they are targets.
 - It's fine if only 2–3 of them come up in the whole conversation.
 
-{MISTAKES_RULES}{facts_rules}Start: greet her briefly and open your chosen topic with a question.
+{MISTAKES_RULES}{facts_rules}Start: greet her briefly and open the opener topic with a question.
 
 Target words (Spanish — Russian meaning):
 {word_lines or "- (no words yet — just have a simple everyday conversation)"}"""
 
 
-def build_scene_instructions(scene: dict, facts=()) -> str:
+def build_scene_instructions(scene: dict, facts=(), avoid_facts=()) -> str:
     """Picture mode (/scene → «Описать голосом», 2026-09-28). Unlike the free conversation,
     here the words come first: the picture takes the choice of topic away from her, which is
     the point — in free talk she steers to comfortable topics and her passive words never
@@ -249,7 +296,7 @@ The conversation has three phases. Move on when a phase is done; never announce 
    - Up to two questions around a word. If she still doesn't produce it: a hint — what it's for, where it is, or how it starts ("empieza por «pa…»"). If that doesn't work either: give the word in a natural sentence and ask her to say something with it — "Es «el paraguas». ¿Qué hace la mujer con el paraguas?"
    - A correct synonym is fine: accept it ("¡Sí!"), mention the target in passing ("también se dice «…»"), and let her use it.
    - A word she has already said, in any form, is done — don't come back to it in this phase.
-3. Her life. When every target word has been said — by her or handed to her — bridge from the picture to her own life and have a real conversation: she leads, you react and ask one follow-up question. Ask grown-up questions (experience, opinion, reasons, choices, plans) whose natural answers reuse the target words in her own situation: "¿Y a ti? ¿Qué haces cuando llueve y no tienes paraguas?". Don't hand her the words again here — let her find them herself.
+3. Her life. When every target word has been said — by her or handed to her — bridge from the picture to her own life — through the situation in the picture (the rain, the cooking, the waiting), not to a topic you remember about her — and have a real conversation: she leads, you react and ask one follow-up question. Ask grown-up questions (experience, opinion, reasons, choices, plans) whose natural answers reuse the target words in her own situation: "¿Y a ti? ¿Qué haces cuando llueve y no tienes paraguas?". Don't hand her the words again here — let her find them herself.
 
 How a turn sounds:
 - Simple A1–A2 words, short sentences (up to ~12 words). Keep your turn to 1–3 sentences; she talks more than you.
@@ -257,7 +304,7 @@ How a turn sounds:
 - If she asks what something in the picture is called, tell her — then ask her to use it.
 - Do NOT start by repeating what she said.
 
-{MISTAKES_RULES}{_facts_rules(facts)}Start: greet her in one short sentence and ask her to describe the picture."""
+{MISTAKES_RULES}{_facts_rules(facts, avoid_facts)}Start: greet her in one short sentence and ask her to describe the picture."""
 
 
 TURN_FORMAT = """
@@ -270,7 +317,8 @@ Answer with JSON:
 - If her message ends with [LARGA PAUSA], she went quiet for a long time: if it breaks off mid-sentence, she's stuck — help gently, offer the word she seems to be looking for or ask your question again more simply; if it's a finished thought, just reply normally.
 - [TERMINÉ] at the end only means she tapped "I'm done" — reply normally.
 - "translations": every Russian word or phrase in THIS message of hers that she used because she didn't know it in Spanish, with the Spanish the conversation needed — "ru" as she said it but always in Cyrillic (turn a Latin-letter transliteration like "shapka" back into "шапка"), "es" for a single word in dictionary form (nouns with their article, verbs in the infinitive): [{"ru": "шапка", "es": "el gorro"}]; for a whole Russian phrase, the natural Spanish phrase as she would say it here ("я много работаю" → "trabajo mucho"). Empty list if she used no Russian. Only her LAST message counts: a Russian word from her earlier messages was already translated — never list it again unless she says it in Russian again now. Russian she used to ask you something ("что значит…", "как сказать…") is not a translation — answer the question instead. These are shown to her on screen and offered for her vocabulary, so the Spanish must be the natural, common A1–A2 word for her meaning.
-- "used_words": the target words she herself used in THIS message, in any grammatical form ("fui" counts for "ir", "paraguas" for "el paraguas") — copied exactly as they appear in the target list. Only her message, not your reply. Empty list if none."""
+- "used_words": the target words she herself used in THIS message, in any grammatical form ("fui" counts for "ir", "paraguas" for "el paraguas") — copied exactly as they appear in the target list. Only her message, not your reply. Empty list if none.
+- "raised_fact": if YOUR reply brings up something from what you remember about her that she did not mention in this conversation, copy that fact exactly as it is in your list; otherwise "". Reacting to something she said herself doesn't count."""
 
 TURN_SCHEMA = {
     "type": "object",
@@ -286,8 +334,9 @@ TURN_SCHEMA = {
             },
         },
         "used_words": {"type": "array", "items": {"type": "string"}},
+        "raised_fact": {"type": "string"},
     },
-    "required": ["reply", "translations", "used_words"],
+    "required": ["reply", "translations", "used_words", "raised_fact"],
     "additionalProperties": False,
 }
 
@@ -351,8 +400,10 @@ def _history_to_messages(history, user_text: str | None) -> list[dict]:
     return messages
 
 
-def session_instructions(target_words, facts=(), scene: dict | None = None) -> str:
-    base = build_scene_instructions(scene, facts) if scene else build_instructions(target_words, facts)
+def session_instructions(target_words, facts=(), scene: dict | None = None,
+                         opener: str | None = None, avoid_facts=()) -> str:
+    base = (build_scene_instructions(scene, facts, avoid_facts) if scene
+            else build_instructions(target_words, facts, opener, avoid_facts))
     return base + TURN_FORMAT
 
 
@@ -446,6 +497,18 @@ def _voice_error(e: Exception) -> web.Response:
     return web.json_response({"error": f"{type(e).__name__}: {e}"[:300]}, status=502)
 
 
+def _note_raised_fact(session_id: int, raised, facts) -> None:
+    """Remember a memory fact the bot brought up itself, so the next conversation doesn't
+    open the same door. Only facts really on her list count — the model may paraphrase."""
+    raised = str(raised or "").strip().lower()
+    if not raised:
+        return
+    for fact in facts:
+        if raised == fact.lower() or raised in fact.lower() or fact.lower() in raised:
+            db.add_voice_raised_fact(session_id, fact)
+            return
+
+
 async def handle_start(request: web.Request) -> web.Response:
     """Opens a session: picks the target words, and the bot says the first line."""
     user_id = _request_owner_id(request)
@@ -468,7 +531,9 @@ async def handle_start(request: web.Request) -> web.Response:
             return web.json_response({"error": "картинка не найдена"}, status=404)
 
     target_words = scene_target_words(scene) if scene else db.get_voice_target_words(user_id, TARGET_WORD_COUNT)
-    system = session_instructions(target_words, db.get_talk_memory(user_id), scene)
+    opener = None if scene else pick_opener(user_id)
+    facts = db.get_talk_memory(user_id)
+    system = session_instructions(target_words, facts, scene, opener, db.get_last_raised_facts(user_id))
     timings, usage = {}, {}
     try:
         t = time.monotonic()
@@ -480,7 +545,8 @@ async def handle_start(request: web.Request) -> web.Response:
     except Exception as e:
         return _voice_error(e)
 
-    session_id = db.create_voice_session(user_id, target_words, scene["id"] if scene else None)
+    session_id = db.create_voice_session(user_id, target_words, scene["id"] if scene else None, opener)
+    _note_raised_fact(session_id, data.get("raised_fact"), facts)
     return web.json_response({
         "session_id": session_id,
         "target_count": len(target_words),
@@ -539,7 +605,9 @@ async def handle_turn(request: web.Request) -> web.Response:
     try:
         t = time.monotonic()
         scene = db.get_scene(session["scene_id"]) if session.get("scene_id") else None
-        system = session_instructions(session["target_words"], db.get_talk_memory(user_id), scene)
+        facts = db.get_talk_memory(user_id)
+        system = session_instructions(session["target_words"], facts, scene, session.get("opener"),
+                                      db.get_last_raised_facts(user_id, before_id=session_id))
         reply_task = asyncio.ensure_future(asyncio.to_thread(claude_turn, system, history, user_text + marker))
         if mode == "auto":
             last_bot = next((str(h.get("text", "")) for h in reversed(history) if h.get("role") == "assistant"), "")
@@ -567,6 +635,7 @@ async def handle_turn(request: web.Request) -> web.Response:
     except Exception as e:
         return _voice_error(e)
 
+    _note_raised_fact(session_id, data.get("raised_fact"), facts)
     word_use = track_word_use(session, user_text, reply, data.get("used_words"))
     if word_use != (session.get("word_use") or {}):
         db.set_voice_word_use(session_id, word_use)

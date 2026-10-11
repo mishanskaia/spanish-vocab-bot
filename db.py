@@ -265,6 +265,13 @@ def init_db():
         conn.execute("ALTER TABLE voice_sessions ADD COLUMN scene_id INTEGER")
     except sqlite3.OperationalError:
         pass
+    # Topic breadth (2026-10-11): the opener topic picked by code (rotated so it doesn't repeat),
+    # and the facts from her memory the bot brought up itself — next time it mustn't raise them again.
+    for column in ("opener TEXT", "raised_facts TEXT DEFAULT '[]'"):
+        try:
+            conn.execute(f"ALTER TABLE voice_sessions ADD COLUMN {column}")
+        except sqlite3.OperationalError:
+            pass
     # /scene pictures — see scene_practice.py. words: [{"es", "ru", "shown"}] after the vision
     # check; seen: what Claude actually sees in the picture (the conversation works from it).
     conn.execute(
@@ -1091,12 +1098,12 @@ def get_voice_target_words(user_id: int, limit: int = 10):
     return [dict(r) for r in rows]
 
 
-def create_voice_session(user_id: int, target_words, scene_id: int | None = None) -> int:
+def create_voice_session(user_id: int, target_words, scene_id: int | None = None, opener: str | None = None) -> int:
     conn = get_connection()
     cur = conn.execute(
-        "INSERT INTO voice_sessions (user_id, target_words, started_at, scene_id) VALUES (?, ?, ?, ?)",
+        "INSERT INTO voice_sessions (user_id, target_words, started_at, scene_id, opener) VALUES (?, ?, ?, ?, ?)",
         (user_id, json.dumps(list(target_words), ensure_ascii=False), datetime.now(timezone.utc).isoformat(),
-         scene_id),
+         scene_id, opener),
     )
     session_id = cur.lastrowid
     conn.commit()
@@ -1112,12 +1119,53 @@ def get_voice_session(session_id: int):
         return None
     d = dict(row)
     for key, default in (("target_words", []), ("transcript", []), ("usage", {}), ("found_words", []),
-                         ("word_use", {}), ("analysis", {})):
+                         ("word_use", {}), ("analysis", {}), ("raised_facts", [])):
         try:
             d[key] = json.loads(d[key]) if d[key] else default
         except json.JSONDecodeError:
             d[key] = default
     return d
+
+
+def get_recent_openers(user_id: int, limit: int) -> list:
+    """Opener topics of her last free conversations, newest first."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT opener FROM voice_sessions WHERE user_id = ? AND opener IS NOT NULL ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return [r["opener"] for r in rows]
+
+
+def get_last_raised_facts(user_id: int, before_id: int | None = None) -> list:
+    """Facts the bot brought up itself in her previous conversation (any mode). before_id: the
+    current session, so every turn sees the same list as the opening line did."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT raised_facts FROM voice_sessions WHERE user_id = ? AND id < ? ORDER BY id DESC LIMIT 1",
+        (user_id, before_id if before_id is not None else 2**62),
+    ).fetchone()
+    conn.close()
+    try:
+        return json.loads(row["raised_facts"]) if row and row["raised_facts"] else []
+    except json.JSONDecodeError:
+        return []
+
+
+def add_voice_raised_fact(session_id: int, fact: str):
+    conn = get_connection()
+    row = conn.execute("SELECT raised_facts FROM voice_sessions WHERE id = ?", (session_id,)).fetchone()
+    try:
+        facts = json.loads(row["raised_facts"]) if row and row["raised_facts"] else []
+    except json.JSONDecodeError:
+        facts = []
+    if fact not in facts:
+        facts.append(fact)
+        conn.execute("UPDATE voice_sessions SET raised_facts = ? WHERE id = ?",
+                     (json.dumps(facts, ensure_ascii=False), session_id))
+        conn.commit()
+    conn.close()
 
 
 def save_voice_transcript(session_id: int, transcript, usage, ended: bool):
