@@ -69,6 +69,8 @@
   body[data-state="thinking"] #orb { animation: breathe 1.2s ease-in-out infinite; filter: brightness(.85); }
   body[data-state="speaking"] #orb { animation: speak .5s ease-in-out infinite alternate; box-shadow: 0 0 90px 0 var(--warm-2); }
   body[data-state="paused"] #orb, body[data-state="ended"] #orb { animation: none; filter: grayscale(1) brightness(.55); box-shadow: none; }
+  #orb.tapped { animation: tapped .45s ease-out !important; }
+  @keyframes tapped { 0% { transform: scale(.86); filter: brightness(1.8); } 100% { transform: scale(1); filter: brightness(.85); } }
   @keyframes breathe { 0%,100% { transform: scale(.95); } 50% { transform: scale(1); } }
   @keyframes listen { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
   @keyframes speak { from { transform: scale(1); } to { transform: scale(1.09); } }
@@ -279,6 +281,19 @@
     hintEl.textContent = h;
   }
   function showError(msg) { errEl.textContent = msg; }
+
+  // «я договорила» registered — she must see and feel it, or she taps again and wonders
+  function tapFeedback() {
+    const orb = $("orb");
+    orb.classList.remove("tapped");
+    void orb.offsetWidth;  // restart the animation
+    orb.classList.add("tapped");
+    try {
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.impactOccurred("medium");
+      else if (navigator.vibrate) navigator.vibrate(30);
+    } catch (e) {}
+  }
+  $("orb").addEventListener("animationend", (e) => { if (e.animationName === "tapped") $("orb").classList.remove("tapped"); });
 
   function addUsage(src) {
     for (const [k, v] of Object.entries(src || {})) if (typeof v === "number") usage[k] = (usage[k] || 0) + v;
@@ -509,6 +524,8 @@
   function onVoiceStart() {
     if (state === "speaking") { bargeIn(); return; }
     if (state !== "listening" && state !== "thinking") return;
+    // after «я договорила» the turn is final — a tap thump, «мм» or a breath must not cancel it
+    if (inflight && inflight.final) return;
     if (inflight) { inflight.ac.abort(); inflight = null; setState("listening"); }  // she carried on — the check is moot
     if (!utter.hasSpeech) beginUtterFromPreroll();
     waitingHint = false; renderHint();
@@ -568,7 +585,8 @@
     if (inflight) inflight.ac.abort();
     const seq = ++turnSeq;
     const ac = new AbortController();
-    inflight = { ac, seq };
+    const final = mode === "done";  // she said she's done (or MAX_UTTER) — nothing she does now cancels it
+    inflight = { ac, seq, final };
     setState("thinking");
     const t0 = performance.now();
     const form = new FormData();
@@ -610,7 +628,7 @@
       setState("listening");
       return;
     }
-    if (performance.now() - lastVoicedAt < CFG.RESUME_GUARD_MS) {
+    if (!final && performance.now() - lastVoicedAt < CFG.RESUME_GUARD_MS) {
       // she's talking right now — the answer is to half a thought; the next pause re-checks everything
       setState("listening");
       return;
@@ -671,7 +689,7 @@
     diag["пик голоса"] = peak ? peak.toFixed(4) : "—";
     if (document.getElementById("diag").classList.contains("open")) renderDiag();
     let progress = 0;
-    if ((state === "listening" || state === "thinking") && utter.hasSpeech && !voiceActive) {
+    if ((state === "listening" || state === "thinking") && utter.hasSpeech && !voiceActive && !(inflight && inflight.final)) {
       const now = performance.now(), silence = now - lastVoicedAt;
       progress = Math.max(0, Math.min(1, (silence - 400) / (CFG.STUCK_MS - 400)));
       // a voice-like sound is being judged right now — hold the check a moment, but don't restart the countdown
@@ -775,7 +793,12 @@
     if (state === "speaking") {  // skip the rest of the bot's line
       stopPlayback(); ignoreUntil = performance.now() + CFG.ECHO_TAIL_MS; setState("listening"); return;
     }
-    if ((state === "listening" || state === "thinking") && utter.hasSpeech) { sendTurn("done"); return; }  // "I'm done"
+    if ((state === "listening" || state === "thinking") && utter.hasSpeech) {  // "I'm done"
+      if (inflight && inflight.final) return;  // already sent — a second tap changes nothing
+      tapFeedback();
+      sendTurn("done");
+      return;
+    }
     if (state === "listening") {  // fallback if the mic never hears her: tap to start, tap again to send
       beginUtterFromPreroll();
       lastVoicedAt = performance.now();
