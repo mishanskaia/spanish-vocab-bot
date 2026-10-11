@@ -241,6 +241,27 @@ async def main():
     check("неописанных мало — добираем описанными, самые давние первыми",
           all(e.startswith("palabra") for e in order[:10]) and order[10:] == ["antigua", "media", "reciente"])
 
+    print("\n5. Предложенные сцены тоже считаются — чтобы тема не возвращалась")
+    titles = scene_practice.recent_titles(OWNER_ID)
+    check("предложенные сцены сохранены (и выбранная, и нет)", {"Дождь на остановке", "Ужин дома"} <= set(titles))
+    pool = scene_practice.build_pool(OWNER_ID)
+    by_es = {w["es"]: w for w in pool}
+    check("слово невыбранной сцены помечено как предложенное, не как описанное",
+          by_es["cocinar"]["last_offered"] and not by_es["cocinar"]["last_scene"])
+    check("слово, выброшенное проверкой картинки, — тоже предложенное",
+          by_es["esperar"]["last_offered"] and not by_es["esperar"]["last_scene"])
+    staged = [
+        {"es": "describida", "ru": "x", "last_scene": "2026-09-01", "last_offered": "2026-09-01"},
+        {"es": "ofrecida", "ru": "x", "last_scene": None, "last_offered": "2026-10-01"},
+        {"es": "nueva", "ru": "x", "last_scene": None, "last_offered": None},
+    ]
+    order = [w["es"] for w in scene_practice.rotation_slice(staged)]
+    check("порядок: не предлагались → предлагались → описаны", order == ["nueva", "ofrecida", "describida"])
+    prompt = scene_practice._scenes_prompt(scene_practice.rotation_slice(pool), titles)
+    check("в промпте пометка «offered before»", "cocinar — готовить (offered before)" in prompt)
+    check("в промпте — недавние темы с запретом повторять", "Дождь на остановке" in prompt and "do NOT propose" in prompt)
+    check("без истории — блока про недавние темы нет", "do NOT propose" not in scene_practice._scenes_prompt(pool))
+
     await talk_part()
 
     os.remove(DB_FILE)
@@ -249,7 +270,7 @@ async def main():
 
 
 async def talk_part():
-    print("\n5. Разговор по картинке (сервер /talk)")
+    print("\n6. Разговор по картинке (сервер /talk)")
     from aiohttp import web
     from aiohttp.test_utils import TestClient, TestServer
     import stt_helper
@@ -273,7 +294,7 @@ async def talk_part():
     stt_helper.transcribe_mixed = lambda audio, name: "Una mujer con paraguas espera el autobús"
     captured = {}
     voice_talk.update_memory = lambda uid, transcript, about_picture=False: captured.setdefault("about_picture", about_picture)
-    voice_talk.analyze_conversation = lambda transcript, known=(): {"errors": [], "upgrades": [], "unused": []}
+    voice_talk.analyze_conversation = lambda transcript, *a, **kw: {"errors": [], "focus": {}, "focus_result": "not_used", "upgrade": {}}
 
     class Bot:
         async def send_message(self, chat_id, text, **kw):
@@ -321,7 +342,41 @@ async def talk_part():
     res = await client.post("/talk/start", headers=auth, json={})
     plain = await res.json()
     check("обычный /talk по-прежнему без сцены", plain["scene"] is None
-          and "pick an everyday topic" in systems[-1][0])
+          and "Today's opener topic:" in systems[-1][0])
+    plain_session = db.get_voice_session(plain["session_id"])
+    check("стартовая тема записана в сессию и попала в промпт",
+          plain_session["opener"] in voice_talk.OPENER_TOPICS and plain_session["opener"] in systems[-1][0])
+    check("в картиночной сессии стартовой темы нет", db.get_voice_session(session_id)["opener"] is None)
+
+    print("\n7. Широта тем: темы по кругу, память — фон")
+    recent = []
+    for _ in range(voice_talk.OPENER_NO_REPEAT):
+        topic = voice_talk.pick_opener(OWNER_ID)
+        check_ok = topic not in recent and topic not in db.get_recent_openers(OWNER_ID, voice_talk.OPENER_NO_REPEAT)
+        recent.append(topic)
+        db.create_voice_session(OWNER_ID, [], None, topic)
+        if not check_ok:
+            break
+    check(f"{voice_talk.OPENER_NO_REPEAT} разговоров подряд — без повторов стартовой темы", check_ok)
+    facts = ["Va a viajar a Sudáfrica en noviembre", "Tiene tres gatos"]
+    sid = db.create_voice_session(OWNER_ID, [], None, "x")
+    voice_talk._note_raised_fact(sid, "va a viajar a Sudáfrica en noviembre", facts)
+    voice_talk._note_raised_fact(sid, "le gusta el jazz", facts)  # not on her list — ignored
+    check("поднятый ботом факт записан, выдуманный — нет",
+          db.get_voice_session(sid)["raised_facts"] == ["Va a viajar a Sudáfrica en noviembre"])
+    nxt = db.create_voice_session(OWNER_ID, [], None, "y")
+    avoid = db.get_last_raised_facts(OWNER_ID, before_id=nxt)
+    prompt = voice_talk.build_instructions([], facts, "food", avoid)
+    check("в следующем разговоре этот факт — в списке «не поднимай сам»",
+          "don't raise them yourself this time: Va a viajar a Sudáfrica" in prompt)
+    check("память подана как фон, не как темы", "background, not a list of topics" in prompt
+          and "build on it instead" not in prompt)
+    check("на ходу та же сессия видит тот же список (не свой собственный)",
+          db.get_last_raised_facts(OWNER_ID, before_id=nxt) == avoid)
+    scene_prompt = voice_talk.build_scene_instructions(
+        {"seen": "x", "words": [{"es": "a", "ru": "b"}]}, facts, avoid)
+    check("в картинке мостик к её жизни — через ситуацию, а не через факт",
+          "through the situation in the picture" in scene_prompt and "don't raise them yourself" in scene_prompt)
 
     res = await client.post("/talk/transcript", headers=auth, json={
         "session_id": session_id, "ended": True,

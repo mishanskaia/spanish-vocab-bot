@@ -256,7 +256,8 @@ def init_db():
     except sqlite3.OperationalError:
         pass
     try:
-        # post-conversation review: {"errors": [...], "upgrades": [...]} — see voice_talk.analyze_conversation
+        # post-conversation review: {"errors", "focus", "focus_result", "upgrade"} — see voice_talk.analyze_conversation
+        # (before 2026-10-11: {"errors", "upgrades", "unused"})
         conn.execute("ALTER TABLE voice_sessions ADD COLUMN analysis TEXT DEFAULT '{}'")
     except sqlite3.OperationalError:
         pass
@@ -265,6 +266,13 @@ def init_db():
         conn.execute("ALTER TABLE voice_sessions ADD COLUMN scene_id INTEGER")
     except sqlite3.OperationalError:
         pass
+    # Topic breadth (2026-10-11): the opener topic picked by code (rotated so it doesn't repeat),
+    # and the facts from her memory the bot brought up itself — next time it mustn't raise them again.
+    for column in ("opener TEXT", "raised_facts TEXT DEFAULT '[]'"):
+        try:
+            conn.execute(f"ALTER TABLE voice_sessions ADD COLUMN {column}")
+        except sqlite3.OperationalError:
+            pass
     # /scene pictures — see scene_practice.py. words: [{"es", "ru", "shown"}] after the vision
     # check; seen: what Claude actually sees in the picture (the conversation works from it).
     conn.execute(
@@ -276,6 +284,40 @@ def init_db():
             words TEXT NOT NULL,
             seen TEXT NOT NULL,
             image BLOB NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    # The «focus» of the voice conversations (2026-10-11): one mistake at a time that the bot
+    # gives her chances to fix in the next conversations — see voice_talk «Focus loop».
+    # streak: correct uses in a row (counted per conversation); 2 → done.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS talk_focus (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            rule TEXT NOT NULL,
+            wrong TEXT NOT NULL,
+            right_form TEXT NOT NULL,
+            why TEXT,
+            trigger TEXT,
+            status TEXT DEFAULT 'active',
+            streak INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            done_at TEXT
+        )
+        """
+    )
+    # Every scene /scene ever offered, chosen or not (2026-10-11). Without it a scene she
+    # skipped left no trace, its words stayed "never described" and came straight back — and
+    # Claude, not knowing what it had offered, rebuilt «Собираю чемодан» day after day.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS scene_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            title TEXT NOT NULL,
+            words TEXT NOT NULL,
             created_at TEXT NOT NULL
         )
         """
@@ -1077,12 +1119,12 @@ def get_voice_target_words(user_id: int, limit: int = 10):
     return [dict(r) for r in rows]
 
 
-def create_voice_session(user_id: int, target_words, scene_id: int | None = None) -> int:
+def create_voice_session(user_id: int, target_words, scene_id: int | None = None, opener: str | None = None) -> int:
     conn = get_connection()
     cur = conn.execute(
-        "INSERT INTO voice_sessions (user_id, target_words, started_at, scene_id) VALUES (?, ?, ?, ?)",
+        "INSERT INTO voice_sessions (user_id, target_words, started_at, scene_id, opener) VALUES (?, ?, ?, ?, ?)",
         (user_id, json.dumps(list(target_words), ensure_ascii=False), datetime.now(timezone.utc).isoformat(),
-         scene_id),
+         scene_id, opener),
     )
     session_id = cur.lastrowid
     conn.commit()
@@ -1098,12 +1140,53 @@ def get_voice_session(session_id: int):
         return None
     d = dict(row)
     for key, default in (("target_words", []), ("transcript", []), ("usage", {}), ("found_words", []),
-                         ("word_use", {}), ("analysis", {})):
+                         ("word_use", {}), ("analysis", {}), ("raised_facts", [])):
         try:
             d[key] = json.loads(d[key]) if d[key] else default
         except json.JSONDecodeError:
             d[key] = default
     return d
+
+
+def get_recent_openers(user_id: int, limit: int) -> list:
+    """Opener topics of her last free conversations, newest first."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT opener FROM voice_sessions WHERE user_id = ? AND opener IS NOT NULL ORDER BY id DESC LIMIT ?",
+        (user_id, limit),
+    ).fetchall()
+    conn.close()
+    return [r["opener"] for r in rows]
+
+
+def get_last_raised_facts(user_id: int, before_id: int | None = None) -> list:
+    """Facts the bot brought up itself in her previous conversation (any mode). before_id: the
+    current session, so every turn sees the same list as the opening line did."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT raised_facts FROM voice_sessions WHERE user_id = ? AND id < ? ORDER BY id DESC LIMIT 1",
+        (user_id, before_id if before_id is not None else 2**62),
+    ).fetchone()
+    conn.close()
+    try:
+        return json.loads(row["raised_facts"]) if row and row["raised_facts"] else []
+    except json.JSONDecodeError:
+        return []
+
+
+def add_voice_raised_fact(session_id: int, fact: str):
+    conn = get_connection()
+    row = conn.execute("SELECT raised_facts FROM voice_sessions WHERE id = ?", (session_id,)).fetchone()
+    try:
+        facts = json.loads(row["raised_facts"]) if row and row["raised_facts"] else []
+    except json.JSONDecodeError:
+        facts = []
+    if fact not in facts:
+        facts.append(fact)
+        conn.execute("UPDATE voice_sessions SET raised_facts = ? WHERE id = ?",
+                     (json.dumps(facts, ensure_ascii=False), session_id))
+        conn.commit()
+    conn.close()
 
 
 def save_voice_transcript(session_id: int, transcript, usage, ended: bool):
@@ -1274,6 +1357,72 @@ def get_scene(scene_id: int):
     d = dict(row)
     d["words"] = json.loads(d["words"] or "[]")
     return d
+
+
+def get_active_focus(user_id: int):
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM talk_focus WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", (user_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def create_focus(user_id: int, rule: str, wrong: str, right_form: str, why: str, trigger: str) -> int:
+    conn = get_connection()
+    # one active focus at a time — anything older is retired
+    conn.execute("UPDATE talk_focus SET status = 'replaced' WHERE user_id = ? AND status = 'active'", (user_id,))
+    cur = conn.execute(
+        "INSERT INTO talk_focus (user_id, rule, wrong, right_form, why, trigger, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, rule, wrong, right_form, why, trigger, datetime.now(timezone.utc).isoformat()),
+    )
+    focus_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return focus_id
+
+
+def set_focus_streak(focus_id: int, streak: int, done: bool):
+    conn = get_connection()
+    conn.execute(
+        "UPDATE talk_focus SET streak = ?, status = CASE WHEN ? THEN 'done' ELSE status END, "
+        "done_at = CASE WHEN ? THEN ? ELSE done_at END WHERE id = ?",
+        (streak, done, done, datetime.now(timezone.utc).isoformat(), focus_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_focus_done_since(user_id: int, since_iso: str) -> list:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM talk_focus WHERE user_id = ? AND status = 'done' AND done_at >= ? ORDER BY done_at",
+        (user_id, since_iso),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def add_scene_proposals(user_id: int, scenes) -> None:
+    """scenes: [{"title", "words": [{"es", ...}]}] — the batch just offered to her."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_connection()
+    conn.executemany(
+        "INSERT INTO scene_proposals (user_id, title, words, created_at) VALUES (?, ?, ?, ?)",
+        [(user_id, s["title"], json.dumps([w["es"] for w in s["words"]], ensure_ascii=False), now) for s in scenes],
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_scene_proposals(user_id: int) -> list:
+    """[(title, [es...], created_at)], newest first."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT title, words, created_at FROM scene_proposals WHERE user_id = ? ORDER BY id DESC", (user_id,)
+    ).fetchall()
+    conn.close()
+    return [(r["title"], json.loads(r["words"] or "[]"), r["created_at"]) for r in rows]
 
 
 def get_scene_words_history(user_id: int) -> list:

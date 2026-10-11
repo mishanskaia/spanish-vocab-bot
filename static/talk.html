@@ -38,6 +38,12 @@
   }
   #status { color: var(--muted); font-size: 15px; }
   #diagBtn { border: 0; background: none; color: var(--faint); font-size: 20px; padding: 6px; }
+  .hdrBtns { display: flex; align-items: center; gap: 4px; }
+  #earsBtn {
+    border: 1px solid var(--faint); background: none; color: var(--muted); font-size: 14px;
+    border-radius: 999px; padding: 6px 12px; min-height: 36px;
+  }
+  body.ears #earsBtn { border-color: var(--cool-1); color: var(--cool-1); background: color-mix(in srgb, var(--cool-1) 12%, transparent); }
   #diag {
     display: none; font: 12px/1.5 ui-monospace, Menlo, monospace; color: var(--muted);
     background: #15151c; border-radius: 12px; padding: 10px 12px; margin-top: 8px;
@@ -69,6 +75,8 @@
   body[data-state="thinking"] #orb { animation: breathe 1.2s ease-in-out infinite; filter: brightness(.85); }
   body[data-state="speaking"] #orb { animation: speak .5s ease-in-out infinite alternate; box-shadow: 0 0 90px 0 var(--warm-2); }
   body[data-state="paused"] #orb, body[data-state="ended"] #orb { animation: none; filter: grayscale(1) brightness(.55); box-shadow: none; }
+  #orb.tapped { animation: tapped .45s ease-out !important; }
+  @keyframes tapped { 0% { transform: scale(.86); filter: brightness(1.8); } 100% { transform: scale(1); filter: brightness(.85); } }
   @keyframes breathe { 0%,100% { transform: scale(.95); } 50% { transform: scale(1); } }
   @keyframes listen { 0%,100% { transform: scale(1); } 50% { transform: scale(1.07); } }
   @keyframes speak { from { transform: scale(1); } to { transform: scale(1.09); } }
@@ -88,6 +96,10 @@
   .line.user { font-size: 15px; color: var(--muted); text-align: right; padding-left: 20%; }
   .line.user::before { content: "ты: "; color: var(--faint); }
   .line.pending { color: var(--faint); }
+  /* listening mode: the bot's lines are blurred — she sees there is a line and how long, not what it says.
+     A tap opens that one line. Her own lines and the translation plaques stay readable. */
+  body.ears .line.assistant:not(.revealed):not(.dropped) { filter: blur(7px); cursor: pointer; user-select: none; -webkit-user-select: none; }
+  body.ears .line.assistant { transition: filter .25s, opacity .3s; }
   .tr { margin: -8px 0 14px; font-size: 15px; color: var(--cool-1); }
   .tr::before { content: "🔎 "; }
 
@@ -110,7 +122,10 @@
 <body data-state="idle">
   <header>
     <div id="status">Нажми на шар, чтобы начать</div>
-    <button id="diagBtn" aria-label="Диагностика">ⓘ</button>
+    <div class="hdrBtns">
+      <button id="earsBtn" aria-pressed="false" aria-label="Режим на слух: скрыть текст бота">👂 На слух</button>
+      <button id="diagBtn" aria-label="Диагностика">ⓘ</button>
+    </div>
   </header>
   <div id="diag"></div>
   <img id="scenePic" alt="Картинка для описания">
@@ -209,6 +224,22 @@
   renderDiag();
   $("diagBtn").onclick = () => $("diag").classList.toggle("open");
 
+  // ---------- listening mode («на слух») ----------
+  // Practise understanding by ear: the bot's lines are blurred, a tap on one opens just that line.
+  // The choice is a per-device convenience, so localStorage is fine (and may be unavailable).
+  const EARS_KEY = "talk.ears";
+  function setEars(on) {
+    document.body.classList.toggle("ears", on);
+    $("earsBtn").setAttribute("aria-pressed", String(on));
+    try { localStorage.setItem(EARS_KEY, on ? "1" : "0"); } catch (e) {}
+  }
+  try { if (localStorage.getItem(EARS_KEY) === "1") setEars(true); } catch (e) {}
+  $("earsBtn").onclick = () => setEars(!document.body.classList.contains("ears"));
+  $("subs").addEventListener("click", (e) => {
+    const line = e.target.closest(".line.assistant");
+    if (line && document.body.classList.contains("ears")) line.classList.add("revealed");
+  });
+
   if (tg) {
     try {
       tg.ready(); tg.expand();
@@ -279,6 +310,19 @@
     hintEl.textContent = h;
   }
   function showError(msg) { errEl.textContent = msg; }
+
+  // «я договорила» registered — she must see and feel it, or she taps again and wonders
+  function tapFeedback() {
+    const orb = $("orb");
+    orb.classList.remove("tapped");
+    void orb.offsetWidth;  // restart the animation
+    orb.classList.add("tapped");
+    try {
+      if (tg && tg.HapticFeedback) tg.HapticFeedback.impactOccurred("medium");
+      else if (navigator.vibrate) navigator.vibrate(30);
+    } catch (e) {}
+  }
+  $("orb").addEventListener("animationend", (e) => { if (e.animationName === "tapped") $("orb").classList.remove("tapped"); });
 
   function addUsage(src) {
     for (const [k, v] of Object.entries(src || {})) if (typeof v === "number") usage[k] = (usage[k] || 0) + v;
@@ -509,6 +553,8 @@
   function onVoiceStart() {
     if (state === "speaking") { bargeIn(); return; }
     if (state !== "listening" && state !== "thinking") return;
+    // after «я договорила» the turn is final — a tap thump, «мм» or a breath must not cancel it
+    if (inflight && inflight.final) return;
     if (inflight) { inflight.ac.abort(); inflight = null; setState("listening"); }  // she carried on — the check is moot
     if (!utter.hasSpeech) beginUtterFromPreroll();
     waitingHint = false; renderHint();
@@ -568,7 +614,8 @@
     if (inflight) inflight.ac.abort();
     const seq = ++turnSeq;
     const ac = new AbortController();
-    inflight = { ac, seq };
+    const final = mode === "done";  // she said she's done (or MAX_UTTER) — nothing she does now cancels it
+    inflight = { ac, seq, final };
     setState("thinking");
     const t0 = performance.now();
     const form = new FormData();
@@ -610,7 +657,7 @@
       setState("listening");
       return;
     }
-    if (performance.now() - lastVoicedAt < CFG.RESUME_GUARD_MS) {
+    if (!final && performance.now() - lastVoicedAt < CFG.RESUME_GUARD_MS) {
       // she's talking right now — the answer is to half a thought; the next pause re-checks everything
       setState("listening");
       return;
@@ -671,7 +718,7 @@
     diag["пик голоса"] = peak ? peak.toFixed(4) : "—";
     if (document.getElementById("diag").classList.contains("open")) renderDiag();
     let progress = 0;
-    if ((state === "listening" || state === "thinking") && utter.hasSpeech && !voiceActive) {
+    if ((state === "listening" || state === "thinking") && utter.hasSpeech && !voiceActive && !(inflight && inflight.final)) {
       const now = performance.now(), silence = now - lastVoicedAt;
       progress = Math.max(0, Math.min(1, (silence - 400) / (CFG.STUCK_MS - 400)));
       // a voice-like sound is being judged right now — hold the check a moment, but don't restart the countdown
@@ -775,7 +822,12 @@
     if (state === "speaking") {  // skip the rest of the bot's line
       stopPlayback(); ignoreUntil = performance.now() + CFG.ECHO_TAIL_MS; setState("listening"); return;
     }
-    if ((state === "listening" || state === "thinking") && utter.hasSpeech) { sendTurn("done"); return; }  // "I'm done"
+    if ((state === "listening" || state === "thinking") && utter.hasSpeech) {  // "I'm done"
+      if (inflight && inflight.final) return;  // already sent — a second tap changes nothing
+      tapFeedback();
+      sendTurn("done");
+      return;
+    }
     if (state === "listening") {  // fallback if the mic never hears her: tap to start, tap again to send
       beginUtterFromPreroll();
       lastVoicedAt = performance.now();
