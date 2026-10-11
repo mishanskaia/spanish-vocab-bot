@@ -38,6 +38,12 @@
   }
   #status { color: var(--muted); font-size: 15px; }
   #diagBtn { border: 0; background: none; color: var(--faint); font-size: 20px; padding: 6px; }
+  .hdrBtns { display: flex; align-items: center; gap: 4px; }
+  #earsBtn {
+    border: 1px solid var(--faint); background: none; color: var(--muted); font-size: 14px;
+    border-radius: 999px; padding: 6px 12px; min-height: 36px;
+  }
+  body.ears #earsBtn { border-color: var(--cool-1); color: var(--cool-1); background: color-mix(in srgb, var(--cool-1) 12%, transparent); }
   #diag {
     display: none; font: 12px/1.5 ui-monospace, Menlo, monospace; color: var(--muted);
     background: #15151c; border-radius: 12px; padding: 10px 12px; margin-top: 8px;
@@ -90,6 +96,10 @@
   .line.user { font-size: 15px; color: var(--muted); text-align: right; padding-left: 20%; }
   .line.user::before { content: "ты: "; color: var(--faint); }
   .line.pending { color: var(--faint); }
+  /* listening mode: the bot's lines are blurred — she sees there is a line and how long, not what it says.
+     A tap opens that one line. Her own lines and the translation plaques stay readable. */
+  body.ears .line.assistant:not(.revealed):not(.dropped) { filter: blur(7px); cursor: pointer; user-select: none; -webkit-user-select: none; }
+  body.ears .line.assistant { transition: filter .25s, opacity .3s; }
   .tr { margin: -8px 0 14px; font-size: 15px; color: var(--cool-1); }
   .tr::before { content: "🔎 "; }
 
@@ -112,7 +122,10 @@
 <body data-state="idle">
   <header>
     <div id="status">Нажми на шар, чтобы начать</div>
-    <button id="diagBtn" aria-label="Диагностика">ⓘ</button>
+    <div class="hdrBtns">
+      <button id="earsBtn" aria-pressed="false" aria-label="Режим на слух: скрыть текст бота">👂 На слух</button>
+      <button id="diagBtn" aria-label="Диагностика">ⓘ</button>
+    </div>
   </header>
   <div id="diag"></div>
   <img id="scenePic" alt="Картинка для описания">
@@ -210,6 +223,22 @@
   }
   renderDiag();
   $("diagBtn").onclick = () => $("diag").classList.toggle("open");
+
+  // ---------- listening mode («на слух») ----------
+  // Practise understanding by ear: the bot's lines are blurred, a tap on one opens just that line.
+  // The choice is a per-device convenience, so localStorage is fine (and may be unavailable).
+  const EARS_KEY = "talk.ears";
+  function setEars(on) {
+    document.body.classList.toggle("ears", on);
+    $("earsBtn").setAttribute("aria-pressed", String(on));
+    try { localStorage.setItem(EARS_KEY, on ? "1" : "0"); } catch (e) {}
+  }
+  try { if (localStorage.getItem(EARS_KEY) === "1") setEars(true); } catch (e) {}
+  $("earsBtn").onclick = () => setEars(!document.body.classList.contains("ears"));
+  $("subs").addEventListener("click", (e) => {
+    const line = e.target.closest(".line.assistant");
+    if (line && document.body.classList.contains("ears")) line.classList.add("revealed");
+  });
 
   if (tg) {
     try {
