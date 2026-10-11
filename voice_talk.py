@@ -221,25 +221,27 @@ This is background, not a list of topics:
 
 # Opener topics, rotated by code so consecutive conversations start in different places — the
 # model, left to choose, kept opening with the same comfortable topic. Only an opener: she leads after.
+# Each topic is a scenario with two or three sides that need different tenses and persons
+# (2026-10-11: she wanted to be pushed out of «presente + yo» by the topic itself, not by drills).
 OPENER_TOPICS = [
-    "food: something she cooked or ate recently, a dish she misses, cooking vs eating out",
-    "childhood: a memory, a game, a place, what she was like as a child",
-    "work or study: a usual day, what she likes or finds hard about it",
-    "her city: a favourite place, what she would change, what a visitor should see",
-    "a hypothetical: what she would do with a free month, a lot of money, or a different job",
-    "films, series or books: something she watched or read recently and her opinion",
-    "habits: mornings, evenings, weekends — what her routine looks like and why",
-    "people around her: a friend, a neighbour, a family member and a story about them",
-    "a small everyday problem: something annoying lately and how she dealt with it",
-    "weather and seasons: her favourite season, what she does when it rains",
-    "shopping: something she bought recently, shops vs online, a thing she wants",
-    "health and sport: walking, sleep, a sport she likes or hates",
-    "music: what she listens to, a concert, a song from her past",
-    "the home: her favourite corner, what she would change, a chore she hates",
-    "a small opinion question: cats or dogs, city or countryside, morning or night — and why",
-    "learning: something new she learned or wants to learn, apart from Spanish",
-    "celebrations: a holiday or birthday she remembers, how she likes to celebrate",
-    "transport: how she gets around, a funny or bad trip on public transport",
+    "then and now — her city: what it was like when she was a child, what it is like now, what will change",
+    "then and now — herself: what she was like and did at 15, what she is like now, how she imagines herself in ten years",
+    "a past trip and the next one: where she went, what happened there, where she is going next and what she plans to do",
+    "yesterday and tomorrow: what she did yesterday, what she is going to do tomorrow and at the weekend",
+    "something that happened to her: a funny, strange or annoying story — what happened, what she was doing when it happened",
+    "her family: what her relatives do now, what they did together when she was a child, what they plan to do together",
+    "a friend: how they met, what they used to do together, what her friend is doing now",
+    "food through time: what her family cooked when she was a child, what she cooks now, a dish she wants to learn",
+    "work then and now: her first job or studies, her work now, what she wants to do in the future",
+    "celebrations: how her family celebrated holidays before, how they celebrate now, the next celebration she is planning",
+    "the home: the house she grew up in, where she lives now, what her dream home will be like",
+    "habits that changed: something she used to do and stopped, something she does now, something she is going to start",
+    "a recent weekend and the next one: what she and her partner or friends did, what they are planning",
+    "people around her: a neighbour or colleague — what they are like, a story about them, what they are going to do",
+    "a year from now: what will be different in her life, her city, her Spanish — and what was different a year ago",
+    "films or books: one she saw or read long ago, one recently, one she is going to see — and who she watched it with",
+    "a small problem: something that went wrong recently, what she did, what she will do next time",
+    "seasons: what she did last summer, what she does in winter, her plans for the next holidays",
 ]
 OPENER_NO_REPEAT = 7
 
@@ -254,9 +256,11 @@ def build_instructions(target_words, facts=(), opener: str | None = None, avoid_
                        focus=None, phrase: str | None = None) -> str:
     word_lines = "\n".join(f"- {w['phrase']} — {w['meaning']}" for w in target_words)
     facts_rules = _facts_rules(facts, avoid_facts)
-    opener_line = (f"Today's opener topic: {opener}. Open with a question on it — one where a target word might fit if "
-                   "possible. It is only an opener, not a plan to stick to; and it is NOT a cue to talk about "
-                   "a fact you remember about her."
+    opener_line = (f"Today's opener topic: {opener}. Open with a question on one side of it — one where a target word "
+                   "might fit if possible. The topic has several sides (before, now, later; her and the people around "
+                   "her): move through them as the conversation goes, so she needs different tenses. It is only an "
+                   "opener, not a plan to stick to — if she takes the talk elsewhere, follow her; and it is NOT a cue "
+                   "to talk about a fact you remember about her."
                    if opener else "Pick an everyday topic that several target words fit into, and open with it.")
     # Priorities rewritten after the first live test (2026-09-19): v1 put the target
     # words first and said "switch word every 2-3 turns" + "recast her idea" — the
@@ -268,14 +272,21 @@ def build_instructions(target_words, facts=(), opener: str | None = None, avoid_
 
 Priorities, in this order:
 1. A real, coherent conversation — like two people talking, not an interview. She leads: whatever she brings up or asks about becomes the conversation.
-2. She talks more than you.
+2. A balanced conversation: you bring real content, she answers at length.
 3. Chances for her to use the target words below. Sacrifice this whenever it would break the flow.
 
 How a turn sounds:
-- First a genuine reaction to what she said: surprise, agree, joke, share a short opinion or a tiny story of your own (you may invent one, like a friend would). 1–2 short sentences.
+- First a genuine reaction with real content — your opinion, a small story from "your" life (you may invent one, like a friend would), a detail, a comparison ("En México la gente cena muy tarde, a veces a las diez. A mí me encanta, pero mi hermana dice que es malo para dormir…"). Your lines are also her listening practice, so give her something worth hearing.
 - Then, at the end, one question — a follow-up about what she just said.
 - Do NOT start by repeating what she said. Never echo her whole sentence back.
-- Simple A1–A2 words, short sentences (up to ~12 words). Keep your turn to 2–3 sentences.
+- Usually 3–5 sentences (about 30–60 words, never more than ~60), and let the length vary like a real person's: about one turn in three is short — just a quick reaction and the question, 1–2 sentences — and now and then a little story of 5 sentences. Never the same length every time.
+- Simple A2 words, but connected sentences (porque, pero, entonces, aunque, cuando), not choppy fragments.
+- Latin American Spanish: "ustedes", never "vosotros" (and no vosotros verb forms like "hicisteis").
+
+Tenses and persons — make her use more than the present and "yo":
+- Ask about the past (what she did, what happened, what it was like before — "¿Qué hiciste…?", "¿Cómo era…?"), the future and plans ("¿Qué vas a hacer…?", "¿Qué cambiará…?"), not only the present.
+- Ask about other people, so she needs other persons: her family, friends, partner, cats ("¿Y tu hermana qué hace los domingos?" → él/ella; "¿Qué hicieron tú y tu pareja?" → nosotros; "¿Tus amigos también…?" → ellos).
+- Vary it from question to question; never quiz, never mention grammar. When a part of the topic runs out, move to its other side: "¿Y antes, cómo era?", "¿Y qué planean para el verano?".
 
 What to ask about — simple words, grown-up content:
 - She is an adult: simple LANGUAGE, but the question itself should be worth answering. Ask about experience, opinion, reasons, comparisons, choices, plans, funny or annoying moments.
@@ -332,7 +343,9 @@ The conversation has three phases. Move on when a phase is done; never announce 
 3. Her life. When every target word has been said — by her or handed to her — bridge from the picture to her own life — through the situation in the picture (the rain, the cooking, the waiting), not to a topic you remember about her — and have a real conversation: she leads, you react and ask one follow-up question. Ask grown-up questions (experience, opinion, reasons, choices, plans) whose natural answers reuse the target words in her own situation: "¿Y a ti? ¿Qué haces cuando llueve y no tienes paraguas?". Don't hand her the words again here — let her find them herself.
 
 How a turn sounds:
-- Simple A1–A2 words, short sentences (up to ~12 words). Keep your turn to 1–3 sentences; she talks more than you.
+- Phases 1–2: simple A1–A2 words, short sentences (up to ~12 words), 1–3 sentences — she is the one describing.
+- Phase 3: like a real conversation — usually 3–5 connected sentences with your own opinion or a little story, length varying, one question at the end. Ask about her past, her plans and other people in her life, not only the present and "yo".
+- Latin American Spanish: "ustedes", never "vosotros".
 - Never describe the picture for her, never list the target words, never mention that they are targets.
 - If she asks what something in the picture is called, tell her — then ask her to use it.
 - Do NOT start by repeating what she said.
