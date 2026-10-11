@@ -139,8 +139,12 @@ Rules:
 - Each scene has {MIN_SCENE_WORDS}-{MAX_SCENE_WORDS} target words taken EXACTLY as written in the list above.
 - The words of one scene must belong together in one real situation (a kitchen in the morning,
   a rainy bus stop, a doctor's waiting room). Never a collage of unrelated objects.
-- Only words that can be SHOWN unambiguously: objects, visible actions, clearly visible states
-  (a tired face, a wet street). Skip abstract words, connectors, grammar words.
+- Don't play it safe with objects only. Actions (cocinar, esperar, correr) and feelings or states
+  (cansada, preocupado, aburrido) can be drawn too — through a pose, a face, what is happening around
+  the person. When the list has such words: try to give every scene at least one action or feeling,
+  and build at least one scene where they are the core (someone waiting nervously, someone laughing
+  while cooking). Objects are fine, but a scene of nothing but objects is the easy way out.
+- Skip only what can't be drawn at all: connectors, grammar words, purely abstract ideas.
 - The {SCENE_COUNT} scenes must be different situations and use different words.
 - Adult everyday life, not children's-book scenes.
 
@@ -150,7 +154,9 @@ For each scene give:
 - "picture": a description for an illustrator in English, 2-4 sentences: the setting and what is
   happening, one person at most two;
 - "must_show": for each target word, in the same order, a short English phrase saying how it is
-  visible in the picture (e.g. "a folded umbrella dripping by the door").
+  visible in the picture (e.g. "a folded umbrella dripping by the door"). For an action or a feeling,
+  make it unmistakable: the body and face, plus the situation that explains it ("she frowns at her
+  phone, hand on her forehead, a missed bus driving away" for preocupada).
 
 JSON: {{"scenes": [{{"title": "...", "words": ["..."], "picture": "...", "must_show": ["..."]}}]}}"""
 
@@ -267,9 +273,13 @@ def check_image(scene: dict, image: bytes) -> dict:
 
 1. "seen": describe what is actually in the picture, in English, 3-6 plain sentences: the setting, the people
    and what they are doing, the objects that stand out and where they are. Only what is really drawn.
-2. "words": for each target word (copy "es" exactly), "visible": true only if a learner looking at this
-   picture would naturally name that thing/action/state with this word — not if it's tiny, ambiguous or
-   better named by a different word. "how": where and how it appears (English, a few words), or why not."""},
+2. "words": for each target word (copy "es" exactly), "visible" and "how" (where and how it appears,
+   English, a few words — or why not).
+   - Objects: "visible" is true only if a learner would naturally name the thing with this word — not if
+     it's tiny, ambiguous or better named by a different word.
+   - Actions, feelings and states: "visible" is true if the picture shows it so that this word is a
+     natural way to name it, even if a synonym would fit too (a worried face may be "preocupada" or
+     "nerviosa" — fine; the conversation accepts synonyms). False only if it isn't shown at all."""},
         ]}],
         output_config={"format": {"type": "json_schema", "schema": CHECK_SCHEMA}},
     )
