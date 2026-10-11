@@ -269,7 +269,7 @@ Answer with JSON:
 - "reply" is your next spoken turn, read aloud by text-to-speech: Spanish, plus Russian only where the rules above say so (naming the Russian word she used, a short translation she asked for). No emoji, no markdown, no stage directions, no translations in brackets.
 - If her message ends with [LARGA PAUSA], she went quiet for a long time: if it breaks off mid-sentence, she's stuck — help gently, offer the word she seems to be looking for or ask your question again more simply; if it's a finished thought, just reply normally.
 - [TERMINÉ] at the end only means she tapped "I'm done" — reply normally.
-- "translations": every Russian word or phrase in THIS message of hers that she used because she didn't know it in Spanish, with the Spanish the conversation needed — "ru" as she said it but always in Cyrillic (turn a Latin-letter transliteration like "shapka" back into "шапка"), "es" for a single word in dictionary form (nouns with their article, verbs in the infinitive): [{"ru": "шапка", "es": "el gorro"}]; for a whole Russian phrase, the natural Spanish phrase as she would say it here ("я много работаю" → "trabajo mucho"). Empty list if she used no Russian. Russian she used to ask you something ("что значит…", "как сказать…") is not a translation — answer the question instead. These are shown to her on screen and offered for her vocabulary, so the Spanish must be the natural, common A1–A2 word for her meaning.
+- "translations": every Russian word or phrase in THIS message of hers that she used because she didn't know it in Spanish, with the Spanish the conversation needed — "ru" as she said it but always in Cyrillic (turn a Latin-letter transliteration like "shapka" back into "шапка"), "es" for a single word in dictionary form (nouns with their article, verbs in the infinitive): [{"ru": "шапка", "es": "el gorro"}]; for a whole Russian phrase, the natural Spanish phrase as she would say it here ("я много работаю" → "trabajo mucho"). Empty list if she used no Russian. Only her LAST message counts: a Russian word from her earlier messages was already translated — never list it again unless she says it in Russian again now. Russian she used to ask you something ("что значит…", "как сказать…") is not a translation — answer the question instead. These are shown to her on screen and offered for her vocabulary, so the Spanish must be the natural, common A1–A2 word for her meaning.
 - "used_words": the target words she herself used in THIS message, in any grammatical form ("fui" counts for "ir", "paraguas" for "el paraguas") — copied exactly as they appear in the target list. Only her message, not your reply. Empty list if none."""
 
 TURN_SCHEMA = {
@@ -393,6 +393,36 @@ def _clean_translations(raw) -> list[dict]:
         if ru and es and len(es) <= 60:
             pairs.append({"ru": ru, "es": es})
     return pairs[:5]
+
+
+_TRANSLIT = dict(zip("абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
+                     ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "i", "k", "l", "m", "n", "o", "p", "r", "s",
+                      "t", "u", "f", "h", "ts", "ch", "sh", "sch", "", "y", "", "e", "yu", "ya"]))
+_CYR_WORD_RE = re.compile(r"[а-яё]+")
+_ANY_WORD_RE = re.compile(r"[a-zа-яё]+")
+
+
+def _said_in(ru: str, text: str) -> bool:
+    """Is this Russian word/phrase really in her message? Claude sees the whole history and
+    sometimes re-lists a word she said several turns ago — the plaque then reappeared under
+    every later reply. Loose on purpose: a shared stem counts ("шапку" for "шапка"), and so
+    does a Latin transliteration, which STT sometimes writes ("shapka")."""
+    words = [w for w in _CYR_WORD_RE.findall(ru.lower()) if len(w) >= 3]
+    if not words:
+        return True  # nothing to check against — don't hide it
+    said = _ANY_WORD_RE.findall(text.lower())
+
+    def stem(w):
+        return w[:max(3, len(w) - 2)]
+
+    def found(w):
+        variants = {stem(w)}
+        latin = "".join(_TRANSLIT.get(c, c) for c in w)
+        if len(latin) >= 5:  # "дом" → "dom" would match "domingo"
+            variants.add(stem(latin))
+        return any(s.startswith(v) for s in said for v in variants)
+
+    return any(found(w) for w in words)
 
 
 async def _speak(reply: str, usage: dict, timings: dict) -> str:
@@ -527,7 +557,7 @@ async def handle_turn(request: web.Request) -> web.Response:
         data, llm_usage = await reply_task
         timings["llm_ms"] = round((time.monotonic() - t) * 1000)
         usage.update(llm_usage)
-        translations = _clean_translations(data.get("translations"))
+        translations = [p for p in _clean_translations(data.get("translations")) if _said_in(p["ru"], user_text)]
         if translations:
             db.add_voice_found_words(session_id, translations)
         reply = (data.get("reply") or "").strip()
