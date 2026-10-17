@@ -326,6 +326,53 @@ def init_db():
         )
         """
     )
+    # Posts from public Spanish-learning Telegram channels (2026-10-17, channel_digest.py) — the
+    # raw library. status: new → labeled (split into items below) / skip.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channel_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel TEXT NOT NULL,
+            post_id INTEGER NOT NULL,
+            text TEXT,
+            posted_at TEXT,
+            has_photo INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'new',
+            UNIQUE (channel, post_id)
+        )
+        """
+    )
+    # What a day's message is about: one phrase, one grammar point or three related words. A post
+    # listing 16 linking words becomes 16 items, shown on different days. status: ready → shown /
+    # dup (same key as a shown one) / known (she tapped «знаю»).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channel_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            post_row INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            es TEXT NOT NULL,
+            ru TEXT,
+            key TEXT NOT NULL,
+            level TEXT,
+            score INTEGER,
+            status TEXT DEFAULT 'ready',
+            digest TEXT,
+            shown_at TEXT
+        )
+        """
+    )
+    # How far back each channel has been read: oldest post id fetched so far, and whether the
+    # backfill reached the limit (or the channel's first post).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channel_state (
+            channel TEXT PRIMARY KEY,
+            oldest_id INTEGER,
+            backfill_done INTEGER DEFAULT 0
+        )
+        """
+    )
     # Every scene /scene ever offered, chosen or not (2026-10-11). Without it a scene she
     # skipped left no trace, its words stayed "never described" and came straight back — and
     # Claude, not knowing what it had offered, rebuilt «Собираю чемодан» day after day.
@@ -1468,3 +1515,178 @@ def get_scene_image(scene_id: int):
     row = conn.execute("SELECT user_id, image FROM scenes WHERE id = ?", (scene_id,)).fetchone()
     conn.close()
     return (row["user_id"], bytes(row["image"])) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Channel digest (channel_digest.py)
+# ---------------------------------------------------------------------------
+
+def add_channel_posts(channel: str, posts) -> int:
+    """posts: [{"post_id", "text", "posted_at", "has_photo", "status"}]. Already stored ones
+    are left as they are. Returns how many were new."""
+    conn = get_connection()
+    added = 0
+    for p in posts:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO channel_posts (channel, post_id, text, posted_at, has_photo, status) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (channel, p["post_id"], p["text"], p["posted_at"], int(bool(p["has_photo"])), p.get("status", "new")),
+        )
+        added += cur.rowcount
+    conn.commit()
+    conn.close()
+    return added
+
+
+def get_channel_state(channel: str) -> dict:
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM channel_state WHERE channel = ?", (channel,)).fetchone()
+    conn.close()
+    return dict(row) if row else {"channel": channel, "oldest_id": None, "backfill_done": 0}
+
+
+def set_channel_state(channel: str, oldest_id, backfill_done: bool):
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO channel_state (channel, oldest_id, backfill_done) VALUES (?, ?, ?) "
+        "ON CONFLICT(channel) DO UPDATE SET oldest_id = excluded.oldest_id, backfill_done = excluded.backfill_done",
+        (channel, oldest_id, int(bool(backfill_done))),
+    )
+    conn.commit()
+    conn.close()
+
+
+def count_channel_posts(channel: str) -> int:
+    conn = get_connection()
+    n = conn.execute("SELECT COUNT(*) FROM channel_posts WHERE channel = ?", (channel,)).fetchone()[0]
+    conn.close()
+    return n
+
+
+def get_channel_newest_id(channel: str):
+    conn = get_connection()
+    row = conn.execute("SELECT MAX(post_id) FROM channel_posts WHERE channel = ?", (channel,)).fetchone()
+    conn.close()
+    return row[0]
+
+
+def get_unlabeled_channel_posts(limit: int) -> list:
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM channel_posts WHERE status = 'new' ORDER BY id LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def set_channel_post_items(row_id: int, items) -> None:
+    """Marks the post labeled and stores its items: [{"kind", "es", "ru", "key", "level", "score"}].
+    No items (an ad, a quiz, a caption to a picture) → skip."""
+    conn = get_connection()
+    conn.execute("UPDATE channel_posts SET status = ? WHERE id = ?", ("labeled" if items else "skip", row_id))
+    for it in items:
+        conn.execute(
+            "INSERT INTO channel_items (post_row, kind, es, ru, key, level, score) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (row_id, it["kind"], it["es"], it.get("ru"), it["key"], it.get("level"), it.get("score")),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_channel_post(row_id: int):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM channel_posts WHERE id = ?", (row_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+_ITEM_SELECT = (
+    "SELECT i.*, p.channel, p.post_id, p.text AS post_text FROM channel_items i "
+    "JOIN channel_posts p ON p.id = i.post_row "
+)
+
+
+def _item_dict(row):
+    d = dict(row)
+    d["digest"] = json.loads(d["digest"]) if d.get("digest") else None
+    return d
+
+
+def get_channel_candidates(levels, min_score: int) -> list:
+    """Items not shown yet, best first. Picking among them (rotation, the gap between items
+    of one post, what she already knows) is channel_digest's job."""
+    marks = ",".join("?" * len(levels))
+    conn = get_connection()
+    rows = conn.execute(
+        _ITEM_SELECT + f"WHERE i.status = 'ready' AND i.score >= ? AND i.level IN ({marks}) "
+        "ORDER BY i.score DESC, RANDOM()",
+        (min_score, *levels),
+    ).fetchall()
+    conn.close()
+    return [_item_dict(r) for r in rows]
+
+
+def get_channel_item(item_id: int):
+    conn = get_connection()
+    row = conn.execute(_ITEM_SELECT + "WHERE i.id = ?", (item_id,)).fetchone()
+    conn.close()
+    return _item_dict(row) if row else None
+
+
+def mark_channel_item_shown(item_id: int, key: str, digest: dict):
+    """Shown, and every other item on the same key retires as a duplicate — one explanation per
+    key, the best-scored one (candidates come best first)."""
+    now = datetime.now(timezone.utc).isoformat()
+    conn = get_connection()
+    conn.execute(
+        "UPDATE channel_items SET status = 'shown', shown_at = ?, digest = ? WHERE id = ?",
+        (now, json.dumps(digest, ensure_ascii=False), item_id),
+    )
+    conn.execute("UPDATE channel_items SET status = 'dup' WHERE key = ? AND id != ? AND status = 'ready'", (key, item_id))
+    conn.commit()
+    conn.close()
+
+
+def mark_channel_key_known(key: str):
+    conn = get_connection()
+    conn.execute("UPDATE channel_items SET status = 'known' WHERE key = ?", (key,))
+    conn.commit()
+    conn.close()
+
+
+def get_last_shown_channel_item():
+    conn = get_connection()
+    row = conn.execute(_ITEM_SELECT + "WHERE i.shown_at IS NOT NULL ORDER BY i.shown_at DESC, i.id DESC LIMIT 1").fetchone()
+    conn.close()
+    return _item_dict(row) if row else None
+
+
+def get_channel_posts_shown_since(since_iso: str) -> set:
+    """Posts with an item shown since then — their other items wait (the gap between items of one post)."""
+    conn = get_connection()
+    rows = conn.execute("SELECT DISTINCT post_row FROM channel_items WHERE shown_at >= ?", (since_iso,)).fetchall()
+    conn.close()
+    return {r["post_row"] for r in rows}
+
+
+def get_channel_shown_keys() -> set:
+    conn = get_connection()
+    rows = conn.execute("SELECT key FROM channel_items WHERE status IN ('shown', 'known')").fetchall()
+    conn.close()
+    return {r["key"] for r in rows}
+
+
+def get_channel_stats() -> list:
+    """[(channel, posts, posts with text, items ready, items shown)] — for /channels."""
+    conn = get_connection()
+    rows = conn.execute(
+        """SELECT p.channel,
+                  COUNT(DISTINCT p.id) AS posts,
+                  COUNT(DISTINCT CASE WHEN p.status = 'labeled' THEN p.id END) AS useful,
+                  SUM(CASE WHEN i.status = 'ready' THEN 1 ELSE 0 END) AS ready,
+                  SUM(CASE WHEN i.status = 'shown' THEN 1 ELSE 0 END) AS shown
+           FROM channel_posts p LEFT JOIN channel_items i ON i.post_row = p.id
+           GROUP BY p.channel ORDER BY p.channel"""
+    ).fetchall()
+    conn.close()
+    return [(r["channel"], r["posts"], r["useful"], r["ready"] or 0, r["shown"] or 0) for r in rows]
