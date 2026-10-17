@@ -512,7 +512,7 @@ Telegram с автодополнением показывается только
 `_is_owner()`, тот же принцип, что и у `/debug_*` (тихий `return` для не-владельца). Команды
 `/newtopic`, `/topics`, `/canceltopic` не в `set_my_commands`, не светятся в меню Telegram.
 
-**Одно сообщение в день**, отдельная джоба `study_coach_reminder` в 7:00 МСК (04:00 UTC,
+**Одно сообщение в день**, отдельная джоба `study_coach_reminder` в 6:00 МСК (03:00 UTC, до 2026-10-17 — 7:00;
 `STUDY_COACH_UTC`) — независимо от трёх вокаб-напоминаний (10/14/18 МСК). Три независимых блока,
 собираются в `_build_study_coach_slot1()` + `study_coach_reminder()` (`bot.py`):
 

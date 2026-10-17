@@ -69,8 +69,8 @@ REMINDER_LOCAL_SLOTS = {
     18: "🌙 Добрый вечер!",
 }
 DEFAULT_UTC_OFFSET = 3  # Moscow — used until a user answers the /start timezone question
-# 7:00 Moscow = 04:00 UTC — Study Coach, separate from the vocab reminders above
-STUDY_COACH_UTC = (4, 0)
+# 6:00 Moscow = 03:00 UTC — Study Coach (moved from 7:00 on 2026-10-17), separate from the vocab reminders above
+STUDY_COACH_UTC = (3, 0)
 # Sunday 06:00 Moscow = 03:00 UTC — weekly DB backup, quiet time before the day's reminders
 BACKUP_WEEKLY_UTC = (3, 0)
 # Sunday 19:00 Moscow = 16:00 UTC — weekly speech report for the owner (/talkreport on demand)
@@ -1091,7 +1091,7 @@ async def hourly_reminder_job(context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 # Study Coach — admin-only (OWNER_TELEGRAM_ID), hidden from regular users:
 # not in set_my_commands, same as the /debug_* commands below. One message a
-# day at 7:00 MSK with up to three independent blocks: the day's grammar
+# day at 6:00 MSK with up to three independent blocks: the day's grammar
 # slot (tutor-homework/listening/reading anchor, or a due grammar drill),
 # 3 words to actively use in speech, and a due "use this topic in speech"
 # nudge. See CLAUDE.md for the full weekly grid and why dates never get
