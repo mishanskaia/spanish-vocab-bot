@@ -102,6 +102,13 @@
   body.ears .line.assistant { transition: filter .25s, opacity .3s; }
   .tr { margin: -8px 0 14px; font-size: 15px; color: var(--cool-1); }
   .tr::before { content: "🔎 "; }
+  /* the phrase she is learning to use — in sight for the whole conversation */
+  #chunk { display: none; margin: 8px auto 0; max-width: 100%; padding: 6px 12px; border-radius: 12px;
+           font-size: 15px; text-align: center; color: var(--text);
+           background: color-mix(in srgb, var(--cool-1) 14%, transparent); }
+  #chunk.on { display: block; }
+  #chunk b { color: var(--cool-1); font-weight: 600; }
+  #chunk small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
 
   footer { display: flex; justify-content: center; gap: 28px; padding: 10px 0 18px; }
   .ctl {
@@ -129,6 +136,7 @@
   </header>
   <div id="diag"></div>
   <img id="scenePic" alt="Картинка для описания">
+  <div id="chunk"></div>
 
   <div id="stage">
     <div id="orbWrap">
@@ -665,11 +673,16 @@
     // reply
     if (utter.entry) setText(utter.entry, res.user_text); else utter.entry = addEntry("user", res.user_text);
     const botEntry = addEntry("assistant", res.reply);
-    if (res.translations && res.translations.length) {
-      // the Russian words she dropped in, and the Spanish for them — visible, not just woven into the reply
+    // the Russian words she dropped in (→ Spanish) and the words she asked about (Spanish — meaning):
+    // visible, not just woven into the reply
+    const plaque = [
+      ...(res.translations || []).map((p) => `${p.ru} → ${p.es}`),
+      ...(res.asked || []).map((p) => `${p.es} — ${p.ru}`),
+    ];
+    if (plaque.length) {
       const tr = document.createElement("div");
       tr.className = "tr";
-      tr.textContent = res.translations.map((p) => `${p.ru} → ${p.es}`).join(" · ");
+      tr.textContent = plaque.join(" · ");
       botEntry.el.after(tr);
       botEntry.trEl = tr;
     }
@@ -773,6 +786,13 @@
       sessionId = res.session_id;
       diag["сессия"] = `#${sessionId}, целевых слов: ${res.target_count}` + (res.scene ? `, картинка «${res.scene.title}»` : ""); renderDiag();
       addUsage(res.usage);
+      if (res.chunk && res.chunk.text) {
+        const el = $("chunk");
+        el.textContent = "Попробуй сказать: ";
+        const b = document.createElement("b"); b.textContent = res.chunk.text; el.appendChild(b);
+        if (res.chunk.why) { const sm = document.createElement("small"); sm.textContent = res.chunk.why; el.appendChild(sm); }
+        el.classList.add("on");
+      }
       addEntry("assistant", res.reply);
       pauseBtn.disabled = false; endBtn.disabled = false;
       if (tg && tg.enableClosingConfirmation) tg.enableClosingConfirmation();

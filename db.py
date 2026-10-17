@@ -288,9 +288,8 @@ def init_db():
         )
         """
     )
-    # The «focus» of the voice conversations (2026-10-11): one mistake at a time that the bot
-    # gives her chances to fix in the next conversations — see voice_talk «Focus loop».
-    # streak: correct uses in a row (counted per conversation); 2 → done.
+    # Legacy (2026-10-11 → 10-17): the «focus» was one mistake carried into the next conversations.
+    # Replaced by talk_chunk below; the table stays so old rows aren't lost, nothing reads it.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS talk_focus (
@@ -303,6 +302,25 @@ def init_db():
             trigger TEXT,
             status TEXT DEFAULT 'active',
             streak INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            done_at TEXT
+        )
+        """
+    )
+    # The phrase she is learning to use in the voice conversations (2026-10-17): one at a time,
+    # shown on the talk page and given chances in every conversation — see voice_talk «Chunk loop».
+    # uses: conversations where she said it (any form); 2 → done.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS talk_chunk (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            chunk TEXT NOT NULL,
+            said TEXT,
+            example TEXT,
+            why TEXT,
+            status TEXT DEFAULT 'active',
+            uses INTEGER DEFAULT 0,
             created_at TEXT NOT NULL,
             done_at TEXT
         )
@@ -1210,8 +1228,9 @@ def save_voice_transcript(session_id: int, transcript, usage, ended: bool):
 
 
 def add_voice_found_words(session_id: int, pairs) -> list:
-    """Appends {"ru", "es"} pairs, skipping a Spanish word already there (the same word can
-    come back when an utterance is re-sent after she carried on talking)."""
+    """Appends {"ru", "es"} pairs (plus "kind": "asked" for a word she asked about), skipping a
+    Spanish word already there (the same word can come back when an utterance is re-sent after
+    she carried on talking)."""
     session = get_voice_session(session_id)
     if session is None:
         return []
@@ -1219,7 +1238,7 @@ def add_voice_found_words(session_id: int, pairs) -> list:
     seen = {p["es"].strip().lower() for p in found}
     for p in pairs:
         if p["es"].strip().lower() not in seen:
-            found.append({"ru": p["ru"], "es": p["es"]})
+            found.append({"ru": p["ru"], "es": p["es"], **({"kind": p["kind"]} if p.get("kind") else {})})
             seen.add(p["es"].strip().lower())
     conn = get_connection()
     conn.execute(
@@ -1359,48 +1378,58 @@ def get_scene(scene_id: int):
     return d
 
 
-def get_active_focus(user_id: int):
+def get_active_chunk(user_id: int):
     conn = get_connection()
     row = conn.execute(
-        "SELECT * FROM talk_focus WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", (user_id,)
+        "SELECT * FROM talk_chunk WHERE user_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1", (user_id,)
     ).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def create_focus(user_id: int, rule: str, wrong: str, right_form: str, why: str, trigger: str) -> int:
+def create_chunk(user_id: int, chunk: str, said: str, example: str, why: str) -> int:
     conn = get_connection()
-    # one active focus at a time — anything older is retired
-    conn.execute("UPDATE talk_focus SET status = 'replaced' WHERE user_id = ? AND status = 'active'", (user_id,))
+    # one active phrase at a time — anything older is retired
+    conn.execute("UPDATE talk_chunk SET status = 'replaced' WHERE user_id = ? AND status = 'active'", (user_id,))
     cur = conn.execute(
-        "INSERT INTO talk_focus (user_id, rule, wrong, right_form, why, trigger, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (user_id, rule, wrong, right_form, why, trigger, datetime.now(timezone.utc).isoformat()),
+        "INSERT INTO talk_chunk (user_id, chunk, said, example, why, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (user_id, chunk, said, example, why, datetime.now(timezone.utc).isoformat()),
     )
-    focus_id = cur.lastrowid
+    chunk_id = cur.lastrowid
     conn.commit()
     conn.close()
-    return focus_id
+    return chunk_id
 
 
-def set_focus_streak(focus_id: int, streak: int, done: bool):
+def set_chunk_uses(chunk_id: int, uses: int, done: bool):
     conn = get_connection()
     conn.execute(
-        "UPDATE talk_focus SET streak = ?, status = CASE WHEN ? THEN 'done' ELSE status END, "
+        "UPDATE talk_chunk SET uses = ?, status = CASE WHEN ? THEN 'done' ELSE status END, "
         "done_at = CASE WHEN ? THEN ? ELSE done_at END WHERE id = ?",
-        (streak, done, done, datetime.now(timezone.utc).isoformat(), focus_id),
+        (uses, done, done, datetime.now(timezone.utc).isoformat(), chunk_id),
     )
     conn.commit()
     conn.close()
 
 
-def get_focus_done_since(user_id: int, since_iso: str) -> list:
+def get_chunks_done_since(user_id: int, since_iso: str) -> list:
     conn = get_connection()
     rows = conn.execute(
-        "SELECT * FROM talk_focus WHERE user_id = ? AND status = 'done' AND done_at >= ? ORDER BY done_at",
+        "SELECT * FROM talk_chunk WHERE user_id = ? AND status = 'done' AND done_at >= ? ORDER BY done_at",
         (user_id, since_iso),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_recent_chunks(user_id: int, limit: int) -> list:
+    """Phrases she has already been given (any status) — not to suggest again."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT chunk FROM talk_chunk WHERE user_id = ? ORDER BY id DESC LIMIT ?", (user_id, limit)
+    ).fetchall()
+    conn.close()
+    return [r["chunk"] for r in rows]
 
 
 def add_scene_proposals(user_id: int, scenes) -> None:

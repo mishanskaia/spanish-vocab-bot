@@ -294,7 +294,7 @@ async def talk_part():
     stt_helper.transcribe_mixed = lambda audio, name: "Una mujer con paraguas espera el autobús"
     captured = {}
     voice_talk.update_memory = lambda uid, transcript, about_picture=False: captured.setdefault("about_picture", about_picture)
-    voice_talk.analyze_conversation = lambda transcript, *a, **kw: {"errors": [], "focus": {}, "focus_result": "not_used", "upgrade": {}}
+    voice_talk.analyze_conversation = lambda transcript, *a, **kw: {"errors": [], "chunk_result": "not_used", "upgrade": {}}
 
     class Bot:
         async def send_message(self, chat_id, text, **kw):

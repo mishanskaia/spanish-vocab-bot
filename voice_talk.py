@@ -30,6 +30,7 @@ import os
 import random
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -165,36 +166,24 @@ MISTAKES_RULES = """Mistakes:
 """
 
 
-# Focus loop (2026-10-11): the mistake she is working on and the phrase from the last review go
-# into the next conversations, so the correction comes back as a chance to say it — not as text to
-# remember. The bot provokes the form with a question; if she goes around it, it says the form
-# itself and invites her to use it. Whether she managed is judged by the review afterwards.
-def _focus_rules(focus, phrase: str | None, scene: bool = False) -> str:
-    if not focus and not phrase:
+# Chunk loop (2026-10-17): the phrase she is learning to use goes into every conversation. It
+# replaced the «focus» (one mistake carried forward): a mistake needs its own situation — "fui"
+# needs a question about the past — so the bot dragged the talk off topic for it, and the check
+# wanted the literal right form ("no toco nada" didn't count as "no quiero tocar"). A chunk like
+# "me parece que" fits any topic, and any form of it counts.
+def _chunk_rules(chunk, scene: bool = False) -> str:
+    if not chunk:
         return ""
-    out = []
-    if focus:
-        when = ("in the her-life part (phase 3)" if scene else "by your third turn at the latest")
-        example = f' — e.g. "{focus["trigger"]}"' if focus.get("trigger") else ""
-        out.append(f"""Her current focus (a mistake from earlier conversations): {focus["rule"]} — the right form is "{focus["right_form"]}" (she tends to say "{focus["wrong"]}").
-- {when[0].upper() + when[1:]}, ask one natural question whose answer needs this form{example}. Fit it to what you're talking about; never announce it — it's a conversation, not a test.
-- If she uses the right form, just react to what she said (no grammar praise).
-- If she goes around it or uses the wrong form: say exactly the right form ("{focus["right_form"]}" — the same person and tense, not a related form like "fuiste" for "fui") in a natural sentence of your own, then invite her to say something with it ("Yo también fui a un café el sábado. ¿Y tú, adónde fuiste después?"). For this one mistake this replaces the general "slip the correct form in passing" rule above — echoing her with "¡Ah, fuiste…!" doesn't show her own form.
-- Once or twice in the conversation is enough — don't drill.""")
-    if phrase:
-        out.append(f"""A phrase worth hearing: "{phrase}". Use it yourself once or twice where it fits naturally. Don't ask her to repeat it and don't point it out.""")
-    return "\n".join(out) + "\n\n"
+    example = f' — e.g. "{chunk["example"]}"' if chunk.get("example") else ""
+    where = ("Stay with the picture or whatever you're talking about at that moment" if scene
+             else "Stay on whatever you're talking about")
+    return f"""The phrase she is learning to use: "{chunk["chunk"]}"{example}. It is shown on her screen.
+- Use it yourself once early, in a natural sentence of your own, and maybe once more later.
+- Within your first four turns, and maybe once more later, ask a question about what you're talking about right now whose natural answer would use it (for "me parece que" — ask what she thinks of the thing at hand; for "tener ganas de" — what she feels like doing about it). {where} — never change the topic for it, never announce it, never ask her to repeat it.
+- Any form counts: another tense or person, her own words inside it. If she uses it, just react to what she said.
+- Don't drill.
 
-
-def current_practice(user_id: int) -> tuple:
-    """(active focus or None, the phrase from the most recent review or None)."""
-    phrase = None
-    for s in db.get_recent_voice_sessions(user_id, 3):
-        up = (s.get("analysis") or {}).get("upgrade") or {}
-        if up.get("better"):
-            phrase = up["better"]
-            break
-    return db.get_active_focus(user_id), phrase
+"""
 
 
 # Memory is background, not a source of topics (2026-10-11). The old rule "build on it" made the
@@ -221,25 +210,27 @@ This is background, not a list of topics:
 
 # Opener topics, rotated by code so consecutive conversations start in different places — the
 # model, left to choose, kept opening with the same comfortable topic. Only an opener: she leads after.
+# Each topic is a scenario with two or three sides that need different tenses and persons
+# (2026-10-11: she wanted to be pushed out of «presente + yo» by the topic itself, not by drills).
 OPENER_TOPICS = [
-    "food: something she cooked or ate recently, a dish she misses, cooking vs eating out",
-    "childhood: a memory, a game, a place, what she was like as a child",
-    "work or study: a usual day, what she likes or finds hard about it",
-    "her city: a favourite place, what she would change, what a visitor should see",
-    "a hypothetical: what she would do with a free month, a lot of money, or a different job",
-    "films, series or books: something she watched or read recently and her opinion",
-    "habits: mornings, evenings, weekends — what her routine looks like and why",
-    "people around her: a friend, a neighbour, a family member and a story about them",
-    "a small everyday problem: something annoying lately and how she dealt with it",
-    "weather and seasons: her favourite season, what she does when it rains",
-    "shopping: something she bought recently, shops vs online, a thing she wants",
-    "health and sport: walking, sleep, a sport she likes or hates",
-    "music: what she listens to, a concert, a song from her past",
-    "the home: her favourite corner, what she would change, a chore she hates",
-    "a small opinion question: cats or dogs, city or countryside, morning or night — and why",
-    "learning: something new she learned or wants to learn, apart from Spanish",
-    "celebrations: a holiday or birthday she remembers, how she likes to celebrate",
-    "transport: how she gets around, a funny or bad trip on public transport",
+    "then and now — her city: what it was like when she was a child, what it is like now, what will change",
+    "then and now — herself: what she was like and did at 15, what she is like now, how she imagines herself in ten years",
+    "a past trip and the next one: where she went, what happened there, where she is going next and what she plans to do",
+    "yesterday and tomorrow: what she did yesterday, what she is going to do tomorrow and at the weekend",
+    "something that happened to her: a funny, strange or annoying story — what happened, what she was doing when it happened",
+    "her family: what her relatives do now, what they did together when she was a child, what they plan to do together",
+    "a friend: how they met, what they used to do together, what her friend is doing now",
+    "food through time: what her family cooked when she was a child, what she cooks now, a dish she wants to learn",
+    "work then and now: her first job or studies, her work now, what she wants to do in the future",
+    "celebrations: how her family celebrated holidays before, how they celebrate now, the next celebration she is planning",
+    "the home: the house she grew up in, where she lives now, what her dream home will be like",
+    "habits that changed: something she used to do and stopped, something she does now, something she is going to start",
+    "a recent weekend and the next one: what she and her partner or friends did, what they are planning",
+    "people around her: a neighbour or colleague — what they are like, a story about them, what they are going to do",
+    "a year from now: what will be different in her life, her city, her Spanish — and what was different a year ago",
+    "films or books: one she saw or read long ago, one recently, one she is going to see — and who she watched it with",
+    "a small problem: something that went wrong recently, what she did, what she will do next time",
+    "seasons: what she did last summer, what she does in winter, her plans for the next holidays",
 ]
 OPENER_NO_REPEAT = 7
 
@@ -251,12 +242,14 @@ def pick_opener(user_id: int) -> str:
 
 
 def build_instructions(target_words, facts=(), opener: str | None = None, avoid_facts=(),
-                       focus=None, phrase: str | None = None) -> str:
+                       chunk=None) -> str:
     word_lines = "\n".join(f"- {w['phrase']} — {w['meaning']}" for w in target_words)
     facts_rules = _facts_rules(facts, avoid_facts)
-    opener_line = (f"Today's opener topic: {opener}. Open with a question on it — one where a target word might fit if "
-                   "possible. It is only an opener, not a plan to stick to; and it is NOT a cue to talk about "
-                   "a fact you remember about her."
+    opener_line = (f"Today's opener topic: {opener}. Open with a question on one side of it — one where a target word "
+                   "might fit if possible. The topic has several sides (before, now, later; her and the people around "
+                   "her): move through them as the conversation goes, so she needs different tenses. It is only an "
+                   "opener, not a plan to stick to — if she takes the talk elsewhere, follow her; and it is NOT a cue "
+                   "to talk about a fact you remember about her."
                    if opener else "Pick an everyday topic that several target words fit into, and open with it.")
     # Priorities rewritten after the first live test (2026-09-19): v1 put the target
     # words first and said "switch word every 2-3 turns" + "recast her idea" — the
@@ -268,14 +261,21 @@ def build_instructions(target_words, facts=(), opener: str | None = None, avoid_
 
 Priorities, in this order:
 1. A real, coherent conversation — like two people talking, not an interview. She leads: whatever she brings up or asks about becomes the conversation.
-2. She talks more than you.
+2. A balanced conversation: you bring real content, she answers at length.
 3. Chances for her to use the target words below. Sacrifice this whenever it would break the flow.
 
 How a turn sounds:
-- First a genuine reaction to what she said: surprise, agree, joke, share a short opinion or a tiny story of your own (you may invent one, like a friend would). 1–2 short sentences.
+- First a genuine reaction with real content — your opinion, a small story from "your" life (you may invent one, like a friend would), a detail, a comparison ("En México la gente cena muy tarde, a veces a las diez. A mí me encanta, pero mi hermana dice que es malo para dormir…"). Your lines are also her listening practice, so give her something worth hearing.
 - Then, at the end, one question — a follow-up about what she just said.
 - Do NOT start by repeating what she said. Never echo her whole sentence back.
-- Simple A1–A2 words, short sentences (up to ~12 words). Keep your turn to 2–3 sentences.
+- Usually 3–5 sentences (about 30–60 words, never more than ~60), and let the length vary like a real person's: about one turn in three is short — just a quick reaction and the question, 1–2 sentences — and now and then a little story of 5 sentences. Never the same length every time.
+- Simple A2 words, but connected sentences (porque, pero, entonces, aunque, cuando), not choppy fragments.
+- Latin American Spanish: "ustedes", never "vosotros" (and no vosotros verb forms like "hicisteis").
+
+Tenses and persons — make her use more than the present and "yo":
+- Ask about the past (what she did, what happened, what it was like before — "¿Qué hiciste…?", "¿Cómo era…?"), the future and plans ("¿Qué vas a hacer…?", "¿Qué cambiará…?"), not only the present.
+- Ask about other people, so she needs other persons: her family, friends, partner, cats ("¿Y tu hermana qué hace los domingos?" → él/ella; "¿Qué hicieron tú y tu pareja?" → nosotros; "¿Tus amigos también…?" → ellos).
+- Vary it from question to question; never quiz, never mention grammar. When a part of the topic runs out, move to its other side: "¿Y antes, cómo era?", "¿Y qué planean para el verano?".
 
 What to ask about — simple words, grown-up content:
 - She is an adult: simple LANGUAGE, but the question itself should be worth answering. Ask about experience, opinion, reasons, comparisons, choices, plans, funny or annoying moments.
@@ -298,13 +298,13 @@ Target words:
 - Never list them, never mention that they are targets.
 - It's fine if only 2–3 of them come up in the whole conversation.
 
-{MISTAKES_RULES}{_focus_rules(focus, phrase)}{facts_rules}Start: greet her briefly and open the opener topic with a question.
+{MISTAKES_RULES}{_chunk_rules(chunk)}{facts_rules}Start: greet her briefly and open the opener topic with a question.
 
 Target words (Spanish — Russian meaning):
 {word_lines or "- (no words yet — just have a simple everyday conversation)"}"""
 
 
-def build_scene_instructions(scene: dict, facts=(), avoid_facts=(), focus=None, phrase: str | None = None) -> str:
+def build_scene_instructions(scene: dict, facts=(), avoid_facts=(), chunk=None) -> str:
     """Picture mode (/scene → «Описать голосом», 2026-09-28). Unlike the free conversation,
     here the words come first: the picture takes the choice of topic away from her, which is
     the point — in free talk she steers to comfortable topics and her passive words never
@@ -332,12 +332,14 @@ The conversation has three phases. Move on when a phase is done; never announce 
 3. Her life. When every target word has been said — by her or handed to her — bridge from the picture to her own life — through the situation in the picture (the rain, the cooking, the waiting), not to a topic you remember about her — and have a real conversation: she leads, you react and ask one follow-up question. Ask grown-up questions (experience, opinion, reasons, choices, plans) whose natural answers reuse the target words in her own situation: "¿Y a ti? ¿Qué haces cuando llueve y no tienes paraguas?". Don't hand her the words again here — let her find them herself.
 
 How a turn sounds:
-- Simple A1–A2 words, short sentences (up to ~12 words). Keep your turn to 1–3 sentences; she talks more than you.
+- Phases 1–2: simple A1–A2 words, short sentences (up to ~12 words), 1–3 sentences — she is the one describing.
+- Phase 3: like a real conversation — usually 3–5 connected sentences with your own opinion or a little story, length varying, one question at the end. Ask about her past, her plans and other people in her life, not only the present and "yo".
+- Latin American Spanish: "ustedes", never "vosotros".
 - Never describe the picture for her, never list the target words, never mention that they are targets.
 - If she asks what something in the picture is called, tell her — then ask her to use it.
 - Do NOT start by repeating what she said.
 
-{MISTAKES_RULES}{_focus_rules(focus, phrase, scene=True)}{_facts_rules(facts, avoid_facts)}Start: greet her in one short sentence and ask her to describe the picture."""
+{MISTAKES_RULES}{_chunk_rules(chunk, scene=True)}{_facts_rules(facts, avoid_facts)}Start: greet her in one short sentence and ask her to describe the picture."""
 
 
 TURN_FORMAT = """
@@ -349,7 +351,8 @@ Answer with JSON:
 - "reply" is your next spoken turn, read aloud by text-to-speech: Spanish, plus Russian only where the rules above say so (naming the Russian word she used, a short translation she asked for). No emoji, no markdown, no stage directions, no translations in brackets.
 - If her message ends with [LARGA PAUSA], she went quiet for a long time: if it breaks off mid-sentence, she's stuck — help gently, offer the word she seems to be looking for or ask your question again more simply; if it's a finished thought, just reply normally.
 - [TERMINÉ] at the end only means she tapped "I'm done" — reply normally.
-- "translations": every Russian word or phrase in THIS message of hers that she used because she didn't know it in Spanish, with the Spanish the conversation needed — "ru" as she said it but always in Cyrillic (turn a Latin-letter transliteration like "shapka" back into "шапка"), "es" for a single word in dictionary form (nouns with their article, verbs in the infinitive): [{"ru": "шапка", "es": "el gorro"}]; for a whole Russian phrase, the natural Spanish phrase as she would say it here ("я много работаю" → "trabajo mucho"). Empty list if she used no Russian. Only her LAST message counts: a Russian word from her earlier messages was already translated — never list it again unless she says it in Russian again now. Russian she used to ask you something ("что значит…", "как сказать…") is not a translation — answer the question instead. These are shown to her on screen and offered for her vocabulary, so the Spanish must be the natural, common A1–A2 word for her meaning.
+- "translations": every Russian word or phrase in THIS message of hers that she used because she didn't know it in Spanish, with the Spanish the conversation needed — "ru" as she said it but always in Cyrillic (turn a Latin-letter transliteration like "shapka" back into "шапка"), "es" for a single word in dictionary form (nouns with their article, verbs in the infinitive): [{"ru": "шапка", "es": "el gorro"}]; for a whole Russian phrase, the natural Spanish phrase as she would say it here ("я много работаю" → "trabajo mucho"). Empty list if she used no Russian. Only her LAST message counts: a Russian word from her earlier messages was already translated — never list it again unless she says it in Russian again now. Russian she used to ask you something ("что значит…", "как сказать…") is not a translation — that goes to "asked". These are shown to her on screen and offered for her vocabulary, so the Spanish must be the natural, common A1–A2 word for her meaning.
+- "asked": every word or expression she asked you about in THIS message — what a Spanish word means ("¿qué significa «aguantar»?", "что значит «frontera»?", "¿qué es eso?" about a word from your last reply) or how to say something in Spanish ("как сказать «граница»?", "¿cómo se dice…?"). "es": the Spanish word or expression in dictionary form (nouns with their article, verbs in the infinitive), the one you actually used or gave her — keep its level, don't swap it for a simpler one; "ru": its meaning in short Russian, in Cyrillic. Shown to her on screen and offered for her vocabulary. Empty list if she asked nothing. Only her LAST message counts.
 - "used_words": the target words she herself used in THIS message, in any grammatical form ("fui" counts for "ir", "paraguas" for "el paraguas") — copied exactly as they appear in the target list. Only her message, not your reply. Empty list if none.
 - "raised_fact": if YOUR reply brings up something from what you remember about her that she did not mention in this conversation, copy that fact exactly as it is in your list; otherwise "". Reacting to something she said herself doesn't count."""
 
@@ -366,10 +369,19 @@ TURN_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "asked": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"es": {"type": "string"}, "ru": {"type": "string"}},
+                "required": ["es", "ru"],
+                "additionalProperties": False,
+            },
+        },
         "used_words": {"type": "array", "items": {"type": "string"}},
         "raised_fact": {"type": "string"},
     },
-    "required": ["reply", "translations", "used_words", "raised_fact"],
+    "required": ["reply", "translations", "asked", "used_words", "raised_fact"],
     "additionalProperties": False,
 }
 
@@ -434,9 +446,9 @@ def _history_to_messages(history, user_text: str | None) -> list[dict]:
 
 
 def session_instructions(target_words, facts=(), scene: dict | None = None,
-                         opener: str | None = None, avoid_facts=(), focus=None, phrase: str | None = None) -> str:
-    base = (build_scene_instructions(scene, facts, avoid_facts, focus, phrase) if scene
-            else build_instructions(target_words, facts, opener, avoid_facts, focus, phrase))
+                         opener: str | None = None, avoid_facts=(), chunk=None) -> str:
+    base = (build_scene_instructions(scene, facts, avoid_facts, chunk) if scene
+            else build_instructions(target_words, facts, opener, avoid_facts, chunk))
     return base + TURN_FORMAT
 
 
@@ -509,6 +521,19 @@ def _said_in(ru: str, text: str) -> bool:
     return any(found(w) for w in words)
 
 
+def _asked_now(raw, user_text: str, history) -> list[dict]:
+    """Words she asked about this turn ("¿qué significa…?", "как сказать…?", 2026-10-17). Like
+    the translations, Claude might re-list a word asked several turns ago, so the word has to be
+    in her message — the Spanish or the Russian — or in the bot's last reply ("¿qué es eso?")."""
+    last_bot = next((str(h.get("text", "")) for h in reversed(history) if h.get("role") == "assistant"), "")
+    out = []
+    for p in _clean_translations(raw):
+        es = p["es"]
+        if _word_used(es, user_text) or _word_used(es, last_bot) or _said_in(p["ru"], user_text):
+            out.append({**p, "kind": "asked"})
+    return out
+
+
 async def _speak(reply: str, usage: dict, timings: dict) -> str:
     t = time.monotonic()
     audio = await asyncio.to_thread(stt_helper.synthesize, reply)
@@ -566,8 +591,9 @@ async def handle_start(request: web.Request) -> web.Response:
     target_words = scene_target_words(scene) if scene else db.get_voice_target_words(user_id, TARGET_WORD_COUNT)
     opener = None if scene else pick_opener(user_id)
     facts = db.get_talk_memory(user_id)
+    chunk = db.get_active_chunk(user_id)
     system = session_instructions(target_words, facts, scene, opener, db.get_last_raised_facts(user_id),
-                                  *current_practice(user_id))
+                                  chunk)
     timings, usage = {}, {}
     try:
         t = time.monotonic()
@@ -585,6 +611,8 @@ async def handle_start(request: web.Request) -> web.Response:
         "session_id": session_id,
         "target_count": len(target_words),
         "scene": {"title": scene["title"], "image": f"/talk/scene/{scene['id']}/image"} if scene else None,
+        # the plaque on the page: the phrase stays in sight for the whole conversation
+        "chunk": {"text": chunk["chunk"], "why": chunk.get("why") or ""} if chunk else None,
         "reply": reply,
         "audio": audio_b64,
         "usage": usage,
@@ -642,7 +670,7 @@ async def handle_turn(request: web.Request) -> web.Response:
         facts = db.get_talk_memory(user_id)
         system = session_instructions(session["target_words"], facts, scene, session.get("opener"),
                                       db.get_last_raised_facts(user_id, before_id=session_id),
-                                      *current_practice(user_id))
+                                      db.get_active_chunk(user_id))
         reply_task = asyncio.ensure_future(asyncio.to_thread(claude_turn, system, history, user_text + marker))
         if mode == "auto":
             last_bot = next((str(h.get("text", "")) for h in reversed(history) if h.get("role") == "assistant"), "")
@@ -661,8 +689,12 @@ async def handle_turn(request: web.Request) -> web.Response:
         timings["llm_ms"] = round((time.monotonic() - t) * 1000)
         usage.update(llm_usage)
         translations = [p for p in _clean_translations(data.get("translations")) if _said_in(p["ru"], user_text)]
-        if translations:
-            db.add_voice_found_words(session_id, translations)
+        asked = _asked_now(data.get("asked"), user_text, history)
+        # «Как по-испански будет "скучать"?» came back in both lists — keep it once, as asked
+        asked_es = {p["es"].lower() for p in asked}
+        translations = [p for p in translations if p["es"].lower() not in asked_es]
+        if translations or asked:
+            db.add_voice_found_words(session_id, translations + asked)
         reply = (data.get("reply") or "").strip()
         if not reply:
             reply = "Perdona, ¿puedes repetirlo?"
@@ -680,6 +712,7 @@ async def handle_turn(request: web.Request) -> web.Response:
         "user_text": user_text,
         "reply": reply,
         "translations": translations,
+        "asked": asked,
         "audio": audio_b64,
         "usage": usage,
         "timings": timings,
@@ -731,17 +764,17 @@ async def handle_transcript(request: web.Request) -> web.Response:
         ))
         ctx = review_context(user_id)
         analysis_task = asyncio.ensure_future(asyncio.to_thread(
-            analyze_conversation, transcript, ctx["focus"], ctx["past_errors"], ctx["past_upgrades"]
+            analyze_conversation, transcript, ctx["chunk"], ctx["past_errors"], ctx["past_chunks"]
         ))
         try:
             await memory_task
         except Exception:
             logger.exception("talk: failed to update memory")
-        analysis, focus_state = {}, {}
+        analysis, chunk_state = {}, {}
         try:
             analysis = await analysis_task
             db.set_voice_analysis(session_id, analysis)
-            focus_state = apply_focus(user_id, analysis)
+            chunk_state = apply_chunk(user_id, analysis)
         except Exception:
             logger.exception("talk: failed to analyse the conversation")
 
@@ -754,7 +787,7 @@ async def handle_transcript(request: web.Request) -> web.Response:
                     parse_mode="HTML",
                     reply_markup=found_words_keyboard(session),
                 )
-                message = build_analysis_message(analysis, focus_state)
+                message = build_analysis_message(analysis, chunk_state)
                 if message:
                     await _bot.send_message(user_id, message, parse_mode="HTML")
             except Exception:
@@ -810,77 +843,68 @@ def update_memory(user_id: int, transcript, about_picture: bool = False) -> list
     return facts
 
 
-# Post-conversation review, rebuilt 2026-10-11. The old review listed up to 12 items (5 mistakes,
-# 4 upgrades, 3 «known but unused» words); she read it and forgot it by the next conversation,
-# and it kept naming the same mistakes because it had no idea they were old news. Now she sees
-# two things — one mistake (the «focus») and one phrase — and the focus goes INTO the next
-# conversations: the bot gives her chances to use the right form until she has done it twice in a
-# row. The full list of mistakes is still found and stored: it is what tells a repeated mistake
-# from a one-off slip. «Known but unused» was dropped entirely (she found it irrelevant).
+# Post-conversation review. 2026-10-11: from 12 items down to two — one mistake (the «focus»,
+# carried into the next conversations) and one phrase. 2026-10-17: the focus loop is gone (see
+# «Chunk loop» above) — she now sees the 1–2 most important mistakes just to know them, and the
+# PHRASE is what goes into the next conversations, until she has used it in two of them. The full
+# list of mistakes is still found and stored: it is what tells a repeated mistake from a slip.
 ANALYSIS_MAX_ERRORS = 5
-FOCUS_DONE_STREAK = 2          # correct in this many conversations in a row → the focus is done
+ANALYSIS_SHOW_ERRORS = 2       # the mistakes she sees after the conversation
+CHUNK_DONE_USES = 2            # used in this many conversations → the phrase is done, next one comes
 PAST_ERRORS_SESSIONS = 10      # how far back the review looks for repeated mistakes
-PAST_UPGRADES = 8              # recent phrases not to suggest again
+PAST_CHUNKS = 12               # phrases already given, not to suggest again
 
 ANALYSIS_PROMPT = """You review a voice conversation that a Russian-speaking learner of Spanish (A1–A2, a woman) has just had with a Spanish-speaking friend. Explanations in Russian, Spanish stays in Spanish.
 
 The transcript is speech-to-text of the real conversation. ОНА = her, BOT = the bot. Only her lines are reviewed.
 
-"errors" — real mistakes in her Spanish: wrong word for the meaning, wrong verb form or tense, gender/number agreement, articles, prepositions, ser/estar, word order.
+"errors" — real mistakes in her Spanish: wrong word for the meaning, wrong verb form or tense, gender/number agreement, articles, prepositions, ser/estar, word order. Most important first — she sees only the first two:
+1. It gets in the way of understanding (wrong tense that changes when it happened, a wrong word).
+2. It repeats — the same rule is in her past mistakes (listed with the transcript, if any).
+3. A frequent basic form (past tense of common verbs, ser/estar, gender, basic prepositions) beats a rare construction.
 - "said": her own words, short (quote only the part that is wrong, with just enough around it).
 - "fix": the same thing said correctly.
 - "why": a few words in Russian naming the rule — «прошедшее время ir», «род прилагательного», «предлог с ir».
+- "repeated": true if the same rule is among her past mistakes.
 - Only real mistakes. Correct but plain phrasing is not a mistake.
 - She is a woman: adjectives about herself are feminine ("estoy cansada"). Never "correct" that.
 - The present tense about how she is or feels NOW is correct, even inside a story about the past ("El sábado fui a la playa. Estoy cansada" — she is tired now). Don't turn it into a past tense.
 - Ignore speech-to-text artifacts: punctuation, missing accent marks, repeated words, «э-э».
 - A Russian word she used is a vocabulary gap, not a mistake — skip it.
 - Both European and Latin American Spanish are correct.
-- If "fix" would be the same as "said", it isn't a mistake — leave it out.
+- If "fix" would be the same as "said", it isn't a mistake — leave it out. Same if it only adds an accent mark or a capital letter, or swaps one correct variant for another ("en el verano" / "en verano").
+- "fix" is only the corrected Spanish — no explanations in it.
 - At most {max_errors}.
 
-"focus" — ONE of those errors that she will work on next. She sees only this one, so choose carefully. Priority:
-1. It gets in the way of understanding (wrong tense that changes when it happened, a wrong word).
-2. It repeats — the same rule is in her past mistakes (listed with the transcript, if any).
-3. A frequent basic form (past tense of common verbs, ser/estar, gender, basic prepositions) beats a rare construction.
-It must be easy to provoke with a question in a conversation: a verb tense — yes ("¿Qué hiciste el sábado?"); a preposition inside one rare construction — no, choose another.
-- "rule": the rule in Russian, short — «ir в прошедшем: fui».
-- "said", "fix", "why": as in errors.
-- "trigger": one natural Spanish question whose natural answer needs the right form ("¿Adónde fuiste el fin de semana?").
-- If there is a current focus (given with the transcript), still choose the best NEW candidate — the code decides whether it is used. If no error is suitable, all fields empty.
+"chunk_result" — only if a current phrase is given: did SHE say it in this conversation?
+- "used": she said it at least once, in any form — another tense or person, her own words inside it ("me pareció que", "a mí me parece que" both count for "me parece que"; "tengo ganas de salir" counts for "tener ganas de"). Saying it right after the bot did counts too.
+- "not_used": she didn't (the bot saying it doesn't count).
+No current phrase → "not_used".
 
-"focus_result" — only if a current focus is given: did she use that right form in THIS conversation?
-- "correct": she used the right form at least once and never the wrong one after the bot showed it;
-- "wrong": she made that same mistake again;
-- "not_used": the form didn't come up (or the bot said it and she didn't).
-No current focus → "not_used".
-
-"upgrade" — ONE phrase of hers that was correct but plain, and how to say it better.
-- "said": her phrase from the transcript. "better": the improved version, A2–B1, natural, still sayable by her. "chunk": the reusable chunk itself, as it appears in "better" ("la verdad es que", "lo bueno es que"). "why": a short Russian note.
-- Prefer a phrase she leans on — one she said more than once in this conversation ("pienso que es bueno…") is the best candidate.
-- "better" should hinge on a ready-made chunk she can reuse in many conversations (es que…, la verdad es que…, me da igual, al final…, o sea…, sobre todo…, lo bueno es que…), not just extra details or a one-off fancy word.
+"upgrade" — ONE phrase of hers that was correct but plain or clumsy, and how a native speaker would say it. This becomes the phrase she practises in the next conversations, so choose it carefully.
+- "said": her phrase from the transcript. "better": the improved version, A2–B1, natural, still sayable by her. "chunk": the reusable part itself, in a short dictionary-like form ("me parece que", "tener ganas de", "depende de", "lo bueno es que"). "why": a short Russian note on what it does and when to use it.
+- It must fit almost ANY topic: she will get chances to use it in conversations about anything (a shop, a trip, her cats). Good: opinion and reaction (me parece que, para mí, lo bueno es que, me da igual), linking (por eso, al final, es que, sobre todo, en cambio), a common verb with its preposition and everyday collocations (tener ganas de, pensar en, depende de, acabar de, soler + inf., darse cuenta de). Bad: a collocation tied to one topic ("hacer cola", "pedir la cuenta"), a one-off fancy word, extra details.
+- Prefer a phrase she leans on (said more than once — "pienso que es bueno…") or one she built clumsily (a calque from Russian, a wrong preposition).
 - The chunk must do the same job as what she said: for an opinion ("pienso que es bueno") — "me parece que", "para mí", "lo bueno es que", not a filler like "o sea".
-- The chunks listed with the transcript as already suggested are taken: pick a different chunk. Never invent phrases she didn't say.
+- The current phrase and the phrases listed as already given are taken: pick a different one, even if she used the old ones clumsily. Never invent phrases she didn't say.
 - Nothing worth it → all fields empty.
 
 If she barely spoke, return empty lists and empty fields."""
 
-_PAIR = {"said": {"type": "string"}, "fix": {"type": "string"}, "why": {"type": "string"}}
 ANALYSIS_SCHEMA = {
     "type": "object",
     "properties": {
         "errors": {
             "type": "array",
-            "items": {"type": "object", "properties": _PAIR, "required": ["said", "fix", "why"],
-                      "additionalProperties": False},
+            "items": {
+                "type": "object",
+                "properties": {"said": {"type": "string"}, "fix": {"type": "string"}, "why": {"type": "string"},
+                               "repeated": {"type": "boolean"}},
+                "required": ["said", "fix", "why", "repeated"],
+                "additionalProperties": False,
+            },
         },
-        "focus": {
-            "type": "object",
-            "properties": {**_PAIR, "rule": {"type": "string"}, "trigger": {"type": "string"}},
-            "required": ["rule", "said", "fix", "why", "trigger"],
-            "additionalProperties": False,
-        },
-        "focus_result": {"type": "string", "enum": ["correct", "wrong", "not_used"]},
+        "chunk_result": {"type": "string", "enum": ["used", "not_used"]},
         "upgrade": {
             "type": "object",
             "properties": {"said": {"type": "string"}, "better": {"type": "string"}, "chunk": {"type": "string"},
@@ -889,29 +913,31 @@ ANALYSIS_SCHEMA = {
             "additionalProperties": False,
         },
     },
-    "required": ["errors", "focus", "focus_result", "upgrade"],
+    "required": ["errors", "chunk_result", "upgrade"],
     "additionalProperties": False,
 }
 
-_EMPTY_ANALYSIS = {"errors": [], "focus": {}, "focus_result": "not_used", "upgrade": {}}
+_EMPTY_ANALYSIS = {"errors": [], "chunk_result": "not_used", "upgrade": {}}
 
 
 def review_context(user_id: int) -> dict:
-    """What the review needs to know beyond the transcript: the current focus, her past
-    mistakes (to spot a repeated one) and the phrases already suggested (not to repeat them)."""
+    """What the review needs to know beyond the transcript: the current phrase, her past
+    mistakes (to spot a repeated one) and the phrases already given (not to repeat them)."""
     sessions = db.get_recent_voice_sessions(user_id, PAST_ERRORS_SESSIONS)
     past_errors = [e for s in sessions for e in ((s.get("analysis") or {}).get("errors") or [])]
-    past_upgrades = []
-    for s in sessions:
-        a = s.get("analysis") or {}
-        ups = ([a["upgrade"]] if (a.get("upgrade") or {}).get("better") else []) + list(a.get("upgrades") or [])
-        past_upgrades += [u.get("chunk") or u["better"] for u in ups if u.get("better")]
-    return {"focus": db.get_active_focus(user_id), "past_errors": past_errors,
-            "past_upgrades": past_upgrades[:PAST_UPGRADES]}
+    return {"chunk": db.get_active_chunk(user_id), "past_errors": past_errors,
+            "past_chunks": db.get_recent_chunks(user_id, PAST_CHUNKS)}
 
 
 def _norm(text: str) -> str:
     return " ".join(_TOKEN_RE.findall(text.lower()))
+
+
+def _same_but_accents(said: str, fix: str) -> bool:
+    """A "fix" that only adds an accent mark or a capital is a speech-to-text artifact, not her
+    mistake — the model still listed "Mexico → México" despite the prompt (2026-10-17)."""
+    plain = lambda t: "".join(c for c in unicodedata.normalize("NFD", _norm(t)) if unicodedata.category(c) != "Mn")
+    return plain(said) == plain(fix)
 
 
 def _reused_chunk(upgrade: dict, past) -> bool:
@@ -923,21 +949,20 @@ def _reused_chunk(upgrade: dict, past) -> bool:
     return False
 
 
-def analyze_conversation(transcript, focus=None, past_errors=(), past_upgrades=()) -> dict:
-    """Sync (blocking) — call through asyncio.to_thread. All the mistakes (stored), one focus
-    candidate, whether the current focus was used right, and one phrase."""
+def analyze_conversation(transcript, chunk=None, past_errors=(), past_chunks=()) -> dict:
+    """Sync (blocking) — call through asyncio.to_thread. All the mistakes (stored, most
+    important first), whether she used the current phrase, and the next phrase candidate."""
     spoken = "\n".join(f"{'ОНА' if t['role'] == 'user' else 'BOT'}: {t['text']}" for t in transcript if t.get("text"))
     if sum(1 for t in transcript if t.get("role") == "user" and t.get("text")) < 2:
         return dict(_EMPTY_ANALYSIS)
     content = spoken
-    if focus:
-        content += (f"\n\nТекущий фокус: {focus['rule']} — правильно «{focus['right_form']}», "
-                    f"она говорила «{focus['wrong']}».")
+    if chunk:
+        content += f"\n\nТекущий оборот: «{chunk['chunk']}»" + (f" (пример: {chunk['example']})" if chunk.get("example") else "")
     if past_errors:
         content += "\n\nЕё ошибки в прошлых разговорах:\n" + "\n".join(
             f"- {e.get('said')} → {e.get('fix')} ({e.get('why', '')})" for e in past_errors[:30])
-    if past_upgrades:
-        content += "\n\nУже предлагали эти обороты (выбери другой):\n" + "\n".join(f"- {u}" for u in past_upgrades)
+    if past_chunks:
+        content += "\n\nУже давали эти обороты (выбери другой):\n" + "\n".join(f"- {c}" for c in past_chunks)
     response = ai_helper.client.messages.create(
         model=TALK_LLM_MODEL,
         max_tokens=2000,
@@ -946,65 +971,63 @@ def analyze_conversation(transcript, focus=None, past_errors=(), past_upgrades=(
         output_config={"format": {"type": "json_schema", "schema": ANALYSIS_SCHEMA}},
     )
     data = json.loads(next((b.text for b in response.content if b.type == "text"), "{}"))
-    focus_c = data.get("focus") or {}
     upgrade = data.get("upgrade") or {}
-    result = data.get("focus_result") if focus else "not_used"
+    result = data.get("chunk_result") if chunk else "not_used"
     return {
         "errors": [e for e in (data.get("errors") or [])
-                   if e.get("said") and e.get("fix") and _norm(e["said"]) != _norm(e["fix"])][:ANALYSIS_MAX_ERRORS],
-        "focus": focus_c if (focus_c.get("fix") and focus_c.get("said") and focus_c.get("rule")
-                             and _norm(focus_c["said"]) != _norm(focus_c["fix"])) else {},
-        "focus_result": result if result in ("correct", "wrong", "not_used") else "not_used",
-        # a chunk she was already given is dropped in code too — the model reused it 6 times of 6
-        "upgrade": upgrade if upgrade.get("said") and upgrade.get("better") and not _reused_chunk(upgrade, past_upgrades) else {},
+                   if e.get("said") and e.get("fix") and not _same_but_accents(e["said"], e["fix"])][:ANALYSIS_MAX_ERRORS],
+        "chunk_result": result if result in ("used", "not_used") else "not_used",
+        # a phrase she was already given is dropped in code too — the model reused one 6 times of 6
+        "upgrade": (upgrade if upgrade.get("said") and upgrade.get("better") and upgrade.get("chunk")
+                    and not _reused_chunk(upgrade, past_chunks) else {}),
     }
 
 
-def apply_focus(user_id: int, analysis: dict) -> dict:
-    """Moves the focus loop one conversation forward. Correct → streak+1 (FOCUS_DONE_STREAK →
-    done), wrong → streak back to 0, not used → unchanged. A new focus only replaces a done one
-    (or none): one thing at a time. Returns what the message needs."""
-    active = db.get_active_focus(user_id)
-    out = {"active": active, "result": None, "streak": 0, "done": False, "new": None}
+def apply_chunk(user_id: int, analysis: dict) -> dict:
+    """Moves the phrase loop one conversation forward: used → +1 (CHUNK_DONE_USES → done),
+    not used → unchanged (a phrase she didn't get to isn't a failure). A new phrase only
+    replaces a done one (or none): one thing at a time. Returns what the message needs."""
+    active = db.get_active_chunk(user_id)
+    out = {"active": active, "used": False, "uses": 0, "done": False, "new": None}
     if active:
-        result = analysis.get("focus_result") or "not_used"
-        streak = active["streak"] + 1 if result == "correct" else 0 if result == "wrong" else active["streak"]
-        done = streak >= FOCUS_DONE_STREAK
-        db.set_focus_streak(active["id"], streak, done)
-        out.update(result=result, streak=streak, done=done)
-    cand = analysis.get("focus") or {}
-    if (not active or out["done"]) and cand.get("fix"):
-        db.create_focus(user_id, cand["rule"], cand["said"], cand["fix"], cand.get("why", ""), cand.get("trigger", ""))
+        used = analysis.get("chunk_result") == "used"
+        uses = active["uses"] + (1 if used else 0)
+        done = uses >= CHUNK_DONE_USES
+        if used:
+            db.set_chunk_uses(active["id"], uses, done)
+        out.update(used=used, uses=uses, done=done)
+    cand = analysis.get("upgrade") or {}
+    if (not active or out["done"]) and cand.get("chunk"):
+        db.create_chunk(user_id, cand["chunk"], cand.get("said", ""), cand.get("better", ""), cand.get("why", ""))
         out["new"] = cand
     return out
 
 
-def build_analysis_message(analysis: dict, focus_state: dict | None = None) -> str | None:
-    """Two things at most: the focus (its progress, or a new one) and one phrase."""
-    focus_state = focus_state or {}
+def build_analysis_message(analysis: dict, chunk_state: dict | None = None) -> str | None:
+    """The 1–2 most important mistakes (just to know), then the phrase: its progress, or a new one."""
+    chunk_state = chunk_state or {}
     lines = []
-    active = focus_state.get("active")
+    errors = (analysis.get("errors") or [])[:ANALYSIS_SHOW_ERRORS]
+    if errors:
+        lines.append("🔸 <b>Ошибки</b>\n" + "\n".join(
+            f"<s>{html.escape(e['said'])}</s> → <b>{html.escape(e['fix'])}</b>"
+            + (f" — <i>{html.escape(e['why'])}</i>" if e.get("why") else "")
+            + (" (повторяется)" if e.get("repeated") else "")
+            for e in errors))
+    active = chunk_state.get("active")
     if active:
-        right = html.escape(active["right_form"])
-        result = focus_state.get("result")
-        if result == "correct" and focus_state.get("done"):
-            lines.append(f"✅ <b>Фокус снят:</b> «{right}» — правильно {FOCUS_DONE_STREAK} раза подряд.")
-        elif result == "correct":
-            lines.append(f"✅ <b>Фокус:</b> «{right}» — сказала правильно "
-                         f"({focus_state['streak']} из {FOCUS_DONE_STREAK}).")
-        elif result == "wrong":
-            lines.append(f"🎯 <b>Фокус пока в работе:</b> <s>{html.escape(active['wrong'])}</s> → <b>{right}</b>"
-                         + (f"\n<i>{html.escape(active['why'])}</i>" if active.get("why") else ""))
+        text = html.escape(active["chunk"])
+        if chunk_state.get("done"):
+            lines.append(f"✅ <b>Оборот освоен:</b> «{text}» — сказала в {CHUNK_DONE_USES} разговорах.")
+        elif chunk_state.get("used"):
+            lines.append(f"💬 <b>Оборот:</b> «{text}» — сказала ({chunk_state['uses']} из {CHUNK_DONE_USES}).")
         else:
-            lines.append(f"🎯 <b>Фокус:</b> «{right}» — в этот раз не прозвучало, вернёмся к нему.")
-    new = focus_state.get("new")
+            lines.append(f"💬 <b>Оборот:</b> «{text}» — в этот раз не прозвучал, остаётся на следующий разговор.")
+    new = chunk_state.get("new")
     if new:
-        lines.append(f"🎯 <b>Новый фокус:</b> <s>{html.escape(new['said'])}</s> → <b>{html.escape(new['fix'])}</b>"
+        lines.append(f"💬 <b>Новый оборот:</b> «{html.escape(new['chunk'])}»\n"
+                     f"{html.escape(new['said'])} → <b>{html.escape(new['better'])}</b>"
                      + (f"\n<i>{html.escape(new['why'])}</i>" if new.get("why") else ""))
-    upgrade = analysis.get("upgrade") or {}
-    if upgrade.get("better"):
-        lines.append(f"💬 <b>Оборот:</b> {html.escape(upgrade['said'])} → <b>{html.escape(upgrade['better'])}</b>"
-                     + (f"\n<i>{html.escape(upgrade['why'])}</i>" if upgrade.get("why") else ""))
     if not lines:
         return None
     return "📝 <b>После разговора</b>\n\n" + "\n\n".join(lines)
@@ -1100,13 +1123,12 @@ REPORT_MAX_OVERUSED = 2
 
 
 def build_weekly_report(user_id: int) -> str | None:
-    """Sync (blocking) — call through asyncio.to_thread. Rebuilt 2026-10-11 around the focus
-    loop: foci closed this week, the current one, and 1–2 phrases she leans on. The old «recurring
-    mistakes» block is gone — a repeated mistake now becomes the focus by itself. None when
-    there's nothing honest to say."""
+    """Sync (blocking) — call through asyncio.to_thread. Built around the phrase loop
+    (2026-10-17, before that around the focus mistake): phrases she mastered this week, the
+    current one, and 1–2 phrases she leans on. None when there's nothing honest to say."""
     week_ago = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
-    done = db.get_focus_done_since(user_id, week_ago)
-    active = db.get_active_focus(user_id)
+    done = db.get_chunks_done_since(user_id, week_ago)
+    active = db.get_active_chunk(user_id)
 
     overused, counts = [], {}
     sessions = db.get_recent_voice_sessions(user_id, REPORT_SESSIONS)
@@ -1129,12 +1151,11 @@ def build_weekly_report(user_id: int) -> str | None:
         return None
     out = ["📊 <b>Неделя разговоров</b>"]
     if done:
-        out += ["", "✅ <b>Фокусы сняты</b>"]
-        out += [f"• {html.escape(f['rule'])}: «{html.escape(f['right_form'])}»" for f in done]
+        out += ["", "✅ <b>Обороты освоены</b>"]
+        out += [f"• «{html.escape(c['chunk'])}»" for c in done]
     if active:
-        out += ["", "🎯 <b>Сейчас в работе</b>",
-                f"• {html.escape(active['rule'])}: <s>{html.escape(active['wrong'])}</s> → "
-                f"<b>{html.escape(active['right_form'])}</b> ({active['streak']} из {FOCUS_DONE_STREAK})"]
+        out += ["", "💬 <b>Сейчас в работе</b>",
+                f"• «{html.escape(active['chunk'])}» ({active['uses']} из {CHUNK_DONE_USES})"]
     if overused:
         out += ["", "🔁 <b>Часто повторяешь</b>"]
         for o in overused:
@@ -1245,13 +1266,16 @@ def build_summary(session: dict) -> str:
         "",
     ]
     found = session.get("found_words") or []
+    searched = [p for p in found if p.get("kind") != "asked"]
+    asked = [p for p in found if p.get("kind") == "asked"]
+    if searched:
+        lines += ["🔎 <b>Искала по-испански:</b>",
+                  *(f"• {html.escape(p['ru'])} → {html.escape(p['es'])}" for p in searched)]
+    if asked:
+        lines += ["❓ <b>Спрашивала:</b>",
+                  *(f"• {html.escape(p['es'])} — {html.escape(p['ru'])}" for p in asked)]
     if found:
-        lines += [
-            "🔎 <b>Искала по-испански:</b>",
-            *(f"• {html.escape(p['ru'])} → {html.escape(p['es'])}" for p in found),
-            "<i>Нажми на слово внизу, чтобы добавить его в словарь.</i>",
-            "",
-        ]
+        lines += ["<i>Нажми на слово внизу, чтобы добавить его в словарь.</i>", ""]
     lines += [
         f"💸 ≈ ${stt + llm + tts:.3f}: распознавание ${stt:.3f}, Claude ${llm:.3f}, озвучка ${tts:.3f} "
         "<i>(оценка по прайсу на 2026-09-19)</i>",
@@ -1263,7 +1287,7 @@ FOUND_WORDS_BUTTONS = 8
 
 
 def found_words_keyboard(session: dict):
-    """One "add" button per word she looked for — added only if she taps it (each add is a
+    """One "add" button per word she looked for or asked about — added only if she taps it (each add is a
     Claude call and a card; she decides which ones are worth learning)."""
     found = (session.get("found_words") or [])[:FOUND_WORDS_BUTTONS]
     if not found:
