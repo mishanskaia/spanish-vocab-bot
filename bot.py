@@ -19,6 +19,7 @@ from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LinkPreviewOptions,
     BotCommandScopeChat,
     BotCommandScopeDefault,
     WebAppInfo,
@@ -42,6 +43,7 @@ import stt_helper
 import voice_talk
 import word_catalog
 import scene_practice
+import channel_digest
 
 logging.basicConfig(level=logging.INFO)
 # httpx logs every request URL at INFO, and Telegram Bot API URLs contain the bot token —
@@ -74,6 +76,9 @@ BACKUP_WEEKLY_UTC = (3, 0)
 # Sunday 19:00 Moscow = 16:00 UTC — weekly speech report for the owner (/talkreport on demand)
 TALK_REPORT_UTC = (16, 0)
 TALK_REPORT_WEEKDAY = 6
+# 05:00 Moscow = 02:00 UTC — read the Spanish channels and label new posts, before Study Coach
+# (the post of the day goes right after it). Also once shortly after start, so a deploy fills the library.
+CHANNEL_REFRESH_UTC = (2, 0)
 BACKUP_WEEKDAY = 6  # Monday=0 .. Sunday=6, per job_queue's `days`
 
 # Voice notes (evening practice + dictating new words) need OpenAI for speech-to-text — off without the key
@@ -1020,6 +1025,10 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "talkadd":
         await _handle_talk_add_button(query, parts)
 
+    # --- the channel post of the day: add / make it the phrase / «знаю» ---
+    elif action in ("chadd", "chchunk", "chknown"):
+        await _handle_channel_button(query, action, parts)
+
     # --- delete word by button ---
     elif action == "del_word":
         word_id = int(parts[1])
@@ -1143,9 +1152,115 @@ async def study_coach_reminder(context: ContextTypes.DEFAULT_TYPE):
         blocks.append(f'🗣 Попробуй сегодня использовать в речи: «{speaking_due["topic"]}».')
         db.mark_speaking_sent(speaking_due["topic_id"])
 
-    if not blocks:
+    if blocks:
+        await context.bot.send_message(user_id, "\n\n".join(blocks))
+    # the post of the day from the Spanish channels — its own message, right after Study Coach
+    try:
+        await _send_channel_digest(context.bot, user_id)
+    except Exception:
+        logger.exception("channel digest: daily post failed")
+
+
+# ---------------------------------------------------------------------------
+# Channel digest — owner-only, one useful post a day from public Spanish-learning
+# channels (channel_digest.py). The library is filled by channel_refresh_job.
+# ---------------------------------------------------------------------------
+
+def _channel_digest_keyboard(item_id: int, digest: dict):
+    buttons = []
+    if digest.get("add_es"):
+        buttons.append([InlineKeyboardButton(f"➕ {digest['add_es']}", callback_data=f"chadd:{item_id}")])
+    if digest.get("chunk"):
+        buttons.append([InlineKeyboardButton(f"🎯 Сделать оборотом: {digest['chunk']}", callback_data=f"chchunk:{item_id}")])
+    buttons.append([InlineKeyboardButton("✓ Знаю", callback_data=f"chknown:{item_id}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def _send_channel_digest(bot, user_id: int) -> bool:
+    item = await asyncio.to_thread(channel_digest.pick, user_id)
+    if item is None:
+        return False
+    digest = await asyncio.to_thread(channel_digest.compose, item)
+    db.mark_channel_item_shown(item["id"], item["key"], digest)
+    await bot.send_message(
+        user_id,
+        channel_digest.format_message(item, digest),
+        parse_mode="HTML",
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
+        reply_markup=_channel_digest_keyboard(item["id"], digest),
+    )
+    return True
+
+
+async def channel_refresh_job(context: ContextTypes.DEFAULT_TYPE):
+    if not OWNER_TELEGRAM_ID:
         return
-    await context.bot.send_message(user_id, "\n\n".join(blocks))
+    try:
+        result = await asyncio.to_thread(channel_digest.refresh)
+        logger.info("channel digest: refresh %s", result)
+    except Exception:
+        logger.exception("channel digest: refresh failed")
+
+
+async def digest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The post of the day on demand (it counts as shown, like the morning one)."""
+    user_id = update.effective_user.id
+    if not _is_owner(user_id):
+        return
+    try:
+        sent = await _send_channel_digest(context.bot, user_id)
+    except Exception:
+        logger.exception("channel digest: /digest failed")
+        await update.message.reply_text("Не получилось — попробуй позже.")
+        return
+    if not sent:
+        await update.message.reply_text("Пока нечего прислать: библиотека каналов пуста или всё уже показано (/channels).")
+
+
+async def channels_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """How full the channel library is."""
+    user_id = update.effective_user.id
+    if not _is_owner(user_id):
+        return
+    stats = {row[0]: row[1:] for row in db.get_channel_stats()}
+    if not stats:
+        await update.message.reply_text("Библиотека пока пуста — посты подтягиваются после старта бота и каждое утро в 5:00 МСК.")
+        return
+    lines = ["📚 <b>Каналы</b> — постов / полезных / пунктов в очереди / показано"]
+    for channel in channel_digest.CHANNELS:
+        posts, useful, ready, shown = stats.get(channel, (0, 0, 0, 0))
+        lines.append(f"• @{html.escape(channel)}: {posts} / {useful} / {ready} / {shown}")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def _handle_channel_button(query, action: str, parts):
+    item = db.get_channel_item(int(parts[1]))
+    user_id = query.from_user.id
+    if item is None or not _is_owner(user_id) or not item.get("digest"):
+        return
+    digest = item["digest"]
+    # drop just the pressed button, keep the rest tappable
+    markup = query.message.reply_markup
+    rows = [row for row in (markup.inline_keyboard if markup else [])
+            if not any(b.callback_data == query.data for b in row)]
+    try:
+        await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(rows) if rows else None)
+    except BadRequest:
+        pass
+    if action == "chadd" and digest.get("add_es"):
+        await _add_word(query.message, user_id, digest["add_es"])
+    elif action == "chchunk" and digest.get("chunk"):
+        previous = db.get_active_chunk(user_id)
+        example = digest["examples"][0]["es"] if digest.get("examples") else ""
+        db.create_chunk(user_id, digest["chunk"], "", example, item.get("ru") or "")
+        note = f" Прошлый («{html.escape(previous['chunk'])}») снят." if previous and previous["chunk"] != digest["chunk"] else ""
+        await query.message.reply_text(
+            f"🎯 Теперь в разговорах (/talk, /scene) оборот «<b>{html.escape(digest['chunk'])}</b>».{note}",
+            parse_mode="HTML",
+        )
+    elif action == "chknown":
+        db.mark_channel_key_known(item["key"])
+        await query.message.reply_text("Окей, такое больше не пришлю.")
 
 
 # ---------------------------------------------------------------------------
@@ -1986,6 +2101,8 @@ OWNER_ONLY_COMMANDS = [
     ("talkreport", "Отчёт: как звучит твоя речь"),
     ("talkmemory", "Что бот помнит о тебе"),
     ("talkforget", "Стереть память разговоров"),
+    ("digest", "Полезный пост из каналов сейчас"),
+    ("channels", "Каналы: сколько постов в библиотеке"),
 ]
 
 
@@ -2028,6 +2145,8 @@ def main():
     app.add_handler(CommandHandler("talkreport", talkreport))
     app.add_handler(CommandHandler("talkmemory", talkmemory))
     app.add_handler(CommandHandler("talkforget", talkforget))
+    app.add_handler(CommandHandler("digest", digest_command))
+    app.add_handler(CommandHandler("channels", channels_command))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -2035,6 +2154,8 @@ def main():
 
     app.job_queue.run_repeating(hourly_reminder_job, interval=3600, first=0)
     app.job_queue.run_daily(study_coach_reminder, time=dtime(hour=STUDY_COACH_UTC[0], minute=STUDY_COACH_UTC[1]))
+    app.job_queue.run_daily(channel_refresh_job, time=dtime(hour=CHANNEL_REFRESH_UTC[0], minute=CHANNEL_REFRESH_UTC[1]))
+    app.job_queue.run_once(channel_refresh_job, when=120)
     app.job_queue.run_daily(
         weekly_backup_job,
         time=dtime(hour=BACKUP_WEEKLY_UTC[0], minute=BACKUP_WEEKLY_UTC[1]),
