@@ -56,11 +56,24 @@ MIXED_PROMPT = (
 )
 
 
-def transcribe_mixed(audio_bytes: bytes, filename: str = "voice.wav") -> str:
+# Words and phrases the conversation is built around, named in the prompt as a hint: fast
+# speech glues short words together ("es como si" came back as "escosia", 2026-10-20), and a
+# known phrase is what the model picks when the sound is ambiguous. Capped to keep the prompt short.
+MAX_HINTS = 12
+
+
+def mixed_prompt(hints=()) -> str:
+    hints = [h.strip() for h in hints if h and h.strip()][:MAX_HINTS]
+    if not hints:
+        return MIXED_PROMPT
+    return MIXED_PROMPT + " Puede usar: " + ", ".join(hints) + "."
+
+
+def transcribe_mixed(audio_bytes: bytes, filename: str = "voice.wav", hints=()) -> str:
     result = _get_client().audio.transcriptions.create(
         model=STT_MODEL,
         file=(filename, audio_bytes),
-        prompt=MIXED_PROMPT,
+        prompt=mixed_prompt(hints),
     )
     return result.text.strip()
 
