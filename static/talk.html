@@ -119,11 +119,25 @@
   .ctl:disabled { opacity: .3; }
   #error { color: var(--danger); font-size: 14px; text-align: center; }
 
-  /* picture mode (/scene → «Описать голосом»): the picture on top, a smaller orb under it */
-  #scenePic { display: none; max-width: 100%; max-height: 38vh; border-radius: 16px; margin: 8px auto 0; }
+  /* picture mode (/scene → «Описать голосом»). The picture used to sit on top at 38vh with the orb
+     under it: with the phrase plaque that left one line for the subtitles on a phone (2026-10-20).
+     Now the picture and the orb share a row and the subtitles get the rest; a tap on the picture
+     opens it full width, another tap shrinks it back. */
+  #top { display: contents; }
+  #scenePic { display: none; border-radius: 16px; object-fit: cover; cursor: zoom-in; }
   body.scene #scenePic { display: block; }
-  body.scene { --orb: 84px; }
-  body.scene #stage { padding: 10px 0 6px; }
+  body.scene { --orb: 76px; }
+  body.scene #top {
+    display: grid; grid-template-columns: auto 1fr; grid-template-areas: "pic stage" "chunk chunk";
+    align-items: center; gap: 8px 12px; margin-top: 8px; flex: 0 0 auto;
+  }
+  body.scene #scenePic { grid-area: pic; width: min(56vw, 30vh, 260px); aspect-ratio: 1; }
+  body.scene #stage { grid-area: stage; padding: 0; }
+  body.scene #hint { font-size: 13px; }
+  body.scene #chunk { grid-area: chunk; margin: 0; }
+  body.scene.picBig #top { grid-template-columns: 1fr; grid-template-areas: "pic" "chunk" "stage"; }
+  body.scene.picBig #scenePic { width: min(100%, 36vh); justify-self: center; cursor: zoom-out; }
+  body.scene.picBig #stage { padding: 4px 0 0; }
 </style>
 </head>
 <body data-state="idle">
@@ -135,6 +149,7 @@
     </div>
   </header>
   <div id="diag"></div>
+  <div id="top">
   <img id="scenePic" alt="Картинка для описания">
   <div id="chunk"></div>
 
@@ -144,6 +159,7 @@
       <button id="orb" aria-label="Начать / я договорила / пропустить"></button>
     </div>
     <div id="hint"></div>
+  </div>
   </div>
 
   <div id="subs" aria-live="polite"></div>
@@ -269,6 +285,7 @@
   // headers — an <img src> can't send them.
   if (sceneId && (initData || linkToken)) {
     document.body.classList.add("scene");
+    $("scenePic").onclick = () => document.body.classList.toggle("picBig");
     statusEl.textContent = "Нажми на шар и опиши картинку";
     fetch(`/talk/scene/${encodeURIComponent(sceneId)}/image`, { headers: authHeaders(false) })
       .then((r) => { if (!r.ok) throw new Error(r.status); return r.blob(); })

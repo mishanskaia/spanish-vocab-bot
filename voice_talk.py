@@ -650,9 +650,11 @@ async def handle_turn(request: web.Request) -> web.Response:
     timings = {}
     # 16 kHz mono 16-bit WAV from the page: 32000 bytes per second after the 44-byte header
     usage = {"stt_seconds": max(0, len(audio) - 44) / 32000}
+    chunk = db.get_active_chunk(user_id)
+    hints = ([chunk["chunk"]] if chunk else []) + [w["phrase"] for w in session.get("target_words") or []]
     try:
         t = time.monotonic()
-        heard = await asyncio.to_thread(stt_helper.transcribe_mixed, audio, "turn.wav")
+        heard = await asyncio.to_thread(stt_helper.transcribe_mixed, audio, "turn.wav", hints)
         timings["stt_ms"] = round((time.monotonic() - t) * 1000)
     except Exception as e:
         return _voice_error(e)
@@ -670,7 +672,7 @@ async def handle_turn(request: web.Request) -> web.Response:
         facts = db.get_talk_memory(user_id)
         system = session_instructions(session["target_words"], facts, scene, session.get("opener"),
                                       db.get_last_raised_facts(user_id, before_id=session_id),
-                                      db.get_active_chunk(user_id))
+                                      chunk)
         reply_task = asyncio.ensure_future(asyncio.to_thread(claude_turn, system, history, user_text + marker))
         if mode == "auto":
             last_bot = next((str(h.get("text", "")) for h in reversed(history) if h.get("role") == "assistant"), "")
@@ -949,6 +951,21 @@ def _reused_chunk(upgrade: dict, past) -> bool:
     return False
 
 
+def _plain(text: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFD", _norm(text)) if unicodedata.category(c) != "Mn")
+
+
+def _chunk_said(chunk: str, her_text: str) -> bool:
+    """A safety net under the model's verdict: the phrase is in her lines, in order. Short words
+    must match exactly; longer ones by their start, so "tengo ganas de" counts for "tener ganas
+    de" and "me pareció que" for "me parece que". The model still catches what this can't."""
+    words = _plain(re.sub(r"\(.*?\)|…|\.\.\.", " ", chunk)).split()
+    if not words:
+        return False
+    parts = [re.escape(w) if len(w) < 4 else re.escape(w[:len(w) - 2]) + r"\w*" for w in words]
+    return re.search(r"(?<!\w)" + r"\s+".join(parts) + r"(?!\w)", _plain(her_text)) is not None
+
+
 def analyze_conversation(transcript, chunk=None, past_errors=(), past_chunks=()) -> dict:
     """Sync (blocking) — call through asyncio.to_thread. All the mistakes (stored, most
     important first), whether she used the current phrase, and the next phrase candidate."""
@@ -973,6 +990,9 @@ def analyze_conversation(transcript, chunk=None, past_errors=(), past_chunks=())
     data = json.loads(next((b.text for b in response.content if b.type == "text"), "{}"))
     upgrade = data.get("upgrade") or {}
     result = data.get("chunk_result") if chunk else "not_used"
+    her_text = "\n".join(t["text"] for t in transcript if t.get("role") == "user" and t.get("text"))
+    if chunk and result != "used" and _chunk_said(chunk["chunk"], her_text):
+        result = "used"  # it's right there in her lines — the model missed it
     return {
         "errors": [e for e in (data.get("errors") or [])
                    if e.get("said") and e.get("fix") and not _same_but_accents(e["said"], e["fix"])][:ANALYSIS_MAX_ERRORS],
