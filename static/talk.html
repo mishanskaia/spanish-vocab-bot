@@ -240,7 +240,10 @@
   ringCircle.style.strokeDasharray = RING_LEN;
   ringCircle.style.strokeDashoffset = RING_LEN;
 
+  // bump on every change to this page: shows in ⓘ whether the deploy reached the phone
+  const PAGE_VERSION = "2026-10-23";
   const diag = {
+    "версия страницы": PAGE_VERSION,
     "где": initData ? "Telegram" : (linkToken ? "браузер (ссылка)" : "без авторизации"),
     "микрофон": "—", "экран не гаснет": "—", "аудио": "—", "уровень / шум / порог": "—", "периодичность": "—", "пик голоса": "—",
     "последний ход": "—", "сессия": "—",
