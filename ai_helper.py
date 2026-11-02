@@ -161,6 +161,8 @@ def explain_word(word: str) -> dict:
   (формат "словосочетание — перевод"), реально употребимых на уровне A1-A2. Если для этого слова
   нет ничего значимого — верни пустой массив [].
 - Если это глагол — ОБЯЗАТЕЛЬНО включи спряжение в настоящем времени (presente de indicativo) в поле
-  conjugation, И форму герундия (gerundio) в поле gerund, например "hablando", "comiendo", "viviendo".
+  conjugation — ОДНОЙ СТРОКОЙ (не объектом) через запятую, с местоимением перед каждой формой:
+  "yo hablo, tú hablas, él/ella habla, nosotros hablamos, vosotros habláis, ellos/ellas hablan" —
+  И форму герундия (gerundio) в поле gerund, например "hablando", "comiendo", "viviendo".
   Если не глагол — conjugation и gerund оба null."""
     return _ask_claude(prompt)

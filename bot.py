@@ -129,10 +129,24 @@ def _md(text) -> str:
     return escape_markdown(str(text), version=1) if text else text
 
 
+def _conjugation_lines(conjugation) -> list[str]:
+    """Conjugation as one "yo hablo" line per person. Claude sometimes sends a
+    dict instead of the requested string, and stored strings are comma lists
+    ("yo hablo, tú hablas, …") — both become a column, not a run-on line."""
+    if isinstance(conjugation, dict):
+        return [f"{k} {v}".strip() for k, v in conjugation.items()]
+    parts = re.split(r"\s*[,;\n]\s*", str(conjugation).strip())
+    return [p for p in parts if p]
+
+
 def _format_conj_gerund(conjugation, gerund) -> str:
     if not conjugation:
         return ""
-    block = f"\n\n📝 Спряжение: {_md(conjugation)}"
+    lines = _conjugation_lines(conjugation)
+    if len(lines) > 1:
+        block = "\n\n📝 Спряжение:\n" + "\n".join(_md(l) for l in lines)
+    else:
+        block = f"\n\n📝 Спряжение: {_md(conjugation)}"
     if gerund:
         block += f"\nГерундий: {_md(gerund)}"
     return block
